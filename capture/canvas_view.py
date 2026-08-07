@@ -1,0 +1,1744 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""탭 하나에 대응하는 편집 캔버스."""
+
+import logging
+import math
+from typing import Callable, Optional
+
+import numpy as np
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, Signal
+from PySide6.QtGui import (QBrush, QColor, QFont, QGuiApplication, QImage, QKeyEvent,
+                            QMouseEvent, QPainter, QPainterPath, QPen, QPixmap,
+                            QResizeEvent, QTextCharFormat, QTextCursor, QTransform, QWheelEvent)
+from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QTextEdit,
+                                QToolButton, QWidget)
+from scipy import ndimage
+
+from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CURSORS,
+                             DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL,
+                             DEFAULT_TEXT_COLOR, DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS,
+                             HANDLE_PX, HANDLES, HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION,
+                             SHARPEN_AMOUNT_SCALE, SHARPEN_SIGMA)
+from capture.shapes import (ARROW_KINDS, FREEHAND_KINDS, arrowhead_length, draw_bbox_shape,
+                             draw_bezier_kind, draw_line_kind, is_line_kind, lock_square,
+                             snap_line_angle)
+
+logger = logging.getLogger(__name__)
+
+
+class _OverlayTextEdit(QTextEdit):
+    """텍스트 편집 오버레이 내부용 QTextEdit. Esc를 부모에 알리기 위해서만 존재한다."""
+
+    escapePressed = Signal()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        """Esc는 편집 취소로 위임하고, 나머지는 기본 동작을 그대로 따른다."""
+        if event.key() == Qt.Key.Key_Escape:
+            self.escapePressed.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class _TextEditOverlay(QWidget):
+    """텍스트 박스 편집 중 표시되는, 전체가 입력칸인 오버레이.
+
+    영역 전체가 QTextEdit이고, 우측 상단에 편집을 닫는 X 버튼만 둔다.
+    """
+
+    closed = Signal()      # X 클릭 등 '편집 닫기' (내용 반영)
+    cancelled = Signal()    # Esc (내용 반영하지 않고 취소)
+
+    def __init__(self, parent: QWidget) -> None:
+        """Args:
+            parent: 오버레이를 얹을 뷰포트 위젯.
+        """
+        super().__init__(parent)
+        self.text_edit = _OverlayTextEdit(self)
+        self.text_edit.setAcceptRichText(False)
+        self.text_edit.setFrameStyle(0)
+        self.text_edit.setStyleSheet(
+            "QTextEdit { background-color: rgba(255, 255, 255, 235); border: 1px solid #2d9cff; }")
+        self.text_edit.escapePressed.connect(self.cancelled.emit)
+
+        self._close_btn = QToolButton(self)
+        self._close_btn.setText("×")
+        self._close_btn.setFixedSize(16, 16)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setStyleSheet(
+            "QToolButton { background-color: #2d9cff; color: white; border: none; "
+            "font-weight: bold; border-radius: 8px; }"
+            "QToolButton:hover { background-color: #1c7fd6; }")
+        self._close_btn.clicked.connect(self.closed.emit)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        """텍스트 편집칸을 전체 크기로, X 버튼은 우측 상단에 겹쳐 배치한다."""
+        self.text_edit.setGeometry(0, 0, self.width(), self.height())
+        self._close_btn.move(max(self.width() - self._close_btn.width() - 2, 0), 2)
+        self._close_btn.raise_()
+        super().resizeEvent(event)
+
+
+class CanvasView(QGraphicsView):
+    """sceneRect 를 캔버스로 사용하는 편집 뷰.
+
+    핸들 드래그로 여백을 확장하며, 원점이 음수여도 무방하다.
+    저장 시 sceneRect 영역만 렌더링하므로 여백 확장 시 아이템 좌표를 옮길 필요가 없다.
+
+    도구('이동'/'선택')에 따라 캔버스 드래그의 의미가 달라진다. '이동' 도구에서는
+    QGraphicsView 기본 동작(아이템 드래그 이동, 빈 공간 러버밴드 선택)을 그대로
+    쓰고, '선택' 도구에서는 픽셀 영역을 마퀴로 지정해 잘라내기/복사에 사용한다.
+    """
+
+    changed = Signal()
+    viewChanged = Signal()      # 확대/축소 등 문서 내용과 무관한 뷰 상태 변경 (상태바 갱신용, dirty 표시 없음)
+
+    MAX_UNDO = 20
+
+    def __init__(self, image: QImage, parent=None) -> None:
+        """캔버스를 생성하고 원본 이미지를 배경 아이템으로 추가한다.
+
+        Args:
+            image: 캔버스에 배치할 원본 이미지.
+            parent: 부모 위젯.
+        """
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setBackgroundBrush(QColor(CANVAS_SURROUND_COLOR))
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # 마우스 버튼을 누르지 않은 순수 hover 상태에서도 mouseMoveEvent가 와야
+        # 캔버스 경계 핸들 위에서 커서 모양이 바뀐다 (기본값은 드래그 중에만 옴).
+        self.setMouseTracking(True)
+
+        self._scene.setSceneRect(0, 0, max(image.width(), 1), max(image.height(), 1))
+        self.base_item: QGraphicsPixmapItem = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
+        self.draw_item: QGraphicsPixmapItem = self._add_draw_layer()
+
+        self._drag_handle: Optional[tuple[int, int]] = None
+        self._drag_start_view: Optional[QPointF] = None
+        self._drag_start_rect: Optional[QRectF] = None
+        self.file_path: Optional[str] = None
+        self.is_dirty: bool = True     # 저장 이후 변경 여부 (탭 저장 상태 표시에 사용)
+
+        self.tool: str = "move"
+        self._select_rect: QRectF = QRectF()
+        self._select_state: str = "idle"          # idle | dragging | adjust
+        self._select_origin: Optional[QPointF] = None
+        self._select_drag_handle: Optional[tuple[int, int] | str] = None
+        self._select_drag_ref: Optional[tuple[QPointF, QRectF]] = None
+
+        self.draw_subtool: str = "brush"          # brush | eraser | highlighter
+        self.draw_thickness: int = DEFAULT_THICKNESS
+        self.draw_color: QColor = QColor(DEFAULT_DRAW_COLOR)
+        self._stroke_path: Optional[QPainterPath] = None
+        self._stroke_backup: Optional[QPixmap] = None
+        self._stroke_last_point: Optional[QPointF] = None
+
+        self.fill_tolerance: int = DEFAULT_FILL_TOLERANCE
+
+        # shape_subtool: rectangle | rounded_rect | ellipse | circle | triangle | diamond |
+        # pentagon | hexagon | line | line_arrow | freehand | freehand_arrow
+        self.shape_subtool: str = DEFAULT_SHAPE_SUBTOOL
+        self._shape_state: str = "idle"           # idle | dragging
+        self._shape_origin: Optional[QPointF] = None
+        self._shape_rect: QRectF = QRectF()
+        # 자유곡선(freehand/freehand_arrow) 편집 중인 3차 베지에 4개 제어점
+        # (시작/제어1/제어2/끝, 씬 좌표). 편집 중이 아니면 빈 리스트.
+        self._curve_points: list[QPointF] = []
+        self._curve_drag_index: Optional[int] = None
+
+        self.text_font: QFont = QFont()
+        self.text_font.setPointSize(DEFAULT_TEXT_FONT_SIZE)
+        self.text_color: QColor = QColor(DEFAULT_TEXT_COLOR)
+        self.text_align_h: str = "left"
+        self.text_align_v: str = "top"
+        self._text_state: str = "idle"            # idle | dragging
+        self._text_origin: Optional[QPointF] = None
+        self._text_rect: QRectF = QRectF()
+        self._text_overlay: Optional[_TextEditOverlay] = None
+        self._text_editing_item: Optional[QGraphicsPixmapItem] = None
+        self._text_new_rect: Optional[QRectF] = None
+        self._text_meta: dict[int, dict] = {}      # id(item) -> {text, font, color, align_h, align_v}
+
+        self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
+        self._pending_move_snapshot: Optional[dict] = None
+        self._pending_move_positions: Optional[dict[int, QPointF]] = None
+
+    def _add_pixmap(self, pixmap: QPixmap, pos: QPoint) -> QGraphicsPixmapItem:
+        """씬에 이동/선택 가능한 픽스맵 아이템을 추가한다."""
+        item = QGraphicsPixmapItem(pixmap)
+        item.setFlags(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable | QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable)
+        item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        item.setPos(pos)
+        item.setZValue(len(self._scene.items()))
+        self._scene.addItem(item)
+        self.changed.emit()
+        return item
+
+    def _add_draw_layer(self) -> QGraphicsPixmapItem:
+        """그리기(브러시/지우개/형광펜) 전용 투명 레이어를 씬 크기에 맞춰 추가한다.
+
+        이동/선택 대상이 되지 않도록 base_item/붙여넣은 이미지와 달리
+        ItemIsMovable/ItemIsSelectable 플래그를 주지 않는다.
+        """
+        r = self._scene.sceneRect()
+        pm = QPixmap(max(int(round(r.width())), 1), max(int(round(r.height())), 1))
+        pm.fill(Qt.GlobalColor.transparent)
+        item = QGraphicsPixmapItem(pm)
+        item.setPos(r.topLeft())
+        item.setZValue(len(self._scene.items()))
+        self._scene.addItem(item)
+        return item
+
+    def _resize_draw_layer(self, new_rect: QRectF, old_rect: QRectF) -> None:
+        """씬 크기가 바뀔 때 그리기 레이어를 새 크기로 만들고 기존 내용을 그대로 옮긴다."""
+        new_pm = QPixmap(max(int(round(new_rect.width())), 1), max(int(round(new_rect.height())), 1))
+        new_pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(new_pm)
+        painter.drawPixmap(old_rect.topLeft() - new_rect.topLeft(), self.draw_item.pixmap())
+        painter.end()
+        self.draw_item.setPixmap(new_pm)
+        self.draw_item.setPos(new_rect.topLeft())
+
+    # ---------- 실행 취소/다시 실행 ---------- #
+    def _snapshot(self) -> dict:
+        """현재 씬의 모든 아이템과 캔버스 크기를 스냅샷으로 캡처한다."""
+        items = []
+        for it in self._scene.items():
+            if isinstance(it, QGraphicsPixmapItem):
+                entry = {
+                    "pixmap": QPixmap(it.pixmap()),
+                    "pos": QPointF(it.pos()),
+                    "z": it.zValue(),
+                    "is_base": it is self.base_item,
+                    "is_draw": it is self.draw_item,
+                }
+                meta = self._text_meta.get(id(it))
+                if meta is not None:
+                    entry["text_meta"] = dict(meta)
+                items.append(entry)
+        return {"items": items, "scene_rect": QRectF(self._scene.sceneRect()),
+                "select_rect": QRectF(self._select_rect)}
+
+    def _push_undo(self) -> None:
+        """실행 취소를 위해 현재 상태를 스택에 기록하고, 다시 실행 스택을 비운다."""
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > self.MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _restore(self, snapshot: dict) -> None:
+        """스냅샷으로 씬 아이템과 캔버스 크기를 복원한다."""
+        for it in list(self._scene.items()):
+            self._scene.removeItem(it)
+        self._text_meta = {}
+        for entry in sorted(snapshot["items"], key=lambda e: e["z"]):
+            item = QGraphicsPixmapItem(entry["pixmap"])
+            if not entry.get("is_draw"):
+                item.setFlags(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable | QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable)
+            item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+            item.setPos(entry["pos"])
+            item.setZValue(entry["z"])
+            self._scene.addItem(item)
+            if entry["is_base"]:
+                self.base_item = item
+            if entry.get("is_draw"):
+                self.draw_item = item
+            if "text_meta" in entry:
+                item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
+                self._text_meta[id(item)] = dict(entry["text_meta"])
+        self._scene.setSceneRect(snapshot["scene_rect"])
+        self._select_rect = QRectF(snapshot.get("select_rect", QRectF()))
+        self.changed.emit()
+        self.viewport().update()
+
+    def undo(self) -> bool:
+        """직전 상태로 한 단계 되돌린다.
+
+        Returns:
+            실제로 되돌렸는지 여부 (더 되돌릴 내역이 없으면 False).
+        """
+        self.commit_pending_edit()
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
+        return True
+
+    def redo(self) -> bool:
+        """되돌린 작업을 한 단계 다시 실행한다.
+
+        Returns:
+            실제로 다시 실행했는지 여부 (내역이 없으면 False).
+        """
+        self.commit_pending_edit()
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(self._snapshot())
+        self._restore(self._redo_stack.pop())
+        return True
+
+    def paste_image(self, image: Optional[QImage] = None) -> bool:
+        """클립보드(또는 전달된) 이미지를 캔버스 중앙에 붙여넣는다.
+
+        현재 보이는 뷰포트(스크롤/줌 상태)가 아니라 캔버스(씬) 자체의
+        중앙을 기준으로 한다. 뷰포트 기준으로 하면 캔버스가 뷰포트보다 큰
+        경우(막 만든 탭이 아직 화면에 다 안 보이는 경우 등) 뷰포트 중앙과
+        캔버스 중앙이 달라져, 캔버스 크기와 똑같은 이미지를 붙여도 구석이
+        어긋나 여백이 생기는 문제가 있었다.
+
+        Args:
+            image: 붙여넣을 이미지. None이면 클립보드 이미지를 사용한다.
+
+        Returns:
+            성공적으로 붙여넣었는지 여부.
+        """
+        if image is None:
+            image = QGuiApplication.clipboard().image()
+        if image is None or image.isNull():
+            return False
+        self._push_undo()
+        center = self._scene.sceneRect().center()
+        pos = QPoint(int(center.x() - image.width() / 2), int(center.y() - image.height() / 2))
+        item = self._add_pixmap(QPixmap.fromImage(image), pos)
+        self._scene.clearSelection()
+        item.setSelected(True)
+        return True
+
+    def select_all(self) -> None:
+        """씬의 모든 아이템을 선택한다."""
+        for it in self._scene.items():
+            it.setSelected(True)
+
+    def delete_selected(self) -> None:
+        """선택된 아이템을 삭제한다 (배경 아이템은 제외)."""
+        targets = [it for it in self._scene.selectedItems() if it is not self.base_item]
+        if not targets:
+            return
+        self._push_undo()
+        for it in targets:
+            self._scene.removeItem(it)
+            self._text_meta.pop(id(it), None)
+        self.changed.emit()
+
+    def canvas_rect(self) -> QRectF:
+        """현재 캔버스(씬) 사각형을 반환한다."""
+        return self._scene.sceneRect()
+
+    def expand_margin(self, px: int) -> None:
+        """캔버스 네 방향 여백을 px만큼 확장(음수면 축소)한다."""
+        old = QRectF(self._scene.sceneRect())
+        r = QRectF(old)
+        r.adjust(-px, -px, px, px)
+        if r.width() < MIN_CANVAS or r.height() < MIN_CANVAS:
+            return
+        self._push_undo()
+        self._resize_draw_layer(r, old)
+        self._scene.setSceneRect(r)
+        self.changed.emit()
+
+    def fit_to_content(self) -> None:
+        """캔버스 크기를 모든 아이템(그리기 레이어 제외)을 포함하는 최소 영역으로 맞춘다.
+
+        그리기 레이어는 항상 캔버스 전체 크기의 투명 픽스맵이라, 포함하면
+        '내용에 맞춤'이 항상 현재 캔버스 크기 그대로가 되어버리므로 제외한다.
+        """
+        rects = []
+        for it in self._scene.items():
+            if it is self.draw_item:
+                continue
+            if isinstance(it, QGraphicsPixmapItem):
+                rects.append(QRectF(it.pos(), QSizeF(it.pixmap().size())))
+            else:
+                rects.append(it.sceneBoundingRect())
+        if not rects:
+            return
+        br = rects[0]
+        for r in rects[1:]:
+            br = br.united(r)
+        old = QRectF(self._scene.sceneRect())
+        self._push_undo()
+        self._resize_draw_layer(br, old)
+        self._scene.setSceneRect(br)
+        self.changed.emit()
+
+    # ---------- 회전/대칭 이동 ---------- #
+    def _replace_with_flattened(self, image: QImage) -> None:
+        """씬의 모든 아이템을 지우고 주어진 이미지 하나로 캔버스를 통째로 교체한다.
+
+        회전/대칭 이동처럼 배경·그린 것·붙여넣은 이미지·텍스트 상자를 모두
+        포함해 캔버스 전체를 하나의 결과물로 합쳐야 하는 연산에 쓴다. 이후에는
+        개별 텍스트 상자를 다시 편집하거나 붙여넣은 이미지만 따로 선택/이동할
+        수 없다 (모두 하나의 배경으로 합쳐짐).
+        """
+        self._push_undo()
+        for it in list(self._scene.items()):
+            self._scene.removeItem(it)
+        self._text_meta = {}
+        self._scene.setSceneRect(0, 0, max(image.width(), 1), max(image.height(), 1))
+        self.base_item = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
+        self.draw_item = self._add_draw_layer()
+        self.changed.emit()
+
+    def _target_pixel_rect(self, image: QImage) -> tuple[int, int, int, int]:
+        """효과를 적용할 대상 사각형을 정수 픽셀 좌표 (x, y, w, h)로 반환한다.
+
+        선택 영역이 있으면 그 영역(캔버스 경계와 교차한 부분), 없으면 캔버스
+        전체를 대상으로 한다. 색반전/무채화/모자이크/회전/대칭 이동 등
+        '선택 있으면 그 영역만, 없으면 전체'로 동작하는 모든 효과가 공유한다.
+        image는 render_image()로 얻은, 씬과 동일한 크기의 이미지여야 한다.
+        """
+        scene_rect = self._scene.sceneRect()
+        target = self._select_rect.intersected(scene_rect) if self.has_selection() else scene_rect
+        if target.isEmpty():
+            return 0, 0, 0, 0
+        x0 = int(round(target.left() - scene_rect.left()))
+        y0 = int(round(target.top() - scene_rect.top()))
+        w = min(int(round(target.width())), image.width() - x0)
+        h = min(int(round(target.height())), image.height() - y0)
+        return x0, y0, w, h
+
+    def _paste_transformed_region(self, transform: Callable[[QImage], QImage]) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 전체)에 transform을 적용해 같은 자리에 그려 넣는다.
+
+        회전 180도/대칭 이동처럼 가로세로 크기가 바뀌지 않는 변형에 쓴다.
+        """
+        image = self.render_image()
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+        transformed = transform(image.copy(x0, y0, w, h))
+        painter = QPainter(image)
+        painter.drawImage(x0, y0, transformed)
+        painter.end()
+        self._replace_with_flattened(image)
+
+    def _rotate_90(self, degrees: int) -> None:
+        """대상 영역을 90도 단위로 회전한다 (degrees는 90 또는 -90).
+
+        선택 영역이 없으면 캔버스 전체(이미지+캔버스 크기)를 함께 회전한다.
+        선택 영역이 있으면 PicPick과 동일하게, 선택 영역 자체를 회전된
+        내용의 가로/세로에 맞춰 좌상단은 그대로 두고 함께 바꾼다(회전 결과가
+        그대로 온전히 담긴다). 캔버스 크기는 바꾸지 않으므로, 회전 후
+        선택 영역이 캔버스 밖으로 나가는 부분은 잘리고 그만큼 주변 내용을
+        덮어쓸 수 있다.
+        """
+        if not self.has_selection():
+            self._replace_with_flattened(self.render_image().transformed(QTransform().rotate(degrees)))
+            return
+        image = self.render_image()
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+        rotated = image.copy(x0, y0, w, h).transformed(QTransform().rotate(degrees))
+        new_w = min(rotated.width(), image.width() - x0)
+        new_h = min(rotated.height(), image.height() - y0)
+        painter = QPainter(image)
+        painter.drawImage(x0, y0, rotated)
+        painter.end()
+        self._replace_with_flattened(image)
+        self._select_rect = QRectF(x0, y0, new_w, new_h)
+
+    def rotate_right(self) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 오른쪽(시계 방향)으로 90도 회전한다."""
+        self._rotate_90(90)
+
+    def rotate_180(self) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 180도 회전한다."""
+        self._paste_transformed_region(lambda img: img.transformed(QTransform().rotate(180)))
+
+    def rotate_left(self) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 왼쪽(반시계 방향)으로 90도 회전한다."""
+        self._rotate_90(-90)
+
+    def flip_vertical(self) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 상하로 대칭 이동한다."""
+        self._paste_transformed_region(lambda img: img.mirrored(False, True))
+
+    def flip_horizontal(self) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 좌우로 대칭 이동한다."""
+        self._paste_transformed_region(lambda img: img.mirrored(True, False))
+
+    def resize_image(self, width: int, height: int) -> None:
+        """캔버스 전체(이미지+캔버스 크기)를 지정한 픽셀 크기로 확대/축소한다.
+
+        회전/대칭 이동과 동일하게 배경·그린 것·붙여넣은 이미지·텍스트 상자를
+        모두 하나의 이미지로 합친 뒤 그 결과물을 새 크기로 리샘플링한다.
+        """
+        width = max(width, 1)
+        height = max(height, 1)
+        scaled = self.render_image().scaled(
+            width, height, Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self._replace_with_flattened(scaled)
+
+    def resize_canvas(self, width: int, height: int, bg_color: QColor) -> None:
+        """캔버스 경계만 지정한 크기로 바꾼다 (이미지 내용은 확대/축소하지 않음).
+
+        '이미지 크기 변경'과 달리 리샘플링하지 않고, 기존 내용을 좌상단(0,0)에
+        고정한 채 새 크기가 더 크면 초과 영역을 bg_color로 채우고, 더 작으면
+        우측/하단을 잘라낸다.
+        """
+        width = max(width, 1)
+        height = max(height, 1)
+        new_image = QImage(width, height, QImage.Format.Format_ARGB32)
+        new_image.fill(bg_color)
+        painter = QPainter(new_image)
+        painter.drawImage(0, 0, self.render_image())
+        painter.end()
+        self._replace_with_flattened(new_image)
+
+    def invert_colors(self) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)의 색을 반전한다.
+
+        R/G/B 각 채널을 255에서 뺀 값으로 바꾸고, 알파는 유지한다.
+        """
+        image = self.render_image()
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+        sub = image.copy(x0, y0, w, h)
+        sub.invertPixels(QImage.InvertMode.InvertRgb)
+        painter = QPainter(image)
+        painter.drawImage(x0, y0, sub)
+        painter.end()
+        self._replace_with_flattened(image)
+
+    def grayscale(self) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 흑백(그레이스케일)으로 바꾼다.
+
+        단순 RGB 평균이 아니라, 사람 눈이 색상별 밝기를 다르게 인지하는
+        특성을 반영한 휘도(luminance) 공식(ITU-R BT.601: 0.299R + 0.587G +
+        0.114B)으로 계산한 밝기 값을 R/G/B에 동일하게 넣어 색만 지운다
+        (알파는 유지).
+        """
+        image = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+        arr = self._image_array(image)
+        region = arr[y0:y0 + h, x0:x0 + w]
+
+        b = region[:, :, 0].astype(np.float32)
+        g = region[:, :, 1].astype(np.float32)
+        r = region[:, :, 2].astype(np.float32)
+        luminance = np.round(0.299 * r + 0.587 * g + 0.114 * b).astype(np.uint8)
+        region[:, :, 0] = luminance
+        region[:, :, 1] = luminance
+        region[:, :, 2] = luminance
+
+        self._replace_with_flattened(image)
+
+    def apply_mosaic(self, percent: int) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)에 모자이크 효과를 적용한다.
+
+        대상 영역을 블록 격자로 나눈 뒤, 블록 안 픽셀들의 평균색으로 블록
+        전체를 덮어씌운다. percent(1~30)는 대상 영역의 짧은 변 길이에 대한
+        비율로 블록 크기를 정해(값이 클수록 블록이 커져 더 뭉개진 모자이크가
+        된다), 이미지 해상도와 무관하게 항상 비슷한 정도로 보이게 한다.
+        """
+        image = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+        block = max(1, round(min(w, h) * percent / 100))
+
+        arr = self._image_array(image)
+        region = arr[y0:y0 + h, x0:x0 + w]
+        self._mosaic_region(region, block)
+
+        self._replace_with_flattened(image)
+
+    def apply_blur(self, percent: int) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)에 가우시안 블러를 적용한다.
+
+        각 픽셀을 주변 픽셀과 가우스 분포 가중치로 평균 내는 표준적인
+        가우시안 블러를 scipy.ndimage.gaussian_filter로 채널별(R/G/B)로
+        적용한다(채널 축은 sigma=0으로 둬 서로 섞이지 않게 한다). percent
+        (1~30)는 모자이크와 같은 방식으로 대상 영역의 짧은 변 길이에 대한
+        비율로 표준편차(sigma)를 정해(BLUR_SIGMA_SCALE로 축소), 값이 클수록
+        더 흐려지되 이미지 해상도와 무관하게 비슷한 정도로 보이게 한다.
+        """
+        image = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+        sigma = min(w, h) * percent / 100 * BLUR_SIGMA_SCALE
+        if sigma <= 0:
+            return
+
+        arr = self._image_array(image)
+        region = arr[y0:y0 + h, x0:x0 + w]
+        blurred = ndimage.gaussian_filter(region[:, :, :3].astype(np.float32), sigma=(sigma, sigma, 0))
+        region[:, :, :3] = np.round(blurred).astype(np.uint8)
+
+        self._replace_with_flattened(image)
+
+    def apply_sharpen(self, percent: int) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)에 선명하게(언샵 마스킹)를 적용한다.
+
+        가우시안 블러로 만든 흐릿한 버전을 원본에서 빼 경계(고주파) 성분만
+        뽑아낸 뒤, 그 성분을 원본에 다시 더해 경계를 뚜렷하게 만드는 언샵
+        마스킹 기법을 쓴다. 블러와 달리 여기서 쓰는 블러 반경(SHARPEN_SIGMA)은
+        '경계 검출 범위'라 이미지 해상도에 비례시키지 않고 몇 픽셀 수준으로
+        고정한다. percent(1~30)는 검출한 경계 성분을 얼마나 강하게 더할지
+        (amount)를 정해, 값이 클수록 더 또렷해진다.
+        """
+        image = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+        amount = percent * SHARPEN_AMOUNT_SCALE
+
+        arr = self._image_array(image)
+        region = arr[y0:y0 + h, x0:x0 + w]
+        original = region[:, :, :3].astype(np.float32)
+        blurred = ndimage.gaussian_filter(original, sigma=(SHARPEN_SIGMA, SHARPEN_SIGMA, 0))
+        sharpened = original + amount * (original - blurred)
+        region[:, :, :3] = np.clip(sharpened, 0, 255).astype(np.uint8)
+
+        self._replace_with_flattened(image)
+
+    def apply_brightness_contrast(self, brightness: int, contrast: int) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)의 명도/대비를 조절한다.
+
+        명도(-100~100)는 각 채널에 그대로 더하는 오프셋이다. 대비(-100~100)는
+        중간값 128을 기준으로 (100+contrast)/100배만큼 밀어내는 배율이라,
+        -100이면 완전히 평평한 회색(배율 0), 0이면 변화 없음(배율 1),
+        100이면 대비가 2배가 된다. 명도를 먼저 더한 뒤 대비를 적용한다.
+        """
+        if brightness == 0 and contrast == 0:
+            return
+        image = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+
+        arr = self._image_array(image)
+        region = arr[y0:y0 + h, x0:x0 + w]
+        pixels = region[:, :, :3].astype(np.float32)
+        pixels += brightness
+        factor = (100 + contrast) / 100
+        pixels = (pixels - 128) * factor + 128
+        region[:, :, :3] = np.clip(pixels, 0, 255).astype(np.uint8)
+
+        self._replace_with_flattened(image)
+
+    def apply_hue_saturation(self, hue: int, saturation: int) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)의 색조/채도를 조절한다.
+
+        RGB를 HSV로 바꿔 H(색조)는 색상환 위에서 회전시키고 S(채도)는
+        배율로 조절한 뒤 다시 RGB로 되돌린다. hue(-100~100)는 -180~180도
+        회전에 대응하고, saturation(-100~100)은 명도/대비의 대비와 같은
+        방식으로 (100+saturation)/100배(-100=완전 무채색, 0=변화 없음,
+        100=채도 2배)를 곱한다.
+        """
+        if hue == 0 and saturation == 0:
+            return
+        image = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        x0, y0, w, h = self._target_pixel_rect(image)
+        if w <= 0 or h <= 0:
+            return
+
+        arr = self._image_array(image)
+        region = arr[y0:y0 + h, x0:x0 + w]
+        rgb = region[:, :, [2, 1, 0]].astype(np.float32) / 255.0     # B,G,R -> R,G,B, 0~1
+        hsv = self._rgb_to_hsv(rgb)
+        hsv[:, :, 0] = (hsv[:, :, 0] + hue / 200.0) % 1.0
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * ((100 + saturation) / 100), 0, 1)
+        rgb_new = np.clip(self._hsv_to_rgb(hsv) * 255.0, 0, 255)
+        region[:, :, 2] = np.round(rgb_new[:, :, 0]).astype(np.uint8)     # R
+        region[:, :, 1] = np.round(rgb_new[:, :, 1]).astype(np.uint8)     # G
+        region[:, :, 0] = np.round(rgb_new[:, :, 2]).astype(np.uint8)     # B
+
+        self._replace_with_flattened(image)
+
+    @staticmethod
+    def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
+        """(..., 3) RGB(0~1) 배열을 (..., 3) HSV(0~1) 배열로 바꾼다 (colorsys.rgb_to_hsv와 동일한 공식의 벡터화 버전)."""
+        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+        maxc = np.max(rgb, axis=-1)
+        minc = np.min(rgb, axis=-1)
+        v = maxc
+        delta = maxc - minc
+        safe_delta = np.where(delta == 0, 1.0, delta)
+        s = np.where(maxc == 0, 0.0, delta / np.where(maxc == 0, 1.0, maxc))
+        rc = (maxc - r) / safe_delta
+        gc = (maxc - g) / safe_delta
+        bc = (maxc - b) / safe_delta
+        h = np.select([r == maxc, g == maxc], [bc - gc, 2.0 + rc - bc], default=4.0 + gc - rc)
+        h = (h / 6.0) % 1.0
+        h = np.where(delta == 0, 0.0, h)
+        return np.stack([h, s, v], axis=-1)
+
+    @staticmethod
+    def _hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
+        """(..., 3) HSV(0~1) 배열을 (..., 3) RGB(0~1) 배열로 바꾼다 (colorsys.hsv_to_rgb와 동일한 공식의 벡터화 버전)."""
+        h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        i = np.floor(h * 6.0)
+        f = h * 6.0 - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - s * f)
+        t = v * (1.0 - s * (1.0 - f))
+        i = i.astype(np.int64) % 6
+        conditions = [i == 0, i == 1, i == 2, i == 3, i == 4, i == 5]
+        r = np.select(conditions, [v, q, p, p, t, v])
+        g = np.select(conditions, [t, v, v, q, p, p])
+        b = np.select(conditions, [p, p, t, v, v, q])
+        r = np.where(s == 0, v, r)
+        g = np.where(s == 0, v, g)
+        b = np.where(s == 0, v, b)
+        return np.stack([r, g, b], axis=-1)
+
+    @staticmethod
+    def _image_array(image: QImage) -> np.ndarray:
+        """ARGB32 QImage를 (H, W, 4) uint8 numpy 배열(B,G,R,A 순서)로 감싼다.
+
+        배열을 수정하면 image의 실제 픽셀 데이터도 함께 바뀐다(같은 메모리를
+        공유하는 뷰).
+        """
+        w, h = image.width(), image.height()
+        stride = image.bytesPerLine()
+        buf = np.frombuffer(image.bits(), dtype=np.uint8, count=stride * h)
+        return buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
+
+    @staticmethod
+    def _mosaic_region(region: np.ndarray, block: int) -> None:
+        """region(H, W, 4) 배열의 R/G/B를 block x block 격자 평균색으로 제자리에서 바꾼다."""
+        h, w = region.shape[:2]
+        pad_h, pad_w = (-h) % block, (-w) % block
+        channels = region[:, :, :3].astype(np.float32)
+        if pad_h or pad_w:
+            channels = np.pad(channels, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+        ph, pw = channels.shape[:2]
+        blocks = channels.reshape(ph // block, block, pw // block, block, 3)
+        means = blocks.mean(axis=(1, 3), keepdims=True)
+        mosaic = np.broadcast_to(means, blocks.shape).reshape(ph, pw, 3)[:h, :w]
+        region[:, :, :3] = np.round(mosaic).astype(np.uint8)
+
+    # ---------- 도구 ---------- #
+    def set_tool(self, tool: str) -> None:
+        """활성 도구를 전환한다 ('move', 'select', 'draw', 'fill', 'text', 'shape').
+
+        '선택' 도구를 벗어나면 진행 중이던 선택 영역을 지우고, 편집 중인
+        텍스트 박스가 있으면 먼저 반영하고 닫는다.
+        """
+        self._commit_text_overlay()
+        if tool != "shape" and self._curve_points:
+            self._commit_curve()
+        self.tool = tool
+        if tool != "select":
+            self.clear_selection()
+        if tool != "draw":
+            self._stroke_path = None
+            self._stroke_backup = None
+            self._stroke_last_point = None
+        if tool != "text":
+            self._text_state = "idle"
+            self._text_rect = QRectF()
+        if tool != "shape":
+            self._shape_state = "idle"
+            self._shape_origin = None
+            self._shape_rect = QRectF()
+            self._curve_drag_index = None
+        self.viewport().update()
+
+    def set_draw_options(self, subtool: str, thickness: int, color: QColor) -> None:
+        """그리기 도구의 하위 도구('brush'/'eraser'/'highlighter'), 두께, 색상을 설정한다."""
+        self.draw_subtool = subtool
+        self.draw_thickness = thickness
+        self.draw_color = QColor(color)
+
+    def set_shape_subtool(self, subtool: str) -> None:
+        """도형 도구의 하위 종류(사각형/타원/.../직선/자유곡선 등)를 설정한다.
+
+        자유곡선을 편집(핸들 조정)하는 중에 다른 하위 도구로 바뀌면, 그
+        시점 모양 그대로 캔버스에 반영한 뒤 전환한다.
+        """
+        if subtool == self.shape_subtool:
+            return
+        if self._curve_points:
+            self._commit_curve()
+        self.shape_subtool = subtool
+
+    def set_fill_tolerance(self, tolerance_pct: int) -> None:
+        """채우기 도구의 색상 허용 범위(0~100%)를 설정한다."""
+        self.fill_tolerance = tolerance_pct
+
+    def set_text_options(self, font: QFont, color: QColor, align_h: str, align_v: str) -> None:
+        """텍스트 도구의 폰트/색/정렬 기본값을 설정한다.
+
+        편집 중인 텍스트 박스가 있으면 즉시 반영한다 (세로 정렬은 QTextEdit이
+        내용 세로 정렬을 지원하지 않아 편집 중에는 항상 위쪽 기준으로 보이고,
+        편집을 마칠 때 최종 렌더링에만 반영된다).
+        """
+        self.text_font = QFont(font)
+        self.text_color = QColor(color)
+        self.text_align_h = align_h
+        self.text_align_v = align_v
+        if self._text_overlay is not None:
+            self._style_text_edit(self._text_overlay.text_edit, self.text_font, self.text_color,
+                                   self.text_align_h)
+
+    def has_selection(self) -> bool:
+        """유효한 선택 영역이 있는지 여부."""
+        return self._select_rect.width() > 0 and self._select_rect.height() > 0
+
+    def clear_selection(self) -> None:
+        """선택 영역을 지운다."""
+        self._select_rect = QRectF()
+        self._select_state = "idle"
+        self.viewport().update()
+
+    def render_selection(self) -> Optional[QImage]:
+        """선택 영역의 픽셀을 렌더링해 반환한다. 선택이 없으면 None."""
+        if not self.has_selection():
+            return None
+        r = self._select_rect
+        img = QImage(max(int(round(r.width())), 1), max(int(round(r.height())), 1),
+                     QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        self._scene.clearSelection()
+        painter = QPainter(img)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        self._scene.render(painter, QRectF(img.rect()), r)
+        painter.end()
+        return img
+
+    def cut_selection(self, fill_color: QColor = Qt.GlobalColor.white) -> Optional[QImage]:
+        """선택 영역을 잘라낸다.
+
+        선택 영역의 픽셀을 렌더링해 반환하고, 원본 캡처 이미지(base_item)에서
+        선택 영역과 겹치는 부분을 fill_color로 채운다. 다른 붙여넣은 이미지에는
+        영향을 주지 않는다.
+
+        Args:
+            fill_color: 잘라낸 자리를 채울 색.
+
+        Returns:
+            잘라낸 영역의 이미지. 선택이 없으면 None.
+        """
+        img = self.render_selection()
+        if img is None:
+            return None
+
+        base_rect = QRectF(self.base_item.pos(), QSizeF(self.base_item.pixmap().size()))
+        fill_rect = self._select_rect.intersected(base_rect).translated(-self.base_item.pos())
+        if not fill_rect.isEmpty():
+            self._push_undo()
+            pm = QPixmap(self.base_item.pixmap())
+            painter = QPainter(pm)
+            painter.fillRect(fill_rect, fill_color)
+            painter.end()
+            self.base_item.setPixmap(pm)
+
+        self.clear_selection()
+        self.changed.emit()
+        return img
+
+    # ---------- 핸들 공통 ---------- #
+    def _handle_size_scene(self) -> float:
+        """뷰 배율을 반영한 씬 좌표계에서의 핸들 크기."""
+        scale = self.transform().m11() or 1.0
+        return HANDLE_PX / scale
+
+    @staticmethod
+    def _handles_for(rect: QRectF, size: float) -> dict[tuple[int, int], QRectF]:
+        """rect의 8방향 조절 핸들 사각형을 계산한다."""
+        out = {}
+        for dx, dy in HANDLES:
+            cx = rect.left() + (rect.width() / 2 if dx == 0 else (0 if dx < 0 else rect.width()))
+            cy = rect.top() + (rect.height() / 2 if dy == 0 else (0 if dy < 0 else rect.height()))
+            out[(dx, dy)] = QRectF(cx - size / 2, cy - size / 2, size, size)
+        return out
+
+    # ---------- 캔버스 경계 핸들(여백 조절) ---------- #
+    def _canvas_handle_rects(self) -> dict[tuple[int, int], QRectF]:
+        """캔버스 경계의 8개 조절 핸들 사각형을 계산한다."""
+        return self._handles_for(self._scene.sceneRect(), self._handle_size_scene())
+
+    def _canvas_handle_at(self, view_pos: QPoint) -> Optional[tuple[int, int]]:
+        """뷰 좌표 view_pos 에 해당하는 캔버스 경계 핸들 키를 찾는다. 없으면 None."""
+        sp = self.mapToScene(view_pos)
+        for key, hr in self._canvas_handle_rects().items():
+            if hr.contains(sp):
+                return key
+        return None
+
+    # ---------- 선택 영역 핸들 ---------- #
+    def _select_handle_rects(self) -> dict[tuple[int, int], QRectF]:
+        """선택 영역의 8개 조절 핸들 사각형을 계산한다."""
+        return self._handles_for(self._select_rect, self._handle_size_scene())
+
+    def _select_handle_at(self, view_pos: QPoint) -> Optional[tuple[int, int]]:
+        """조절 모드에서 view_pos 에 해당하는 선택 핸들 키를 찾는다. 없으면 None."""
+        if self._select_state != "adjust":
+            return None
+        sp = self.mapToScene(view_pos)
+        for key, hr in self._select_handle_rects().items():
+            if hr.contains(sp):
+                return key
+        return None
+
+    def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
+        """뷰포트 배경과 캔버스(흰색) 영역을 그린다."""
+        painter.fillRect(rect, self.backgroundBrush())
+        painter.fillRect(self._scene.sceneRect(), QColor(0xff, 0xff, 0xff))
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        """캔버스 밖으로 삐져나온 내용을 가리고, 테두리·조절 핸들·선택 영역을 그린다."""
+        r = self._scene.sceneRect()
+        scale = self.transform().m11() or 1.0
+
+        # 아이템(배경 이미지 등)은 sceneRect로 자동으로 잘리지 않아, 캔버스를
+        # 축소하면 실제 경계 밖까지 그대로 보여 캔버스가 아니라 이미지 자체가
+        # 줄어드는 것처럼 보인다. 아이템 데이터는 그대로 두고, 화면에 보이는
+        # 부분만 경계 밖을 배경색으로 덮어 실제로 잘린 것처럼 보이게 한다
+        # (다시 캔버스를 늘리면 가려졌던 부분이 그대로 다시 나타난다).
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.backgroundBrush())
+        outside = QPainterPath()
+        outside.addRect(rect)
+        inside = QPainterPath()
+        inside.addRect(r)
+        painter.drawPath(outside.subtracted(inside))
+        painter.restore()
+
+        painter.save()
+        pen = QPen(QColor(0x2d, 0x7d, 0xd2))
+        pen.setWidthF(1.0 / scale)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(r)
+        painter.setBrush(QBrush(Qt.GlobalColor.white))
+        for hr in self._canvas_handle_rects().values():
+            painter.drawRect(hr)
+        painter.restore()
+
+        if self.tool == "select" and self.has_selection():
+            painter.save()
+            pen = QPen(ACCENT)
+            pen.setWidthF(1.0 / scale)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._select_rect)
+            if self._select_state == "adjust":
+                painter.setBrush(QBrush(Qt.GlobalColor.white))
+                for hr in self._select_handle_rects().values():
+                    painter.drawRect(hr)
+            painter.restore()
+
+        if self.tool == "text" and self._text_state == "dragging":
+            painter.save()
+            pen = QPen(ACCENT)
+            pen.setWidthF(1.0 / scale)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._text_rect)
+            painter.restore()
+
+        if self.tool == "shape" and self._shape_state == "dragging":
+            painter.save()
+            pen = QPen(ACCENT)
+            pen.setWidthF(1.0 / scale)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if is_line_kind(self.shape_subtool):
+                painter.drawLine(self._shape_rect.topLeft(), self._shape_rect.bottomRight())
+            else:
+                draw_bbox_shape(painter, self.shape_subtool, self._shape_rect)
+            painter.restore()
+
+        if self.tool == "shape" and self._curve_points:
+            painter.save()
+            painter.setPen(self._shape_pen())
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            draw_bezier_kind(painter, self.shape_subtool, self._curve_points, self.draw_thickness)
+
+            guide_pen = QPen(ACCENT)
+            guide_pen.setWidthF(1.0 / scale)
+            guide_pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(guide_pen)
+            p0, p1, p2, p3 = self._curve_points
+            painter.drawLine(p0, p1)
+            painter.drawLine(p3, p2)
+
+            handle_size = self._handle_size_scene()
+            painter.setPen(QPen(QColor(0x33, 0x33, 0x33), 1.0 / scale))
+            painter.setBrush(QBrush(QColor(0xff, 0xdd, 0x00)))
+            for p in self._curve_points:
+                painter.drawRect(QRectF(p.x() - handle_size / 2, p.y() - handle_size / 2,
+                                         handle_size, handle_size))
+            painter.restore()
+
+    def _clamp_to_scene(self, rect: QRectF) -> QRectF:
+        """선택 사각형을 씬 범위 안으로 밀어넣는다."""
+        r = QRectF(rect).normalized()
+        bounds = self._scene.sceneRect()
+        if r.width() > bounds.width():
+            r.setWidth(bounds.width())
+        if r.height() > bounds.height():
+            r.setHeight(bounds.height())
+        dx = min(0.0, bounds.right() - r.right()) or max(0.0, bounds.left() - r.left())
+        dy = min(0.0, bounds.bottom() - r.bottom()) or max(0.0, bounds.top() - r.top())
+        r.translate(dx, dy)
+        return r
+
+    # ---------- 마우스 ---------- #
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """캔버스 경계 핸들 클릭을 최우선 처리하고, 이후 도구별 동작을 위임한다.
+
+        편집 중인 텍스트 오버레이 바깥을 클릭하면(오버레이 안쪽 클릭은 오버레이
+        위젯이 직접 받아 이 메서드까지 오지 않는다) 먼저 편집 내용을 반영한다.
+        """
+        if self._text_overlay is not None:
+            self._commit_text_overlay()
+        if event.button() == Qt.MouseButton.LeftButton and self._curve_points:
+            idx = self._curve_handle_at(event.position().toPoint())
+            if idx is not None:
+                self._curve_drag_index = idx
+                event.accept()
+                return
+            # 핸들이 아닌 곳을 클릭하면 편집 중인 곡선을 그 모양대로 확정하고,
+            # 아래 일반 처리로 넘어가 이 클릭이 자유곡선이면 새 곡선을 바로 시작한다.
+            self._commit_curve()
+        if event.button() == Qt.MouseButton.LeftButton:
+            h = self._canvas_handle_at(event.position().toPoint())
+            if h:
+                self._drag_handle = h
+                self._drag_start_view = event.position()
+                self._drag_start_rect = QRectF(self._scene.sceneRect())
+                event.accept()
+                return
+            if self.tool == "select":
+                self._select_press(event.position().toPoint())
+                event.accept()
+                return
+            if self.tool == "draw":
+                self._draw_press(event.position().toPoint())
+                event.accept()
+                return
+            if self.tool == "fill":
+                self.fill_at(event.position().toPoint())
+                event.accept()
+                return
+            if self.tool == "text":
+                self._text_press(event.position().toPoint())
+                event.accept()
+                return
+            if self.tool == "shape":
+                self._shape_press(event.position().toPoint())
+                event.accept()
+                return
+            # '이동' 도구: 아이템 드래그가 실제로 위치를 바꿀 경우에만 되돌리기
+            # 항목으로 기록하기 위해, 드래그 시작 시점의 상태를 미리 잡아둔다.
+            self._pending_move_snapshot = self._snapshot()
+            self._pending_move_positions = {
+                id(it): QPointF(it.pos()) for it in self._scene.items()
+                if isinstance(it, QGraphicsPixmapItem)
+            }
+        super().mousePressEvent(event)
+
+    def _select_press(self, view_pos: QPoint) -> None:
+        """선택 도구: 드래그 시작, 핸들 잡기, 이동 시작을 처리한다."""
+        sp = self.mapToScene(view_pos)
+        h = self._select_handle_at(view_pos)
+        if h:
+            self._select_drag_handle = h
+            self._select_drag_ref = (sp, QRectF(self._select_rect))
+            return
+        if self._select_state == "adjust" and self._select_rect.contains(sp):
+            self._select_drag_handle = "move"
+            self._select_drag_ref = (sp, QRectF(self._select_rect))
+            return
+        self._select_state = "dragging"
+        self._select_origin = sp
+        self._select_rect = QRectF(sp, QSizeF(0, 0))
+        self.viewport().update()
+
+    # ---------- 텍스트 ---------- #
+    def _text_press(self, view_pos: QPoint) -> None:
+        """텍스트 도구: 새 텍스트 박스가 들어갈 영역 드래그를 시작한다."""
+        sp = self.mapToScene(view_pos)
+        self._text_state = "dragging"
+        self._text_origin = sp
+        self._text_rect = QRectF(sp, QSizeF(0, 0))
+        self.viewport().update()
+
+    def _text_move(self, view_pos: QPoint) -> None:
+        """텍스트 도구: 드래그 중인 영역을 갱신한다."""
+        if self._text_state == "dragging" and self._text_origin is not None:
+            sp = self.mapToScene(view_pos)
+            self._text_rect = QRectF(self._text_origin, sp).normalized()
+            self.viewport().update()
+
+    def _text_release(self) -> None:
+        """텍스트 도구: 드래그를 마치면 지정한 영역에 편집 오버레이를 연다."""
+        if self._text_state != "dragging":
+            return
+        self._text_state = "idle"
+        rect = self._clamp_to_scene(self._text_rect)
+        self._text_rect = QRectF()
+        self.viewport().update()
+        if rect.width() < MIN_SELECTION or rect.height() < MIN_SELECTION:
+            return
+        self._open_text_editor(rect=rect)
+
+    def _open_text_editor(self, rect: Optional[QRectF] = None,
+                           existing_item: Optional[QGraphicsPixmapItem] = None) -> None:
+        """지정한 영역(신규) 또는 기존 텍스트 아이템 위에 편집 오버레이를 연다."""
+        if self._text_overlay is not None:
+            self._commit_text_overlay()
+
+        if existing_item is not None:
+            rect = QRectF(existing_item.pos(), QSizeF(existing_item.pixmap().size()))
+            meta = self._text_meta.get(id(existing_item), {})
+            text = meta.get("text", "")
+            font = QFont(meta.get("font", self.text_font))
+            color = QColor(meta.get("color", self.text_color))
+            align_h = meta.get("align_h", self.text_align_h)
+        else:
+            text = ""
+            font = QFont(self.text_font)
+            color = QColor(self.text_color)
+            align_h = self.text_align_h
+
+        if rect is None:
+            return
+        self._text_editing_item = existing_item
+        self._text_new_rect = QRectF(rect) if existing_item is None else None
+
+        overlay = _TextEditOverlay(self.viewport())
+        top_left = self.mapFromScene(rect.topLeft())
+        bottom_right = self.mapFromScene(rect.bottomRight())
+        size = QSize(max(bottom_right.x() - top_left.x(), 1), max(bottom_right.y() - top_left.y(), 1))
+        overlay.setGeometry(QRect(top_left, size))
+        overlay.text_edit.setPlainText(text)
+        self._style_text_edit(overlay.text_edit, font, color, align_h)
+        overlay.closed.connect(self._commit_text_overlay)
+        overlay.cancelled.connect(self._discard_text_overlay)
+        self._text_overlay = overlay
+        overlay.show()
+        overlay.raise_()
+        overlay.text_edit.setFocus()
+        overlay.text_edit.selectAll()
+
+    @staticmethod
+    def _style_text_edit(text_edit: QTextEdit, font: QFont, color: QColor, align_h: str) -> None:
+        """편집 중인 텍스트칸에 폰트/색/가로 정렬을 실시간으로 반영한다.
+
+        세로 정렬은 QTextEdit이 내용 세로 정렬을 지원하지 않아 여기서는
+        반영하지 않고, 최종 래스터화(_rasterize_text) 시점에만 적용한다.
+        """
+        text_edit.setFont(font)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor = text_edit.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.mergeCharFormat(fmt)
+        text_edit.mergeCurrentCharFormat(fmt)
+        h_flags = {"left": Qt.AlignmentFlag.AlignLeft, "center": Qt.AlignmentFlag.AlignHCenter,
+                   "right": Qt.AlignmentFlag.AlignRight}
+        text_edit.setAlignment(h_flags.get(align_h, Qt.AlignmentFlag.AlignLeft))
+
+    def commit_text_editing(self) -> None:
+        """편집 중인 텍스트 오버레이가 있으면 반영하고 닫는다 (없으면 아무 동작 없음)."""
+        self._commit_text_overlay()
+
+    def commit_pending_edit(self) -> None:
+        """편집 중인 텍스트나 자유곡선이 있으면 그 시점 상태로 캔버스에 반영한다.
+
+        저장/복사/잘라내기/탭 전환/탭 닫기/실행취소처럼 캔버스 내용을 최종
+        이미지로 다루기 전에 호출해, 아직 래스터화되지 않은 편집 중인 내용이
+        누락되지 않게 한다. 확대/축소(wheelEvent)처럼 자유곡선 편집을 방해할
+        필요가 없는 곳에서는 commit_text_editing()만 쓴다.
+        """
+        self._commit_text_overlay()
+        if self._curve_points:
+            self._commit_curve()
+
+    def _commit_text_overlay(self) -> None:
+        """편집 오버레이를 닫고, 입력된 텍스트를 래스터화해 씬에 반영한다.
+
+        내용이 비어 있으면: 신규 박스는 그냥 버리고, 기존 박스는 삭제한다.
+        """
+        if self._text_overlay is None:
+            return
+        overlay = self._text_overlay
+        text = overlay.text_edit.toPlainText()
+        existing = self._text_editing_item
+        rect = (QRectF(existing.pos(), QSizeF(existing.pixmap().size()))
+                if existing is not None else self._text_new_rect)
+
+        self._text_overlay = None
+        self._text_editing_item = None
+        self._text_new_rect = None
+        overlay.setParent(None)
+        overlay.deleteLater()
+
+        if not text.strip():
+            if existing is not None:
+                self._push_undo()
+                self._scene.removeItem(existing)
+                self._text_meta.pop(id(existing), None)
+                self.changed.emit()
+            return
+
+        if rect is None:
+            return
+        pixmap = self._rasterize_text(text, self.text_font, self.text_color,
+                                       self.text_align_h, self.text_align_v, rect.size())
+        meta = {"text": text, "font": QFont(self.text_font), "color": QColor(self.text_color),
+                "align_h": self.text_align_h, "align_v": self.text_align_v}
+        self._push_undo()
+        if existing is not None:
+            existing.setPixmap(pixmap)
+            existing.setZValue(len(self._scene.items()))
+            self._text_meta[id(existing)] = meta
+            self.changed.emit()
+        else:
+            item = self._add_pixmap(pixmap, rect.topLeft().toPoint())
+            # 텍스트는 대부분 투명 배경이라, 기본 마스크 기반 히트 테스트로는
+            # 글자가 없는 빈 공간을 클릭(더블클릭 재편집 포함)했을 때 반응하지
+            # 않는다. 상자 전체 영역을 클릭 대상으로 삼도록 바꾼다.
+            item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
+            self._text_meta[id(item)] = meta
+
+    def _discard_text_overlay(self) -> None:
+        """편집 내용을 반영하지 않고 오버레이만 닫는다 (Esc)."""
+        if self._text_overlay is None:
+            return
+        overlay = self._text_overlay
+        self._text_overlay = None
+        self._text_editing_item = None
+        self._text_new_rect = None
+        overlay.setParent(None)
+        overlay.deleteLater()
+
+    @staticmethod
+    def _rasterize_text(text: str, font: QFont, color: QColor, align_h: str, align_v: str,
+                         size: QSizeF) -> QPixmap:
+        """텍스트를 지정한 폰트/색/정렬로 지정 크기의 투명 배경 픽스맵에 그린다."""
+        w = max(int(round(size.width())), 1)
+        h = max(int(round(size.height())), 1)
+        pixmap = QPixmap(w, h)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setFont(font)
+        painter.setPen(QColor(color))
+        h_flags = {"left": Qt.AlignmentFlag.AlignLeft, "center": Qt.AlignmentFlag.AlignHCenter,
+                   "right": Qt.AlignmentFlag.AlignRight}[align_h]
+        v_flags = {"top": Qt.AlignmentFlag.AlignTop, "middle": Qt.AlignmentFlag.AlignVCenter,
+                   "bottom": Qt.AlignmentFlag.AlignBottom}[align_v]
+        painter.drawText(pixmap.rect(), int(h_flags | v_flags | Qt.TextFlag.TextWordWrap), text)
+        painter.end()
+        return pixmap
+
+    # ---------- 도형/선 ---------- #
+    def _shape_press(self, view_pos: QPoint) -> None:
+        """도형 도구: 바운딩 박스 도형, 직선, 또는 자유곡선의 첫 직선 드래그를 시작한다.
+
+        자유곡선도 처음에는 직선과 똑같이 드래그로 시작하고(아래 _shape_release
+        참고), 이후 4개 제어점을 드래그로 조정하는 편집 모드로 들어간다.
+        """
+        sp = self.mapToScene(view_pos)
+        self._shape_state = "dragging"
+        self._shape_origin = sp
+        self._shape_rect = QRectF(sp, QSizeF(0, 0))
+        self.viewport().update()
+
+    def _shape_move(self, view_pos: QPoint, shift: bool) -> None:
+        """도형 도구: 드래그 중인 미리보기 또는 자유곡선 제어점 드래그를 갱신한다.
+
+        Shift를 누른 채면 바운딩 박스 도형은 가로세로 비율 1:1로 고정되고,
+        직선/자유곡선(첫 드래그 구간)은 각도가 45도 단위(수평/수직/대각선)로
+        스냅된다. '원'은 항상 정사각형 박스로 고정되어 Shift 없이도 원이 된다.
+        """
+        sp = self.mapToScene(view_pos)
+        if self._curve_drag_index is not None:
+            self._curve_points[self._curve_drag_index] = sp
+            self.viewport().update()
+            return
+        if self._shape_state != "dragging" or self._shape_origin is None:
+            return
+        if is_line_kind(self.shape_subtool):
+            end = snap_line_angle(self._shape_origin, sp) if shift else sp
+            self._shape_rect = QRectF(self._shape_origin, end)
+        elif shift or self.shape_subtool == "circle":
+            self._shape_rect = lock_square(self._shape_origin, sp)
+        else:
+            self._shape_rect = QRectF(self._shape_origin, sp).normalized()
+        self.viewport().update()
+
+    def _shape_release(self) -> None:
+        """도형 도구: 드래그를 마친다.
+
+        도형/직선은 곧바로 캔버스에 반영하고, 자유곡선은 시작-1/3-2/3-끝
+        4개 제어점을 만들어 핸들로 조정하는 편집 모드로 들어간다(캔버스
+        반영은 _commit_curve가 담당). 자유곡선 제어점을 드래그하던 중이면
+        드래그만 끝내고 편집 모드는 계속 유지한다.
+        """
+        if self._curve_drag_index is not None:
+            self._curve_drag_index = None
+            return
+        if self._shape_state != "dragging":
+            return
+        rect = QRectF(self._shape_rect)
+        self._shape_state = "idle"
+        self._shape_origin = None
+        self._shape_rect = QRectF()
+        self.viewport().update()
+        p0, p3 = rect.topLeft(), rect.bottomRight()
+        if (p0 - p3).manhattanLength() < MIN_SELECTION:
+            return
+        if self.shape_subtool in FREEHAND_KINDS:
+            self._curve_points = [p0, p0 + (p3 - p0) / 3.0, p0 + (p3 - p0) * 2.0 / 3.0, p3]
+            self.viewport().update()
+            return
+        if is_line_kind(self.shape_subtool):
+            self._commit_line_shape(p0, p3)
+            return
+        bbox = self._clamp_to_scene(rect)
+        if bbox.width() >= MIN_SELECTION and bbox.height() >= MIN_SELECTION:
+            self._commit_bbox_shape(bbox)
+
+    def _curve_handle_rects(self) -> list[QRectF]:
+        """편집 중인 자유곡선의 4개 조절점(시작/제어1/제어2/끝) 사각형을 계산한다."""
+        size = self._handle_size_scene()
+        return [QRectF(p.x() - size / 2, p.y() - size / 2, size, size) for p in self._curve_points]
+
+    def _curve_handle_at(self, view_pos: QPoint) -> Optional[int]:
+        """뷰 좌표 view_pos에 해당하는 자유곡선 조절점 인덱스를 찾는다. 없으면 None."""
+        sp = self.mapToScene(view_pos)
+        for i, hr in enumerate(self._curve_handle_rects()):
+            if hr.contains(sp):
+                return i
+        return None
+
+    def _commit_curve(self) -> None:
+        """편집 중인 자유곡선(베지에)을 그 시점 모양대로 래스터화해 새 아이템으로 추가한다."""
+        points = self._curve_points
+        self._curve_points = []
+        self._curve_drag_index = None
+        self.viewport().update()
+        if len(points) != 4:
+            return
+        pad = self._shape_pad() + self._arrowhead_margin()
+        xs, ys = [p.x() for p in points], [p.y() for p in points]
+        left, top = min(xs) - pad, min(ys) - pad
+        w, h = max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad
+        pixmap = QPixmap(max(int(round(w)), 1), max(int(round(h)), 1))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(self._shape_pen())
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        origin = QPointF(left, top)
+        draw_bezier_kind(painter, self.shape_subtool, [p - origin for p in points], self.draw_thickness)
+        painter.end()
+        self._push_undo()
+        self._add_pixmap(pixmap, QPoint(int(round(left)), int(round(top))))
+
+    def _shape_pad(self) -> int:
+        """도형 획(pen) 두께가 픽스맵 경계에서 잘리지 않도록 필요한 여백."""
+        return int(math.ceil(self.draw_thickness / 2)) + 2
+
+    def _shape_pen(self) -> QPen:
+        """도형/선 그리기에 쓸 pen (현재 두께/색, 둥근 이음새)을 만든다."""
+        pen = QPen(QColor(self.draw_color))
+        pen.setWidthF(max(self.draw_thickness, 1))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        return pen
+
+    def _commit_bbox_shape(self, rect: QRectF) -> None:
+        """드래그로 정의된 바운딩 박스 도형을 래스터화해 새(이동 가능한) 아이템으로 추가한다."""
+        pad = self._shape_pad()
+        w, h = max(int(round(rect.width())), 1), max(int(round(rect.height())), 1)
+        pixmap = QPixmap(w + 2 * pad, h + 2 * pad)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(self._shape_pen())
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        draw_bbox_shape(painter, self.shape_subtool, QRectF(pad, pad, w, h))
+        painter.end()
+        self._push_undo()
+        self._add_pixmap(pixmap, (rect.topLeft() - QPointF(pad, pad)).toPoint())
+
+    def _arrowhead_margin(self) -> int:
+        """화살표 날개가 픽스맵 밖으로 잘리지 않도록 필요한 추가 여백."""
+        if self.shape_subtool not in ARROW_KINDS:
+            return 0
+        return int(math.ceil(arrowhead_length(self.draw_thickness))) + 2
+
+    def _commit_line_shape(self, p1: QPointF, p2: QPointF) -> None:
+        """드래그로 정의된 직선(화살표 포함 가능)을 래스터화해 새 아이템으로 추가한다."""
+        pad = self._shape_pad() + self._arrowhead_margin()
+        left, top = min(p1.x(), p2.x()) - pad, min(p1.y(), p2.y()) - pad
+        w = abs(p2.x() - p1.x()) + 2 * pad
+        h = abs(p2.y() - p1.y()) + 2 * pad
+        pixmap = QPixmap(max(int(round(w)), 1), max(int(round(h)), 1))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(self._shape_pen())
+        origin = QPointF(left, top)
+        draw_line_kind(painter, self.shape_subtool, p1 - origin, p2 - origin, self.draw_thickness)
+        painter.end()
+        self._push_undo()
+        self._add_pixmap(pixmap, QPoint(int(round(left)), int(round(top))))
+
+    # ---------- 그리기(브러시/지우개/형광펜) ---------- #
+    def _pixel_align(self, point: QPointF) -> QPointF:
+        """선이 픽셀 경계에 걸쳐 안티앨리어싱으로 번지지 않도록 좌표를 보정한다.
+
+        홀수 두께(1, 3, 5...)는 픽셀 중앙(x.5)에 맞춰야, 짝수 두께는 픽셀
+        경계(정수)에 맞춰야 안티앨리어싱 없이 딱 지정한 두께만큼만 그려진다.
+        맞추지 않으면 선이 두 픽셀 행/열에 반투명하게 걸쳐 그려져, 예를 들어
+        1px 지정이 2px처럼(양쪽에 반투명 1px씩), 5px 지정이 6px처럼 보인다.
+        """
+        if self.draw_thickness % 2 == 1:
+            return QPointF(math.floor(point.x()) + 0.5, math.floor(point.y()) + 0.5)
+        return QPointF(round(point.x()), round(point.y()))
+
+    def _draw_press(self, view_pos: QPoint) -> None:
+        """그리기 도구: 새 스트로크를 시작한다."""
+        self._push_undo()
+        self.draw_item.setZValue(len(self._scene.items()))
+        sp = self._pixel_align(self.mapToScene(view_pos) - self.draw_item.pos())
+        self._stroke_path = QPainterPath()
+        self._stroke_path.moveTo(sp)
+        self._stroke_last_point = sp
+        if self.draw_subtool != "eraser":
+            self._stroke_backup = QPixmap(self.draw_item.pixmap())
+        self._draw_dot(sp)
+
+    def _draw_dot(self, local_point: QPointF) -> None:
+        """스트로크 시작점 등 한 점만 찍힌 경우에도 보이도록 점을 그린다."""
+        if self.draw_subtool == "eraser":
+            self._erase_segment(local_point, local_point)
+        else:
+            self._paint_stroke()
+
+    def _draw_move(self, view_pos: QPoint) -> None:
+        """그리기 도구: 스트로크를 이어 그린다."""
+        if self._stroke_path is None:
+            return
+        sp = self._pixel_align(self.mapToScene(view_pos) - self.draw_item.pos())
+        if self.draw_subtool == "eraser":
+            self._erase_segment(self._stroke_last_point, sp)
+            self._stroke_last_point = sp
+        else:
+            self._stroke_path.lineTo(sp)
+            self._paint_stroke()
+        self.changed.emit()
+
+    def _draw_release(self) -> None:
+        """그리기 도구: 스트로크를 종료한다."""
+        self._stroke_path = None
+        self._stroke_backup = None
+        self._stroke_last_point = None
+
+    def _paint_stroke(self) -> None:
+        """브러시/형광펜: 백업 위에 현재까지의 전체 경로를 다시 그려 자기 겹침으로
+        인한 불필요한 진해짐 없이, 스트로크끼리는 겹칠수록 짙어지게 한다."""
+        pm = QPixmap(self._stroke_backup)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = QColor(self.draw_color)
+        color.setAlphaF(HIGHLIGHTER_ALPHA if self.draw_subtool == "highlighter" else 1.0)
+        pen = QPen(color)
+        pen.setWidthF(max(self.draw_thickness, 1))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(self._stroke_path)
+        painter.end()
+        self.draw_item.setPixmap(pm)
+
+    def _erase_segment(self, p1: QPointF, p2: QPointF) -> None:
+        """지우개: 그리기 레이어에서 p1-p2 구간을 투명하게 지운다."""
+        pm = QPixmap(self.draw_item.pixmap())
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        pen = QPen(Qt.GlobalColor.black)
+        pen.setWidthF(max(self.draw_thickness, 1))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(p1, p2)
+        painter.end()
+        self.draw_item.setPixmap(pm)
+
+    # ---------- 채우기 ---------- #
+    def fill_at(self, view_pos: QPoint) -> bool:
+        """클릭 지점과 연결된, 허용 범위 내의 인접 색상 영역을 draw_color로 채운다.
+
+        화면에 실제로 보이는 색(원본 이미지 + 그리기 레이어 + 다른 이미지가
+        합쳐진 결과)을 기준으로 영역을 찾고, 채운 결과는 그리기 레이어에만
+        그린다 (원본/다른 이미지는 건드리지 않음).
+
+        Args:
+            view_pos: 뷰(위젯) 좌표의 클릭 지점.
+
+        Returns:
+            실제로 채웠는지 여부 (클릭 지점이 캔버스 밖이면 False).
+        """
+        scene_rect = self._scene.sceneRect()
+        sp = self.mapToScene(view_pos)
+        if not scene_rect.contains(sp):
+            return False
+
+        composed = self.render_image().convertToFormat(QImage.Format.Format_RGB32)
+        w, h = composed.width(), composed.height()
+        x = int(sp.x() - scene_rect.left())
+        y = int(sp.y() - scene_rect.top())
+        if not (0 <= x < w and 0 <= y < h):
+            return False
+
+        stride = composed.bytesPerLine()
+        buf = np.frombuffer(composed.constBits(), dtype=np.uint8, count=stride * h)
+        arr = buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4)[:, :, :3].astype(np.int16)
+
+        target = arr[y, x]
+        threshold = self.fill_tolerance / 100 * 255
+        mask = np.all(np.abs(arr - target) <= threshold, axis=2)
+        labeled, _ = ndimage.label(mask)
+        region = labeled == labeled[y, x]
+        pixel_count = int(region.sum())
+        if pixel_count == 0:
+            return False
+
+        fill_img = QImage(w, h, QImage.Format.Format_ARGB32)
+        fill_img.fill(Qt.GlobalColor.transparent)
+        fill_stride = fill_img.bytesPerLine()
+        fill_buf = np.frombuffer(fill_img.bits(), dtype=np.uint8, count=fill_stride * h)
+        fill_arr = fill_buf.reshape(h, fill_stride)[:, :w * 4].reshape(h, w, 4)
+        c = QColor(self.draw_color)
+        fill_arr[region] = [c.blue(), c.green(), c.red(), 255]
+
+        self._push_undo()
+        pm = QPixmap(self.draw_item.pixmap())
+        painter = QPainter(pm)
+        painter.drawImage(scene_rect.topLeft() - self.draw_item.pos(), fill_img)
+        painter.end()
+        self.draw_item.setPixmap(pm)
+        self.draw_item.setZValue(len(self._scene.items()))
+        self.changed.emit()
+        logger.info("채우기: (%d, %d)에서 %d픽셀, 허용범위=%d%%", x, y, pixel_count, self.fill_tolerance)
+        return True
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """여백 조절 드래그 중이면 캔버스 크기를 갱신하고, 아니면 도구별 동작으로 위임한다."""
+        if self._drag_handle and self._drag_start_view is not None and self._drag_start_rect is not None:
+            # 뷰 좌표 기준으로 이동량을 구한다. 드래그 중에 씬 크기가 바뀌면
+            # (캔버스보다 작은 뷰포트에서는 씬이 가운데로 재정렬되어) 같은
+            # 화면 위치라도 mapToScene() 결과가 계속 달라져, 그 값으로 이동량을
+            # 계산하면 매 이동마다 오차가 누적되어 캔버스가 실제 마우스
+            # 이동량보다 훨씬 크게/작게 늘어나거나 줄어든다.
+            scale = self.transform().m11() or 1.0
+            dx = (event.position().x() - self._drag_start_view.x()) / scale
+            dy = (event.position().y() - self._drag_start_view.y()) / scale
+            hx, hy = self._drag_handle
+            r = QRectF(self._drag_start_rect)
+            left, top, right, bottom = r.left(), r.top(), r.right(), r.bottom()
+            if hx < 0:
+                left = min(left + dx, right - MIN_CANVAS)
+            elif hx > 0:
+                right = max(right + dx, left + MIN_CANVAS)
+            if hy < 0:
+                top = min(top + dy, bottom - MIN_CANVAS)
+            elif hy > 0:
+                bottom = max(bottom + dy, top + MIN_CANVAS)
+            new_rect = QRectF(left, top, right - left, bottom - top)
+            old_rect = QRectF(self._scene.sceneRect())
+            # 그리기 레이어도 새 크기로 맞춰야, 손잡이로 캔버스를 넓힌 뒤 그
+            # 새로 늘어난 영역에 그리기/채우기가 실제로 반영된다 (레이어 크기가
+            # 예전 그대로면 그 영역에 그린 내용이 화면 밖처럼 잘려 사라진다).
+            self._resize_draw_layer(new_rect, old_rect)
+            self._scene.setSceneRect(new_rect)
+            self.viewport().update()
+            self.changed.emit()
+            event.accept()
+            return
+
+        if self.tool == "select":
+            self._select_move(event.position().toPoint())
+            event.accept()
+            return
+
+        if self.tool == "draw" and self._stroke_path is not None:
+            self._draw_move(event.position().toPoint())
+            event.accept()
+            return
+
+        if self.tool == "fill":
+            event.accept()
+            return
+
+        if self.tool == "text":
+            self._text_move(event.position().toPoint())
+            event.accept()
+            return
+
+        if self.tool == "shape":
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self._shape_move(event.position().toPoint(), shift)
+            event.accept()
+            return
+
+        h = self._canvas_handle_at(event.position().toPoint())
+        self.viewport().setCursor(CURSORS[h] if h is not None else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def _select_move(self, view_pos: QPoint) -> None:
+        """선택 도구: 이동/조절 드래그 또는 일반 드래그, 커서 갱신을 처리한다."""
+        sp = self.mapToScene(view_pos)
+
+        if self._select_drag_handle == "move":
+            if self._select_drag_ref is None:
+                return
+            start, rect0 = self._select_drag_ref
+            r = QRectF(rect0)
+            r.translate(sp - start)
+            self._select_rect = self._clamp_to_scene(r)
+            self.viewport().update()
+            return
+
+        if self._select_drag_handle:
+            if self._select_drag_ref is None or isinstance(self._select_drag_handle, str):
+                return
+            start, rect0 = self._select_drag_ref
+            hx, hy = self._select_drag_handle
+            d = sp - start
+            left, top, right, bottom = rect0.left(), rect0.top(), rect0.right(), rect0.bottom()
+            if hx < 0:
+                left = min(left + d.x(), right - MIN_SELECTION)
+            elif hx > 0:
+                right = max(right + d.x(), left + MIN_SELECTION)
+            if hy < 0:
+                top = min(top + d.y(), bottom - MIN_SELECTION)
+            elif hy > 0:
+                bottom = max(bottom + d.y(), top + MIN_SELECTION)
+            self._select_rect = self._clamp_to_scene(QRectF(left, top, right - left, bottom - top))
+            self.viewport().update()
+            return
+
+        if self._select_state == "dragging":
+            if self._select_origin is not None:
+                self._select_rect = QRectF(self._select_origin, sp).normalized()
+        elif self._select_state == "adjust":
+            h = self._select_handle_at(view_pos)
+            self.viewport().setCursor(CURSORS[h] if h is not None else Qt.CursorShape.ArrowCursor)
+        self.viewport().update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        """캔버스 여백 조절 드래그 또는 도구별 드래그를 종료한다."""
+        if self._drag_handle:
+            self._drag_handle = None
+            event.accept()
+            return
+        if self.tool == "select":
+            self._select_release()
+            event.accept()
+            return
+        if self.tool == "draw":
+            self._draw_release()
+            event.accept()
+            return
+        if self.tool == "fill":
+            event.accept()
+            return
+        if self.tool == "text":
+            self._text_release()
+            event.accept()
+            return
+        if self.tool == "shape":
+            self._shape_release()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+        self._commit_pending_move()
+
+    def _commit_pending_move(self) -> None:
+        """드래그로 아이템 위치가 실제로 바뀌었으면 되돌리기 항목으로 확정한다."""
+        snapshot, before = self._pending_move_snapshot, self._pending_move_positions
+        self._pending_move_snapshot = None
+        self._pending_move_positions = None
+        if snapshot is None or before is None:
+            return
+        after = {id(it): it.pos() for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)}
+        if before != after:
+            self._undo_stack.append(snapshot)
+            if len(self._undo_stack) > self.MAX_UNDO:
+                self._undo_stack.pop(0)
+            self._redo_stack.clear()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """텍스트 박스를 더블클릭하면 (현재 도구와 무관하게) 편집 오버레이를 다시 연다."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if isinstance(item, QGraphicsPixmapItem) and id(item) in self._text_meta:
+                self._open_text_editor(existing_item=item)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def _select_release(self) -> None:
+        """선택 도구: 드래그/조절 종료를 처리하고 필요 시 adjust 상태로 전환한다."""
+        if self._select_drag_handle:
+            self._select_drag_handle = None
+            self._select_drag_ref = None
+            return
+        if self._select_state == "dragging":
+            if self._select_rect.width() < MIN_SELECTION or self._select_rect.height() < MIN_SELECTION:
+                self._select_rect = QRectF()
+                self._select_state = "idle"
+            else:
+                self._select_state = "adjust"
+            self.viewport().update()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        """선택 도구에서 Esc로 선택 영역을 취소한다."""
+        if self.tool == "select" and event.key() == Qt.Key.Key_Escape and self.has_selection():
+            self.clear_selection()
+            return
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Ctrl+휠로 뷰를 확대/축소한다.
+
+        확대/축소하면 편집 오버레이의 화면 위치가 캔버스와 어긋나므로 먼저 반영하고 닫는다.
+        """
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.commit_text_editing()
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            self.scale(factor, factor)
+            self.viewport().update()
+            self.viewChanged.emit()
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def render_image(self) -> QImage:
+        """sceneRect 영역만 렌더링하여 QImage로 반환한다."""
+        r = self._scene.sceneRect()
+        img = QImage(max(int(round(r.width())), 1), max(int(round(r.height())), 1),
+                     QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.white)
+        self._scene.clearSelection()
+        painter = QPainter(img)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        self._scene.render(painter, QRectF(img.rect()), r)
+        painter.end()
+        return img
