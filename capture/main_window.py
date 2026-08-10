@@ -7,9 +7,10 @@ import os
 from datetime import datetime
 from typing import Callable, Optional, cast
 
-from PySide6.QtCore import QRect, QSettings, QSize, QStandardPaths, Qt
-from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDragEnterEvent, QDropEvent,
-                            QFont, QGuiApplication, QIcon, QImage, QKeySequence, QShortcut)
+from PySide6.QtCore import QRect, QSettings, QSize, QStandardPaths, QUrl, Qt
+from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices,
+                            QDragEnterEvent, QDropEvent, QFont, QGuiApplication, QIcon, QImage,
+                            QKeySequence, QShortcut)
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                 QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
                                 QMenu, QMessageBox, QSizePolicy, QSpinBox, QTabBar, QTabWidget,
@@ -37,6 +38,7 @@ from capture.dialog_utils import strip_minmax_buttons
 from capture.dual_slider_dialog import DualSliderDialog
 from capture.hotkeys import HotkeyFilter, HotkeySpec, register_global_hotkeys, unregister_global_hotkeys
 from capture.image_resize_dialog import ImageResizeDialog
+from capture.logging_setup import get_log_dir
 from capture.palette import PaletteWidget
 from capture.percent_dialog import PercentSettingsDialog
 from capture.region_overlay import RegionOverlay
@@ -928,6 +930,10 @@ class MainWindow(QMainWindow):
         self._shortcut_settings_action = QAction("캡처 단축키 설정...", self)
         self._shortcut_settings_action.triggered.connect(self._open_shortcut_settings)
         self._options_menu.addAction(self._shortcut_settings_action)
+
+        self._log_folder_action = QAction("Log", self)
+        self._log_folder_action.triggered.connect(self._open_log_folder)
+        self._options_menu.addAction(self._log_folder_action)
         self._options_menu.addSeparator()
 
         def add(menu: QMenu, text: str, slot, shortcut: Optional[str] = None) -> QAction:
@@ -1190,6 +1196,12 @@ class MainWindow(QMainWindow):
             unregister_global_hotkeys(self.hotkey_filter)
             self._register_hotkeys()
             self.statusBar().showMessage("캡처 단축키를 저장했습니다.", 3000)
+
+    def _open_log_folder(self) -> None:
+        """로그 파일이 저장되는 폴더를 파일 탐색기로 연다."""
+        log_dir = get_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir)))
 
     # ---------- 편집/저장 ---------- #
     def paste_into_current(self) -> None:

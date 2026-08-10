@@ -24,6 +24,12 @@ _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _crash_file: Optional[IO[str]] = None
 
 
+def get_log_dir() -> Path:
+    """로그 파일이 저장되는 디렉터리 경로를 반환한다(생성 여부와 무관하게 항상 동일한 규칙)."""
+    app_data = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+    return Path(app_data or Path.home() / APP_NAME) / "logs"
+
+
 def setup_logging(level: int = logging.INFO) -> Path:
     """루트 로거에 파일/콘솔 핸들러를 구성한다.
 
@@ -35,8 +41,7 @@ def setup_logging(level: int = logging.INFO) -> Path:
     Returns:
         로그 파일 경로.
     """
-    app_data = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
-    log_dir = Path(app_data or Path.home() / APP_NAME) / "logs"
+    log_dir = get_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{APP_NAME.lower()}.log"
 
