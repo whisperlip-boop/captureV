@@ -37,6 +37,22 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     """QApplication을 생성하고 메인 윈도우를 실행한다."""
+    if IS_WIN:
+        # python.exe(또는 PyInstaller 부트로더)의 기본 매니페스트는 보통
+        # "System DPI Aware"(모니터 전체에 단일 DPI만 적용)라, 배율이 같아도
+        # 모니터별로 따로 합성되는 화면 캡처/오버레이에서 경계가 어긋나거나
+        # 화면이 밀리는 문제가 생길 수 있다. Qt가 초기화되기 전(QApplication
+        # 생성 전)에 Per-Monitor V2로 직접 올려야 나중에는 바꿀 수 없다.
+        try:
+            set_dpi_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
+            set_dpi_context.argtypes = [ctypes.c_void_p]
+            set_dpi_context.restype = ctypes.c_bool
+            per_monitor_v2 = ctypes.c_void_p((-4) & 0xFFFFFFFFFFFFFFFF)
+            if not set_dpi_context(per_monitor_v2):
+                logger.warning("Per-Monitor V2 DPI 인식 설정 실패(이미 다른 값으로 설정됐거나 미지원 Windows 버전)")
+        except Exception:
+            logger.exception("DPI 인식 설정 중 예외 발생")
+
     log_path = setup_logging()
     logger.info("%s 시작 (로그 파일: %s)", APP_NAME, log_path)
 
