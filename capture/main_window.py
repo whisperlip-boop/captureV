@@ -1055,10 +1055,12 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
             | QMessageBox.StandardButton.Cancel, self)
         box.button(QMessageBox.StandardButton.Save).setText("저장")
-        box.button(QMessageBox.StandardButton.Discard).setText("저장 안 함")
+        box.button(QMessageBox.StandardButton.Discard).setText("저장 안 함(N)")
         box.button(QMessageBox.StandardButton.Cancel).setText("취소")
         box.setDefaultButton(QMessageBox.StandardButton.Save)
         strip_minmax_buttons(box)
+        discard_btn = box.button(QMessageBox.StandardButton.Discard)
+        QShortcut(QKeySequence(Qt.Key.Key_N), box).activated.connect(discard_btn.click)
         result = box.exec()
 
         if result == QMessageBox.StandardButton.Cancel:

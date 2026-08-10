@@ -29,7 +29,7 @@ from PySide6.QtWidgets import QApplication
 
 from capture.config import APP_NAME, IS_WIN, get_resource_path
 from capture.hotkeys import unregister_global_hotkeys
-from capture.logging_setup import setup_logging
+from capture.logging_setup import install_excepthook, setup_logging
 from capture.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     """QApplication을 생성하고 메인 윈도우를 실행한다."""
+    # 이후 코드에서 발생하는 예외/크래시를 빠짐없이 로그로 남기기 위해
+    # 다른 어떤 처리보다도 먼저 로깅과 예외 훅을 구성한다.
+    log_path = setup_logging()
+    install_excepthook()
+    logger.info("%s 시작 (로그 파일: %s)", APP_NAME, log_path)
+
     if IS_WIN:
         # python.exe(또는 PyInstaller 부트로더)의 기본 매니페스트는 보통
         # "System DPI Aware"(모니터 전체에 단일 DPI만 적용)라, 배율이 같아도
@@ -52,9 +58,6 @@ def main() -> None:
                 logger.warning("Per-Monitor V2 DPI 인식 설정 실패(이미 다른 값으로 설정됐거나 미지원 Windows 버전)")
         except Exception:
             logger.exception("DPI 인식 설정 중 예외 발생")
-
-    log_path = setup_logging()
-    logger.info("%s 시작 (로그 파일: %s)", APP_NAME, log_path)
 
     if IS_WIN:
         # 이 AppUserModelID를 지정해야 작업표시줄이 python.exe 대신 이 앱의
