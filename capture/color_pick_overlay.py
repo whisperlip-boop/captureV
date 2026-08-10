@@ -12,8 +12,8 @@ import logging
 from typing import Optional
 
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import (QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPainterPath,
-                            QPaintEvent, QPen)
+from PySide6.QtGui import (QColor, QCursor, QFont, QKeyEvent, QMouseEvent, QPainter, QPainterPath,
+                            QPaintEvent, QPen, QPixmap)
 from PySide6.QtWidgets import QWidget
 
 from capture.config import ACCENT
@@ -28,6 +28,33 @@ _MAGNIFIER_GRID_COLOR = QColor(128, 128, 128, 120)
 _MAGNIFIER_LABEL_HEIGHT = 18
 _MAGNIFIER_LABEL_BOTTOM_MARGIN = 6      # 라벨 박스 아래쪽 변을 원의 맨 아래 접점에서 이만큼 띄운다
 _MAGNIFIER_LABEL_BG_ALPHA = 180         # 기존(200)보다 10% 더 투명하게
+
+_CURSOR_SIZE = 21     # 홀수라야 정중앙이 픽셀 하나로 딱 떨어진다
+_CURSOR_GAP = 3        # 중심에서 이만큼은 선을 그리지 않아, 추출될 픽셀이 커서에 가리지 않는다
+
+
+def _make_crosshair_cursor() -> QCursor:
+    """중심 1px이 뚫린 십자 커서를 만든다.
+
+    표준 CrossCursor는 중심까지 선이 이어져 있어 실제로 추출될 픽셀이
+    커서 선에 가려 보인다. 중심 부근에 빈 칸을 둬서 그 아래 픽셀이
+    그대로 드러나도록 한다. 밝은/어두운 배경 모두에서 잘 보이도록
+    흰색 테두리(굵게) 위에 검은 선(얇게)을 겹쳐 그린다.
+    """
+    center = _CURSOR_SIZE // 2
+    pm = QPixmap(_CURSOR_SIZE, _CURSOR_SIZE)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    for color, width in ((Qt.GlobalColor.white, 3), (Qt.GlobalColor.black, 1)):
+        pen = QPen(color)
+        pen.setWidth(width)
+        p.setPen(pen)
+        p.drawLine(0, center, center - _CURSOR_GAP, center)
+        p.drawLine(center + _CURSOR_GAP, center, _CURSOR_SIZE - 1, center)
+        p.drawLine(center, 0, center, center - _CURSOR_GAP)
+        p.drawLine(center, center + _CURSOR_GAP, center, _CURSOR_SIZE - 1)
+    p.end()
+    return QCursor(pm, center, center)
 
 
 class ColorPickOverlay(QWidget):
@@ -48,7 +75,7 @@ class ColorPickOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.shot: DesktopShot = shot or DesktopShot()
         self.setGeometry(self.shot.logical_geo)
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setCursor(_make_crosshair_cursor())
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 

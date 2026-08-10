@@ -1011,6 +1011,7 @@ class CanvasView(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton:
             h = self._canvas_handle_at(event.position().toPoint())
             if h:
+                self._push_undo()
                 self._drag_handle = h
                 self._drag_start_view = event.position()
                 self._drag_start_rect = QRectF(self._scene.sceneRect())
@@ -1572,13 +1573,22 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
 
+        pos = event.position().toPoint()
+        # 어떤 도구를 선택했든, 실제로 버튼을 눌러 그 도구 동작을 드래그하는
+        # 중이 아니라면(순수 hover) 먼저 캔버스 테두리 핸들 위인지 확인해
+        # 크기 조절 커서로 바꾼다. 도구별 처리(_select_move 등)가 이어서
+        # 자기 커서를 덮어씌울 수도 있다(예: 선택 조절 핸들 위일 때).
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            h = self._canvas_handle_at(pos)
+            self.viewport().setCursor(CURSORS[h] if h is not None else Qt.CursorShape.ArrowCursor)
+
         if self.tool == "select":
-            self._select_move(event.position().toPoint())
+            self._select_move(pos)
             event.accept()
             return
 
         if self.tool == "draw" and self._stroke_path is not None:
-            self._draw_move(event.position().toPoint())
+            self._draw_move(pos)
             event.accept()
             return
 
@@ -1587,18 +1597,16 @@ class CanvasView(QGraphicsView):
             return
 
         if self.tool == "text":
-            self._text_move(event.position().toPoint())
+            self._text_move(pos)
             event.accept()
             return
 
         if self.tool == "shape":
             shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-            self._shape_move(event.position().toPoint(), shift)
+            self._shape_move(pos, shift)
             event.accept()
             return
 
-        h = self._canvas_handle_at(event.position().toPoint())
-        self.viewport().setCursor(CURSORS[h] if h is not None else Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def _select_move(self, view_pos: QPoint) -> None:
@@ -1639,6 +1647,8 @@ class CanvasView(QGraphicsView):
                 self._select_rect = QRectF(self._select_origin, sp).normalized()
         elif self._select_state == "adjust":
             h = self._select_handle_at(view_pos)
+            if h is None:
+                h = self._canvas_handle_at(view_pos)
             self.viewport().setCursor(CURSORS[h] if h is not None else Qt.CursorShape.ArrowCursor)
         self.viewport().update()
 

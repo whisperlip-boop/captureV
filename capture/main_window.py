@@ -1328,7 +1328,8 @@ class MainWindow(QMainWindow):
             directory = os.path.dirname(path)
             if directory:
                 os.makedirs(directory, exist_ok=True)
-            saved = v.render_image().save(path, fmt)
+            quality = 100 if fmt == "JPEG" else -1
+            saved = v.render_image().save(path, fmt, quality)
         except OSError:
             logger.exception("저장 실패: %s", path)
             self._warn(f"저장 실패:\n{path}")

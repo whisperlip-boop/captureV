@@ -162,7 +162,10 @@ class RegionOverlay(QWidget):
     def mousePressEvent(self, e: QMouseEvent) -> None:
         """드래그를 시작한다 (고정 크기 모드에서는 즉시 확정, 우클릭은 드래그 취소)."""
         if e.button() == Qt.MouseButton.RightButton:
-            self._cancel_drag()
+            if self._state == "dragging":
+                self._cancel_drag()
+            else:
+                self.close()
             return
         if e.button() != Qt.MouseButton.LeftButton:
             return
@@ -204,8 +207,8 @@ class RegionOverlay(QWidget):
         self._confirm()
 
     def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:
-        """idle 상태에서 더블클릭하면 전체화면을 확정한다."""
-        if self._state == "idle":
+        """idle 상태에서 좌클릭 더블클릭하면 전체화면을 확정한다."""
+        if e.button() == Qt.MouseButton.LeftButton and self._state == "idle":
             self._sel = QRect(self.rect())
             self._confirm()
 
