@@ -10,7 +10,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('img', 'img')],
-    hiddenimports=[],
+    # scipy._cyutility: scipy.linalg 등 여러 Cython 모듈이 내부적으로
+    # cimport하는 공용 헬퍼 확장 모듈이라, PyInstaller의 scipy 훅이 정적
+    # 분석만으로는 찾지 못해 명시적으로 추가해야 한다(없으면 실행 시
+    # "ModuleNotFoundError: No module named 'scipy._cyutility'"로 실패).
+    hiddenimports=['scipy._cyutility'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
