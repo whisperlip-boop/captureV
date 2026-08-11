@@ -128,6 +128,7 @@ TEXT_ICON_PX: int = 20     # 텍스트 설정 팝업의 정렬/볼드/이탤릭 
 # ---------- 효과/크기 조절/회전/색상 추출 (2x2 소형 버튼 그룹) ---------- #
 MINI_TOOL_ICON_PX: int = 18    # 일반 툴바 아이콘(TOOLBAR_ICON_PX)보다 작게
 MINI_TOOL_DIVIDER_COLOR: str = "#8A8A8A"   # 좌우 구분선 색(약간 짙은 회색)
+EFFECT_MENU_ICON_PX: int = 16  # '효과' 하위 메뉴 항목 아이콘 크기(기존 메뉴 높이를 유지하는 크기)
 
 # ---------- 고정 크기 캡처 ---------- #
 DEFAULT_FIXED_CAPTURE_WIDTH: int = 800

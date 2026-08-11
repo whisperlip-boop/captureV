@@ -10,7 +10,7 @@ from typing import Callable, Optional, cast
 from PySide6.QtCore import QPoint, QRect, QSettings, QSize, QStandardPaths, QUrl, Qt, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices,
                             QDragEnterEvent, QDropEvent, QFont, QGuiApplication, QIcon, QImage,
-                            QKeySequence, QMouseEvent, QShortcut)
+                            QKeySequence, QMouseEvent, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                 QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
                                 QMenu, QMessageBox, QSizePolicy, QSpinBox, QTabBar, QTabWidget,
@@ -26,13 +26,14 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                              DEFAULT_FIXED_CAPTURE_HEIGHT, DEFAULT_FIXED_CAPTURE_WIDTH,
                              DEFAULT_MOSAIC_PERCENT, DEFAULT_NEW_CANVAS_HEIGHT,
                              DEFAULT_NEW_CANVAS_WIDTH, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT,
-                             DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS, FILL_TOLERANCE_MAX,
-                             FILL_TOLERANCE_MIN, HUE_SATURATION_MAX, HUE_SATURATION_MIN,
-                             MINI_TOOL_DIVIDER_COLOR, MINI_TOOL_ICON_PX, MOSAIC_PERCENT_MAX,
-                             MOSAIC_PERCENT_MIN, NEW_CANVAS_SIZE_MAX, NEW_CANVAS_SIZE_MIN,
-                             SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN, TAB_SAVED_COLOR,
-                             TAB_UNSAVED_COLOR, THICKNESS_MAX, THICKNESS_MIN, TOOLBAR_ICON_PX,
-                             ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN, get_resource_path, get_settings_path)
+                             DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS, EFFECT_MENU_ICON_PX,
+                             FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, HUE_SATURATION_MAX,
+                             HUE_SATURATION_MIN, MINI_TOOL_DIVIDER_COLOR, MINI_TOOL_ICON_PX,
+                             MOSAIC_PERCENT_MAX, MOSAIC_PERCENT_MIN, NEW_CANVAS_SIZE_MAX,
+                             NEW_CANVAS_SIZE_MIN, SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN,
+                             TAB_SAVED_COLOR, TAB_UNSAVED_COLOR, THICKNESS_MAX, THICKNESS_MIN,
+                             TOOLBAR_ICON_PX, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN, get_resource_path,
+                             get_settings_path)
 from capture.desktop_shot import DesktopShot
 from capture.dialog_utils import strip_minmax_buttons
 from capture.dual_slider_dialog import DualSliderDialog
@@ -116,27 +117,29 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self.tabs)
 
-        # 캔버스 크기와 확대/축소 배율을 짧은 구분선으로 나눠 나란히 표시한다.
-        zoom_group = QWidget()
-        zoom_layout = QHBoxLayout(zoom_group)
-        zoom_layout.setContentsMargins(0, 0, 8, 0)
-        zoom_layout.setSpacing(8)
+        # 캔버스 크기·확대/축소 배율·마지막 영역·저장 폴더를 모두 같은 모양의
+        # 짧은 구분선으로 나눠 나란히 표시한다.
+        status_group = QWidget()
+        status_layout = QHBoxLayout(status_group)
+        status_layout.setContentsMargins(0, 0, 8, 0)
+        status_layout.setSpacing(8)
         self._canvas_size_label = QLabel()
-        zoom_layout.addWidget(self._canvas_size_label)
-        zoom_divider = QFrame()
-        zoom_divider.setFrameShape(QFrame.Shape.VLine)
-        zoom_divider.setFrameShadow(QFrame.Shadow.Plain)
-        zoom_divider.setFixedHeight(14)
-        zoom_layout.addWidget(zoom_divider)
+        status_layout.addWidget(self._canvas_size_label)
+        self._canvas_zoom_divider = self._make_status_divider()
+        status_layout.addWidget(self._canvas_zoom_divider)
         self._zoom_label = _ClickableLabel()
         self._zoom_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self._zoom_label.setToolTip("클릭하여 배율 직접 입력")
         self._zoom_label.clicked.connect(self._open_zoom_popup)
-        zoom_layout.addWidget(self._zoom_label)
-        self.statusBar().addPermanentWidget(zoom_group)
-
-        self.status_label = QLabel()
-        self.statusBar().addPermanentWidget(self.status_label)
+        status_layout.addWidget(self._zoom_label)
+        self._last_region_divider = self._make_status_divider()
+        status_layout.addWidget(self._last_region_divider)
+        self._last_region_label = QLabel()
+        status_layout.addWidget(self._last_region_label)
+        status_layout.addWidget(self._make_status_divider())
+        self._save_dir_label = QLabel()
+        status_layout.addWidget(self._save_dir_label)
+        self.statusBar().addPermanentWidget(status_group)
 
         self._overlay: Optional[RegionOverlay] = None
         self._color_pick_overlay: Optional[ColorPickOverlay] = None
@@ -149,6 +152,15 @@ class MainWindow(QMainWindow):
         self._register_hotkeys()
 
     # ---------- UI ---------- #
+    @staticmethod
+    def _make_status_divider() -> QFrame:
+        """상태바 항목 사이에 쓰는 짧은 세로 구분선을 만든다."""
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.VLine)
+        divider.setFrameShadow(QFrame.Shadow.Plain)
+        divider.setFixedHeight(14)
+        return divider
+
     def _build_toolbar(self) -> None:
         """도구 툴바를 구성한다. 도구는 상호 배타적으로 선택되며, 추후 다른 도구를 추가한다."""
         self._current_tool = "move"
@@ -684,31 +696,45 @@ class MainWindow(QMainWindow):
         self._blur_percent = DEFAULT_BLUR_PERCENT
         self._sharpen_percent = DEFAULT_SHARPEN_PERCENT
 
-        immediate_effects = [("색반전", "invert_colors"), ("무채화", "grayscale")]
-        for text, method_name in immediate_effects:
-            action = QAction(text, self)
+        immediate_effects = [("색반전", "invert.png", "invert_colors"), ("무채화", "decolor.png", "grayscale")]
+        for text, icon_file, method_name in immediate_effects:
+            action = QAction(self._load_menu_icon(icon_file), text, self)
             action.triggered.connect(lambda _checked=False, m=method_name: self._run_canvas_op(m))
             self._effect_menu.addAction(action)
 
-        mosaic_action = QAction("모자이크", self)
+        mosaic_action = QAction(self._load_menu_icon("mosaic.png"), "모자이크", self)
         mosaic_action.triggered.connect(self._open_mosaic_dialog)
         self._effect_menu.addAction(mosaic_action)
 
-        blur_action = QAction("흐리게", self)
+        blur_action = QAction(self._load_menu_icon("blur.png"), "흐리게", self)
         blur_action.triggered.connect(self._open_blur_dialog)
         self._effect_menu.addAction(blur_action)
 
-        sharpen_action = QAction("선명하게", self)
+        sharpen_action = QAction(self._load_menu_icon("Clearly.png"), "선명하게", self)
         sharpen_action.triggered.connect(self._open_sharpen_dialog)
         self._effect_menu.addAction(sharpen_action)
 
-        brightness_contrast_action = QAction("밝기/대비", self)
+        brightness_contrast_action = QAction(self._load_menu_icon("contrast.png"), "밝기/대비", self)
         brightness_contrast_action.triggered.connect(self._open_brightness_contrast_dialog)
         self._effect_menu.addAction(brightness_contrast_action)
 
-        hue_saturation_action = QAction("색조/채도", self)
+        hue_saturation_action = QAction(self._load_menu_icon("saturation.png"), "색조/채도", self)
         hue_saturation_action.triggered.connect(self._open_hue_saturation_dialog)
         self._effect_menu.addAction(hue_saturation_action)
+
+    @staticmethod
+    def _load_menu_icon(icon_file: str) -> QIcon:
+        """메뉴 항목 높이를 넘지 않는 작은 크기로 스케일한 아이콘을 만든다.
+
+        QMenu는 QToolBar/QToolButton과 달리 setIconSize()가 없어, 스타일의
+        기본 아이콘 크기에 원본 픽스맵을 그대로 맡기면 메뉴 행 높이가 커질
+        수 있다. 미리 정해진 작은 크기로 스케일해 둔 픽스맵으로 QIcon을
+        만들면 어떤 스타일에서도 크기가 일정하게 유지된다.
+        """
+        pixmap = QPixmap(str(get_resource_path(f"img/{icon_file}")))
+        scaled = pixmap.scaled(EFFECT_MENU_ICON_PX, EFFECT_MENU_ICON_PX,
+                                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        return QIcon(scaled)
 
     def _open_mosaic_dialog(self) -> None:
         """'모자이크' 팝업을 열어 선택 영역(없으면 캔버스 전체)에 모자이크를 적용한다."""
@@ -759,7 +785,7 @@ class MainWindow(QMainWindow):
         if v is None:
             self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
             return
-        dialog = DualSliderDialog("밝기/대비 설정", "명도", "대비",
+        dialog = DualSliderDialog("밝기/대비 설정", "명도(Brightness)", "대비(Contrast)",
                                    BRIGHTNESS_CONTRAST_MIN, BRIGHTNESS_CONTRAST_MAX, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -775,7 +801,7 @@ class MainWindow(QMainWindow):
         if v is None:
             self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
             return
-        dialog = DualSliderDialog("색조/채도 설정", "색조", "채도",
+        dialog = DualSliderDialog("색조/채도 설정", "색조(Hue)", "채도(Saturation)",
                                    HUE_SATURATION_MIN, HUE_SATURATION_MAX, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1116,19 +1142,22 @@ class MainWindow(QMainWindow):
     def _update_status(self, *_args) -> None:
         """상태바에 캔버스 크기·배율, 마지막 캡처 영역, 저장 폴더를 표시한다."""
         v = self.current_view()
+        has_view = v is not None
         if v:
             r = v.canvas_rect()
             self._canvas_size_label.setText(f"캔버스 {int(round(r.width()))} x {int(round(r.height()))}")
             self._zoom_label.setText(f"{round(v.zoom_percent())}%")
-            self._canvas_size_label.parentWidget().show()
-        else:
-            self._canvas_size_label.parentWidget().hide()
+        self._canvas_size_label.setVisible(has_view)
+        self._canvas_zoom_divider.setVisible(has_view)
+        self._zoom_label.setVisible(has_view)
 
-        parts = []
-        if self.last_region:
-            parts.append(f"마지막 영역 {self.last_region.width()} x {self.last_region.height()}")
-        parts.append(f"저장 폴더: {self.save_dir}")
-        self.status_label.setText("   |   ".join(parts))
+        has_last_region = self.last_region is not None
+        if has_last_region:
+            self._last_region_label.setText(
+                f"마지막 영역 {self.last_region.width()} x {self.last_region.height()}")
+        self._last_region_label.setVisible(has_last_region)
+        self._last_region_divider.setVisible(has_last_region)
+        self._save_dir_label.setText(f"저장 폴더: {self.save_dir}")
 
     def _open_zoom_popup(self) -> None:
         """배율 표시를 클릭하면 그 위에 배율(%)을 직접 입력하는 팝업을 띄운다."""
