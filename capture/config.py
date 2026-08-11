@@ -60,6 +60,11 @@ CURSORS: dict[tuple[int, int], Qt.CursorShape] = {
 ACCENT: QColor = QColor(0x2d, 0x9c, 0xff)
 CANVAS_SURROUND_COLOR: str = "#303030"     # 캔버스 주위(뷰 배경)/탭이 없을 때의 배경색
 
+# ---------- 투명 배경 표시(체커보드) ---------- #
+CHECKER_LIGHT_COLOR: QColor = QColor(0xff, 0xff, 0xff)
+CHECKER_DARK_COLOR: QColor = QColor(0xcc, 0xcc, 0xcc)
+CHECKER_SQUARE_PX: int = 8     # 체커보드 한 칸 크기(캔버스 픽셀 기준)
+
 # ---------- 그리기 도구 ---------- #
 THICKNESS_MIN: int = 1
 THICKNESS_MAX: int = 10

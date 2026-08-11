@@ -16,11 +16,12 @@ from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene, QGraphicsVie
                                 QToolButton, QWidget)
 from scipy import ndimage
 
-from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CURSORS,
-                             DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL,
-                             DEFAULT_TEXT_COLOR, DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS,
-                             HANDLE_PX, HANDLES, HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION,
-                             SHARPEN_AMOUNT_SCALE, SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN)
+from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHECKER_DARK_COLOR,
+                             CHECKER_LIGHT_COLOR, CHECKER_SQUARE_PX, CURSORS, DEFAULT_DRAW_COLOR,
+                             DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL, DEFAULT_TEXT_COLOR,
+                             DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS, HANDLE_PX, HANDLES,
+                             HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION, SHARPEN_AMOUNT_SCALE,
+                             SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN)
 from capture.shapes import (ARROW_KINDS, FREEHAND_KINDS, arrowhead_length, draw_bbox_shape,
                              draw_bezier_kind, draw_line_kind, is_line_kind, lock_square,
                              snap_line_angle)
@@ -111,6 +112,11 @@ class CanvasView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(QColor(CANVAS_SURROUND_COLOR))
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # QGraphicsView는 생성자에서 자신과 뷰포트에 accept-drops를 기본으로
+        # 켜 둔다(씬 안 아이템 간 드래그앤드롭용). 이 앱은 그 기능을 쓰지
+        # 않는데, 켜져 있으면 외부 파일 드롭이 여기서 소리 없이 삼켜져 부모
+        # MainWindow의 dropEvent(새 탭으로 열기)까지 올라가지 못한다.
+        self.setAcceptDrops(False)
         # 마우스 버튼을 누르지 않은 순수 hover 상태에서도 mouseMoveEvent가 와야
         # 캔버스 경계 핸들 위에서 커서 모양이 바뀐다 (기본값은 드래그 중에만 옴).
         self.setMouseTracking(True)
@@ -118,6 +124,13 @@ class CanvasView(QGraphicsView):
         self._scene.setSceneRect(0, 0, max(image.width(), 1), max(image.height(), 1))
         self.base_item: QGraphicsPixmapItem = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
         self.draw_item: QGraphicsPixmapItem = self._add_draw_layer()
+
+        # 배경이 투명한 PNG를 불러온 경우, 캔버스 빈 영역(여백 확장 등)과
+        # 화면 표시/저장 시 흰색 대신 투명을 유지한다. 캔버스 전체를 하나로
+        # 합치는 연산(_replace_with_flattened) 때마다 결과물 기준으로 다시
+        # 판정한다.
+        self._transparent_background: bool = self._has_transparency(image)
+        self._checker_brush: QBrush = self._make_checker_brush()
 
         # 캡처 이미지는 물리 픽셀 원본 해상도로 저장되지만(고DPI 배율 보존),
         # 화면에 표시할 때 배율 1.0(줌 100%)을 곧이곧대로 논리 픽셀 1:1로
@@ -263,7 +276,8 @@ class CanvasView(QGraphicsView):
                     entry["text_meta"] = dict(meta)
                 items.append(entry)
         return {"items": items, "scene_rect": QRectF(self._scene.sceneRect()),
-                "select_rect": QRectF(self._select_rect)}
+                "select_rect": QRectF(self._select_rect),
+                "transparent_background": self._transparent_background}
 
     def _push_undo(self) -> None:
         """실행 취소를 위해 현재 상태를 스택에 기록하고, 다시 실행 스택을 비운다."""
@@ -294,6 +308,7 @@ class CanvasView(QGraphicsView):
                 self._text_meta[id(item)] = dict(entry["text_meta"])
         self._scene.setSceneRect(snapshot["scene_rect"])
         self._select_rect = QRectF(snapshot.get("select_rect", QRectF()))
+        self._transparent_background = snapshot.get("transparent_background", self._transparent_background)
         self.changed.emit()
         self.viewport().update()
 
@@ -448,6 +463,7 @@ class CanvasView(QGraphicsView):
         self._scene.setSceneRect(0, 0, max(image.width(), 1), max(image.height(), 1))
         self.base_item = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
         self.draw_item = self._add_draw_layer()
+        self._transparent_background = self._has_transparency(image)
         self.changed.emit()
 
     def _target_pixel_rect(self, image: QImage) -> tuple[int, int, int, int]:
@@ -773,6 +789,32 @@ class CanvasView(QGraphicsView):
         return buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
 
     @staticmethod
+    def _has_transparency(image: QImage) -> bool:
+        """완전히 불투명하지 않은 픽셀이 하나라도 있는지 검사한다.
+
+        포맷상 알파 채널이 있어도(예: 배경색으로 채워 평탄화한 ARGB32) 실제로
+        모든 픽셀이 불투명(255)이면 False를 반환해, "형식"이 아니라 "실제
+        내용"을 기준으로 투명 배경 여부를 판정한다.
+        """
+        if not image.hasAlphaChannel():
+            return False
+        argb = image.convertToFormat(QImage.Format.Format_ARGB32)
+        arr = CanvasView._image_array(argb)
+        return bool(np.any(arr[:, :, 3] < 255))
+
+    @staticmethod
+    def _make_checker_brush() -> QBrush:
+        """투명 배경을 나타내는 체커보드 무늬 브러시를 만든다."""
+        size = CHECKER_SQUARE_PX
+        tile = QPixmap(size * 2, size * 2)
+        painter = QPainter(tile)
+        painter.fillRect(tile.rect(), CHECKER_LIGHT_COLOR)
+        painter.fillRect(0, 0, size, size, CHECKER_DARK_COLOR)
+        painter.fillRect(size, size, size, size, CHECKER_DARK_COLOR)
+        painter.end()
+        return QBrush(tile)
+
+    @staticmethod
     def _mosaic_region(region: np.ndarray, block: int) -> None:
         """region(H, W, 4) 배열의 R/G/B를 block x block 격자 평균색으로 제자리에서 바꾼다."""
         h, w = region.shape[:2]
@@ -951,9 +993,12 @@ class CanvasView(QGraphicsView):
         return None
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
-        """뷰포트 배경과 캔버스(흰색) 영역을 그린다."""
+        """뷰포트 배경과 캔버스 영역을 그린다(투명 배경이면 체커보드, 아니면 흰색)."""
         painter.fillRect(rect, self.backgroundBrush())
-        painter.fillRect(self._scene.sceneRect(), QColor(0xff, 0xff, 0xff))
+        if self._transparent_background:
+            painter.fillRect(self._scene.sceneRect(), self._checker_brush)
+        else:
+            painter.fillRect(self._scene.sceneRect(), QColor(0xff, 0xff, 0xff))
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         """캔버스 밖으로 삐져나온 내용을 가리고, 테두리·조절 핸들·선택 영역을 그린다."""
@@ -1834,7 +1879,7 @@ class CanvasView(QGraphicsView):
         r = self._scene.sceneRect()
         img = QImage(max(int(round(r.width())), 1), max(int(round(r.height())), 1),
                      QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.white)
+        img.fill(Qt.GlobalColor.transparent if self._transparent_background else Qt.GlobalColor.white)
         self._scene.clearSelection()
         painter = QPainter(img)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
