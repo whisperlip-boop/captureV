@@ -122,6 +122,21 @@ class RegionOverlay(QWidget):
         p.setPen(Qt.GlobalColor.white)
         p.drawText(QRect(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, label)
 
+    def _magnifier_pos(self, box: int) -> QPoint:
+        """돋보기가 놓일 좌표를 계산한다.
+
+        화면(오버레이 전체) 중앙을 기준으로 커서가 어느 사분면에 있는지에
+        따라, 항상 커서의 대각선 반대 방향에 돋보기가 오도록 한다 (커서가
+        좌상단이면 돋보기는 커서 기준 우하단, 좌하단이면 우상단 등). 화면
+        경계를 넘어갈 때만 반응하는 방식보다 위치가 갑자기 바뀌지 않아
+        더 예측 가능하다.
+        """
+        gap = 18
+        half_w, half_h = self.width() / 2, self.height() / 2
+        x = self._cursor.x() + gap if self._cursor.x() < half_w else self._cursor.x() - box - gap
+        y = self._cursor.y() + gap if self._cursor.y() < half_h else self._cursor.y() - box - gap
+        return QPoint(int(x), int(y))
+
     def _paint_magnifier(self, p: QPainter) -> None:
         """커서 주변을 확대해 픽셀 단위로 확인할 수 있는 돋보기를 그린다."""
         box, zoom = 108, 8
@@ -131,11 +146,7 @@ class RegionOverlay(QWidget):
         s = self.shot.scale
         src_phys = QRectF(src.left() * s, src.top() * s, src.width() * s, src.height() * s)
 
-        pos = QPoint(self._cursor.x() + 18, self._cursor.y() + 18)
-        if pos.x() + box > self.width():
-            pos.setX(self._cursor.x() - box - 18)
-        if pos.y() + box > self.height():
-            pos.setY(self._cursor.y() - box - 18)
+        pos = self._magnifier_pos(box)
         target = QRect(pos, QPoint(pos.x() + box, pos.y() + box))
 
         p.save()

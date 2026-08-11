@@ -7,10 +7,10 @@ import os
 from datetime import datetime
 from typing import Callable, Optional, cast
 
-from PySide6.QtCore import QRect, QSettings, QSize, QStandardPaths, QUrl, Qt
+from PySide6.QtCore import QPoint, QRect, QSettings, QSize, QStandardPaths, QUrl, Qt, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices,
                             QDragEnterEvent, QDropEvent, QFont, QGuiApplication, QIcon, QImage,
-                            QKeySequence, QShortcut)
+                            QKeySequence, QMouseEvent, QShortcut)
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                 QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
                                 QMenu, QMessageBox, QSizePolicy, QSpinBox, QTabBar, QTabWidget,
@@ -32,7 +32,7 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                              MOSAIC_PERCENT_MIN, NEW_CANVAS_SIZE_MAX, NEW_CANVAS_SIZE_MIN,
                              SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN, TAB_SAVED_COLOR,
                              TAB_UNSAVED_COLOR, THICKNESS_MAX, THICKNESS_MIN, TOOLBAR_ICON_PX,
-                             get_resource_path, get_settings_path)
+                             ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN, get_resource_path, get_settings_path)
 from capture.desktop_shot import DesktopShot
 from capture.dialog_utils import strip_minmax_buttons
 from capture.dual_slider_dialog import DualSliderDialog
@@ -49,6 +49,32 @@ from capture.shortcuts import CAPTURE_ACTIONS, load_shortcut
 from capture.text_settings import TextSettingsPanel
 
 logger = logging.getLogger(__name__)
+
+
+class _ClickableLabel(QLabel):
+    """클릭을 신호로 알리는 QLabel (배율 표시 클릭 시 입력 팝업을 띄우는 데 사용)."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class _ZoomPopup(QWidget):
+    """확대/축소 배율(%)을 직접 입력하는 작은 팝업."""
+
+    def __init__(self, current_percent: int, parent: QWidget) -> None:
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        self.spin = QSpinBox()
+        self.spin.setRange(ZOOM_PERCENT_MIN, ZOOM_PERCENT_MAX)
+        self.spin.setValue(current_percent)
+        self.spin.setSuffix("%")
+        layout.addWidget(self.spin)
 
 
 class MainWindow(QMainWindow):
@@ -102,7 +128,10 @@ class MainWindow(QMainWindow):
         zoom_divider.setFrameShadow(QFrame.Shadow.Plain)
         zoom_divider.setFixedHeight(14)
         zoom_layout.addWidget(zoom_divider)
-        self._zoom_label = QLabel()
+        self._zoom_label = _ClickableLabel()
+        self._zoom_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._zoom_label.setToolTip("클릭하여 배율 직접 입력")
+        self._zoom_label.clicked.connect(self._open_zoom_popup)
         zoom_layout.addWidget(self._zoom_label)
         self.statusBar().addPermanentWidget(zoom_group)
 
@@ -1090,7 +1119,7 @@ class MainWindow(QMainWindow):
         if v:
             r = v.canvas_rect()
             self._canvas_size_label.setText(f"캔버스 {int(round(r.width()))} x {int(round(r.height()))}")
-            self._zoom_label.setText(f"{round(v.transform().m11() * 100)}%")
+            self._zoom_label.setText(f"{round(v.zoom_percent())}%")
             self._canvas_size_label.parentWidget().show()
         else:
             self._canvas_size_label.parentWidget().hide()
@@ -1100,6 +1129,25 @@ class MainWindow(QMainWindow):
             parts.append(f"마지막 영역 {self.last_region.width()} x {self.last_region.height()}")
         parts.append(f"저장 폴더: {self.save_dir}")
         self.status_label.setText("   |   ".join(parts))
+
+    def _open_zoom_popup(self) -> None:
+        """배율 표시를 클릭하면 그 위에 배율(%)을 직접 입력하는 팝업을 띄운다."""
+        v = self.current_view()
+        if v is None:
+            return
+        popup = _ZoomPopup(round(v.zoom_percent()), self)
+
+        def apply_and_close() -> None:
+            v.set_zoom_percent(popup.spin.value())
+            popup.close()
+
+        popup.spin.editingFinished.connect(apply_and_close)
+        popup.adjustSize()
+        anchor = self._zoom_label.mapToGlobal(QPoint(0, 0))
+        popup.move(anchor.x(), anchor.y() - popup.height())
+        popup.show()
+        popup.spin.setFocus()
+        popup.spin.selectAll()
 
     # ---------- 캡처 ---------- #
     def _open_overlay(self, fixed_size: Optional[tuple[int, int]] = None) -> None:

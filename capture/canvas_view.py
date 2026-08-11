@@ -7,10 +7,11 @@ import math
 from typing import Callable, Optional
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QGuiApplication, QImage, QKeyEvent,
                             QMouseEvent, QPainter, QPainterPath, QPen, QPixmap,
-                            QResizeEvent, QTextCharFormat, QTextCursor, QTransform, QWheelEvent)
+                            QResizeEvent, QShowEvent, QTextCharFormat, QTextCursor, QTransform,
+                            QWheelEvent)
 from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QTextEdit,
                                 QToolButton, QWidget)
 from scipy import ndimage
@@ -19,7 +20,7 @@ from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CUR
                              DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL,
                              DEFAULT_TEXT_COLOR, DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS,
                              HANDLE_PX, HANDLES, HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION,
-                             SHARPEN_AMOUNT_SCALE, SHARPEN_SIGMA)
+                             SHARPEN_AMOUNT_SCALE, SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN)
 from capture.shapes import (ARROW_KINDS, FREEHAND_KINDS, arrowhead_length, draw_bbox_shape,
                              draw_bezier_kind, draw_line_kind, is_line_kind, lock_square,
                              snap_line_angle)
@@ -118,9 +119,18 @@ class CanvasView(QGraphicsView):
         self.base_item: QGraphicsPixmapItem = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
         self.draw_item: QGraphicsPixmapItem = self._add_draw_layer()
 
+        # 캡처 이미지는 물리 픽셀 원본 해상도로 저장되지만(고DPI 배율 보존),
+        # 화면에 표시할 때 배율 1.0(줌 100%)을 곧이곧대로 논리 픽셀 1:1로
+        # 적용하면 이 화면 자체의 배율만큼 실제보다 커 보인다. "줌 100%"가
+        # 실제 원본 크기로 보이도록, 첫 표시 시점(showEvent)에 이 화면의
+        # devicePixelRatio 역수를 기준 배율로 잡는다.
+        self._dpi_base_scale: float = 1.0
+        self._zoom_initialized: bool = False
+
         self._drag_handle: Optional[tuple[int, int]] = None
         self._drag_start_view: Optional[QPointF] = None
         self._drag_start_rect: Optional[QRectF] = None
+        self._canvas_resize_preview: Optional[QRectF] = None
         self.file_path: Optional[str] = None
         self.is_dirty: bool = True     # 저장 이후 변경 여부 (탭 저장 상태 표시에 사용)
 
@@ -168,6 +178,36 @@ class CanvasView(QGraphicsView):
         self._redo_stack: list[dict] = []
         self._pending_move_snapshot: Optional[dict] = None
         self._pending_move_positions: Optional[dict[int, QPointF]] = None
+
+        # 선택 영역 테두리를 움직이는 점선("marching ants")으로 표시하기 위한
+        # 애니메이션 phase. 선택이 없을 때는 갱신해도 다시 그릴 필요가 없으므로
+        # _tick_marching_ants에서 그 경우엔 update()를 생략해 불필요한 반복
+        # 렌더링을 피한다.
+        self._marching_ants_phase: float = 0.0
+        self._marching_ants_timer = QTimer(self)
+        self._marching_ants_timer.timeout.connect(self._tick_marching_ants)
+        self._marching_ants_timer.start(80)
+
+    def _tick_marching_ants(self) -> None:
+        """선택 영역이 있을 때만 점선 애니메이션을 한 걸음 진행시키고 다시 그린다."""
+        has_rect_selection = self.tool == "select" and self.has_selection()
+        if not has_rect_selection and not self._scene.selectedItems():
+            return
+        self._marching_ants_phase = (self._marching_ants_phase + 1.0) % 8.0
+        self.viewport().update()
+
+    def _draw_marching_ants(self, painter: QPainter, rect: QRectF, scale: float) -> None:
+        """검은색/흰색 점선을 번갈아 그려 움직이는 선택 테두리("marching ants")를 그린다."""
+        dash_pen = QPen(Qt.GlobalColor.black)
+        dash_pen.setWidthF(1.0 / scale)
+        dash_pen.setDashPattern([4, 4])
+        dash_pen.setDashOffset(self._marching_ants_phase)
+        painter.setPen(dash_pen)
+        painter.drawRect(rect)
+        dash_pen.setColor(Qt.GlobalColor.white)
+        dash_pen.setDashOffset(self._marching_ants_phase + 4)
+        painter.setPen(dash_pen)
+        painter.drawRect(rect)
 
     def _add_pixmap(self, pixmap: QPixmap, pos: QPoint) -> QGraphicsPixmapItem:
         """씬에 이동/선택 가능한 픽스맵 아이템을 추가한다."""
@@ -327,8 +367,33 @@ class CanvasView(QGraphicsView):
         self.changed.emit()
 
     def canvas_rect(self) -> QRectF:
-        """현재 캔버스(씬) 사각형을 반환한다."""
-        return self._scene.sceneRect()
+        """현재 캔버스(씬) 사각형을 반환한다(여백 조절 드래그 중이면 미리보기 크기)."""
+        return self._canvas_resize_preview if self._canvas_resize_preview is not None else self._scene.sceneRect()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """처음 표시되는 시점에 이 화면의 배율을 기준으로 "줌 100%"를 보정한다."""
+        super().showEvent(event)
+        if not self._zoom_initialized:
+            self._zoom_initialized = True
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            self._dpi_base_scale = 1.0 / ((screen.devicePixelRatio() if screen else 1.0) or 1.0)
+            self.resetTransform()
+            self.scale(self._dpi_base_scale, self._dpi_base_scale)
+            self.viewChanged.emit()
+
+    def zoom_percent(self) -> float:
+        """사용자에게 보여줄 확대/축소 배율(%)을 반환한다(이 화면 실제 배율 보정 포함)."""
+        return self.transform().m11() / self._dpi_base_scale * 100.0
+
+    def set_zoom_percent(self, percent: float) -> None:
+        """확대/축소 배율을 정확한 퍼센트 값으로 맞춘다(ZOOM_PERCENT_MIN~MAX로 제한)."""
+        percent = max(ZOOM_PERCENT_MIN, min(ZOOM_PERCENT_MAX, percent))
+        target_scale = self._dpi_base_scale * percent / 100.0
+        current_scale = self.transform().m11() or 1.0
+        factor = target_scale / current_scale
+        self.scale(factor, factor)
+        self.viewport().update()
+        self.viewChanged.emit()
 
     def expand_margin(self, px: int) -> None:
         """캔버스 네 방향 여백을 px만큼 확장(음수면 축소)한다."""
@@ -921,13 +986,34 @@ class CanvasView(QGraphicsView):
             painter.drawRect(hr)
         painter.restore()
 
-        if self.tool == "select" and self.has_selection():
+        if self._canvas_resize_preview is not None:
             painter.save()
-            pen = QPen(ACCENT)
+            pen = QPen(QColor(0x2d, 0x7d, 0xd2))
             pen.setWidthF(1.0 / scale)
+            pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self._select_rect)
+            painter.drawRect(self._canvas_resize_preview)
+            painter.restore()
+
+        selected_items = self._scene.selectedItems()
+        if selected_items:
+            # Ctrl+A(전체 선택) 등 Qt 기본 아이템 선택은 원래 각 아이템이 자체
+            # 파선 테두리를 그리지만, 캔버스 경계와 좌표가 겹치면 위의 캔버스
+            # 테두리(파란 실선)에 완전히 가려져 버린다. drawForeground는 모든
+            # 아이템을 그린 "뒤"에 호출되므로, 여기서 다시 그려야 항상 위에 보인다.
+            bounds = QRectF()
+            for it in selected_items:
+                bounds = bounds.united(it.sceneBoundingRect())
+            painter.save()
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            self._draw_marching_ants(painter, bounds, scale)
+            painter.restore()
+
+        if self.tool == "select" and self.has_selection():
+            painter.save()
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            self._draw_marching_ants(painter, self._select_rect, scale)
             if self._select_state == "adjust":
                 painter.setBrush(QBrush(Qt.GlobalColor.white))
                 for hr in self._select_handle_rects().values():
@@ -1542,11 +1628,11 @@ class CanvasView(QGraphicsView):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         """여백 조절 드래그 중이면 캔버스 크기를 갱신하고, 아니면 도구별 동작으로 위임한다."""
         if self._drag_handle and self._drag_start_view is not None and self._drag_start_rect is not None:
-            # 뷰 좌표 기준으로 이동량을 구한다. 드래그 중에 씬 크기가 바뀌면
-            # (캔버스보다 작은 뷰포트에서는 씬이 가운데로 재정렬되어) 같은
-            # 화면 위치라도 mapToScene() 결과가 계속 달라져, 그 값으로 이동량을
-            # 계산하면 매 이동마다 오차가 누적되어 캔버스가 실제 마우스
-            # 이동량보다 훨씬 크게/작게 늘어나거나 줄어든다.
+            # 드래그 중에는 미리보기 사각형만 갱신하고, 실제 sceneRect는 건드리지
+            # 않는다. 뷰포트보다 작은 씬은 가운데로 재정렬되므로, 드래그 중에
+            # sceneRect를 계속 바꾸면 화면상 이미지 위치가 매 이동마다 같이
+            # 밀려서(픽픽과 달리) 캔버스가 반대 방향으로 움직이는 것처럼 보인다.
+            # 실제 크기 반영은 mouseReleaseEvent에서 한 번만 한다.
             scale = self.transform().m11() or 1.0
             dx = (event.position().x() - self._drag_start_view.x()) / scale
             dy = (event.position().y() - self._drag_start_view.y()) / scale
@@ -1561,15 +1647,9 @@ class CanvasView(QGraphicsView):
                 top = min(top + dy, bottom - MIN_CANVAS)
             elif hy > 0:
                 bottom = max(bottom + dy, top + MIN_CANVAS)
-            new_rect = QRectF(left, top, right - left, bottom - top)
-            old_rect = QRectF(self._scene.sceneRect())
-            # 그리기 레이어도 새 크기로 맞춰야, 손잡이로 캔버스를 넓힌 뒤 그
-            # 새로 늘어난 영역에 그리기/채우기가 실제로 반영된다 (레이어 크기가
-            # 예전 그대로면 그 영역에 그린 내용이 화면 밖처럼 잘려 사라진다).
-            self._resize_draw_layer(new_rect, old_rect)
-            self._scene.setSceneRect(new_rect)
+            self._canvas_resize_preview = QRectF(left, top, right - left, bottom - top)
             self.viewport().update()
-            self.changed.emit()
+            self.viewChanged.emit()     # 상태바의 캔버스 크기 표시만 실시간 갱신 (dirty 표시 없음)
             event.accept()
             return
 
@@ -1655,7 +1735,18 @@ class CanvasView(QGraphicsView):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         """캔버스 여백 조절 드래그 또는 도구별 드래그를 종료한다."""
         if self._drag_handle:
+            if self._canvas_resize_preview is not None:
+                new_rect = self._canvas_resize_preview
+                old_rect = QRectF(self._scene.sceneRect())
+                # 그리기 레이어도 새 크기로 맞춰야, 손잡이로 캔버스를 넓힌 뒤 그
+                # 새로 늘어난 영역에 그리기/채우기가 실제로 반영된다 (레이어 크기가
+                # 예전 그대로면 그 영역에 그린 내용이 화면 밖처럼 잘려 사라진다).
+                self._resize_draw_layer(new_rect, old_rect)
+                self._scene.setSceneRect(new_rect)
+                self.changed.emit()
             self._drag_handle = None
+            self._canvas_resize_preview = None
+            self.viewport().update()
             event.accept()
             return
         if self.tool == "select":
@@ -1733,9 +1824,7 @@ class CanvasView(QGraphicsView):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.commit_text_editing()
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-            self.scale(factor, factor)
-            self.viewport().update()
-            self.viewChanged.emit()
+            self.set_zoom_percent(self.zoom_percent() * factor)
             event.accept()
             return
         super().wheelEvent(event)

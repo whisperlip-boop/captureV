@@ -111,6 +111,10 @@ NEW_CANVAS_SIZE_MAX: int = 20000
 DEFAULT_NEW_CANVAS_WIDTH: int = 500
 DEFAULT_NEW_CANVAS_HEIGHT: int = 500
 
+# ---------- 캔버스 확대/축소 ---------- #
+ZOOM_PERCENT_MIN: int = 1
+ZOOM_PERCENT_MAX: int = 1000
+
 # ---------- 탭 저장 상태 표시 ---------- #
 TAB_UNSAVED_COLOR: str = "#E86133"
 TAB_SAVED_COLOR: str = "#7DCD28"
