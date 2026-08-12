@@ -962,7 +962,7 @@ class CanvasView(QGraphicsView):
         painter.end()
         return img
 
-    def cut_selection(self, fill_color: QColor = Qt.GlobalColor.white) -> Optional[QImage]:
+    def cut_selection(self, fill_color: Optional[QColor] = None) -> Optional[QImage]:
         """선택 영역을 잘라낸다.
 
         선택 영역의 픽셀을 렌더링해 반환하고, 원본 캡처 이미지(base_item)에서
@@ -970,7 +970,8 @@ class CanvasView(QGraphicsView):
         영향을 주지 않는다.
 
         Args:
-            fill_color: 잘라낸 자리를 채울 색.
+            fill_color: 잘라낸 자리를 채울 색. None이면 배경이 투명인
+                캔버스는 투명으로, 그렇지 않으면 흰색으로 채운다.
 
         Returns:
             잘라낸 영역의 이미지. 선택이 없으면 None.
@@ -978,6 +979,9 @@ class CanvasView(QGraphicsView):
         img = self.render_selection()
         if img is None:
             return None
+        if fill_color is None:
+            fill_color = QColor(Qt.GlobalColor.transparent if self._transparent_background
+                                 else Qt.GlobalColor.white)
 
         base_rect = QRectF(self.base_item.pos(), QSizeF(self.base_item.pixmap().size()))
         fill_rect = self._select_rect.intersected(base_rect).translated(-self.base_item.pos())
@@ -985,6 +989,10 @@ class CanvasView(QGraphicsView):
             self._push_undo()
             pm = QPixmap(self.base_item.pixmap())
             painter = QPainter(pm)
+            # 기본 SourceOver 블렌딩에서는 완전 투명한 색으로 fillRect해도
+            # 알파가 0이라 기존 픽셀이 그대로 남는다. Source 모드로 덮어써야
+            # 실제로 투명해진다 (불투명 색을 채우는 기존 경우는 결과가 같다).
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
             painter.fillRect(fill_rect, fill_color)
             painter.end()
             self.base_item.setPixmap(pm)
