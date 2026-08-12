@@ -377,9 +377,18 @@ class CanvasView(QGraphicsView):
         return True
 
     def select_all(self) -> None:
-        """씬의 모든 아이템을 선택한다."""
+        """씬의 모든 아이템을 선택하고, 캔버스 전체를 선택 영역으로 지정한다.
+
+        잘라내기/복사(cut_selection/render_selection/has_selection)는 아이템의
+        setSelected 여부가 아니라 이 선택 영역(_select_rect)을 기준으로 동작하므로,
+        이것을 설정하지 않으면 Ctrl+A 후 Ctrl+X가 "선택 영역 없음"으로 처리되어
+        아무 일도 일어나지 않는다.
+        """
         for it in self._scene.items():
             it.setSelected(True)
+        self._select_rect = self.canvas_rect()
+        self._select_state = "adjust"
+        self.viewport().update()
 
     def delete_selected(self) -> None:
         """선택된 아이템을 삭제한다 (배경 아이템은 제외)."""
