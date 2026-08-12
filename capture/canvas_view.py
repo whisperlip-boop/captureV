@@ -173,6 +173,11 @@ class CanvasView(QGraphicsView):
         # (시작/제어1/제어2/끝, 씬 좌표). 편집 중이 아니면 빈 리스트.
         self._curve_points: list[QPointF] = []
         self._curve_drag_index: Optional[int] = None
+        # id(item) -> {kind, subtool, color, thickness, pad, geometry}. kind별 geometry:
+        # bbox -> QSizeF(content w,h) / line -> (p1, p2) 콘텐츠-상대 좌표(원점 0,0 기준) /
+        # curve -> 4개 콘텐츠-상대 제어점. pad는 마지막으로 래스터화했을 때의 여백으로,
+        # item.pos()가 이동해도 pos() + pad가 콘텐츠 좌상단(씬 좌표)이 되도록 유지한다.
+        self._shape_meta: dict[int, dict] = {}
 
         self.text_font: QFont = QFont()
         self.text_font.setPointSize(DEFAULT_TEXT_FONT_SIZE)
@@ -274,6 +279,9 @@ class CanvasView(QGraphicsView):
                 meta = self._text_meta.get(id(it))
                 if meta is not None:
                     entry["text_meta"] = dict(meta)
+                shape_meta = self._shape_meta.get(id(it))
+                if shape_meta is not None:
+                    entry["shape_meta"] = dict(shape_meta)
                 items.append(entry)
         return {"items": items, "scene_rect": QRectF(self._scene.sceneRect()),
                 "select_rect": QRectF(self._select_rect),
@@ -291,6 +299,7 @@ class CanvasView(QGraphicsView):
         for it in list(self._scene.items()):
             self._scene.removeItem(it)
         self._text_meta = {}
+        self._shape_meta = {}
         for entry in sorted(snapshot["items"], key=lambda e: e["z"]):
             item = QGraphicsPixmapItem(entry["pixmap"])
             if not entry.get("is_draw"):
@@ -306,6 +315,8 @@ class CanvasView(QGraphicsView):
             if "text_meta" in entry:
                 item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
                 self._text_meta[id(item)] = dict(entry["text_meta"])
+            if "shape_meta" in entry:
+                self._shape_meta[id(item)] = dict(entry["shape_meta"])
         self._scene.setSceneRect(snapshot["scene_rect"])
         self._select_rect = QRectF(snapshot.get("select_rect", QRectF()))
         self._transparent_background = snapshot.get("transparent_background", self._transparent_background)
@@ -379,6 +390,7 @@ class CanvasView(QGraphicsView):
         for it in targets:
             self._scene.removeItem(it)
             self._text_meta.pop(id(it), None)
+            self._shape_meta.pop(id(it), None)
         self.changed.emit()
 
     def canvas_rect(self) -> QRectF:
@@ -460,6 +472,7 @@ class CanvasView(QGraphicsView):
         for it in list(self._scene.items()):
             self._scene.removeItem(it)
         self._text_meta = {}
+        self._shape_meta = {}
         self._scene.setSceneRect(0, 0, max(image.width(), 1), max(image.height(), 1))
         self.base_item = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
         self.draw_item = self._add_draw_layer()
@@ -857,9 +870,14 @@ class CanvasView(QGraphicsView):
 
     def set_draw_options(self, subtool: str, thickness: int, color: QColor) -> None:
         """그리기 도구의 하위 도구('brush'/'eraser'/'highlighter'), 두께, 색상을 설정한다."""
+        unchanged = self.draw_thickness == thickness and self.draw_color == color
         self.draw_subtool = subtool
         self.draw_thickness = thickness
         self.draw_color = QColor(color)
+        # 값이 실제로 바뀐 경우에만 재래스터화한다 (탭 전환 등 반복 호출 시
+        # 선택된 도형을 불필요하게 다시 그리거나 실행취소에 쌓지 않기 위함).
+        if not unchanged:
+            self._restyle_selected_shape_items()
 
     def set_shape_subtool(self, subtool: str) -> None:
         """도형 도구의 하위 종류(사각형/타원/.../직선/자유곡선 등)를 설정한다.
@@ -884,6 +902,8 @@ class CanvasView(QGraphicsView):
         내용 세로 정렬을 지원하지 않아 편집 중에는 항상 위쪽 기준으로 보이고,
         편집을 마칠 때 최종 렌더링에만 반영된다).
         """
+        unchanged = (self.text_font == font and self.text_color == color
+                     and self.text_align_h == align_h and self.text_align_v == align_v)
         self.text_font = QFont(font)
         self.text_color = QColor(color)
         self.text_align_h = align_h
@@ -891,6 +911,31 @@ class CanvasView(QGraphicsView):
         if self._text_overlay is not None:
             self._style_text_edit(self._text_overlay.text_edit, self.text_font, self.text_color,
                                    self.text_align_h)
+            return
+        # 값이 실제로 바뀐 경우에만 재래스터화한다. 탭 전환 등으로 이 메서드가
+        # 동일한 값으로 반복 호출될 때마다 선택된 텍스트 박스를 다시 그리고
+        # 실행취소 스택에 쌓는 것을 방지한다.
+        if not unchanged:
+            self._restyle_selected_text_items()
+
+    def _restyle_selected_text_items(self) -> None:
+        """편집을 마치고 확정된 텍스트 박스가 선택되어 있으면, 방금 바뀐
+        폰트/색/정렬로 다시 래스터화해 즉시 반영한다."""
+        targets = [it for it in self._scene.selectedItems() if id(it) in self._text_meta]
+        if not targets:
+            return
+        self._push_undo()
+        for item in targets:
+            meta = self._text_meta[id(item)]
+            pixmap = self._rasterize_text(meta["text"], self.text_font, self.text_color,
+                                           self.text_align_h, self.text_align_v,
+                                           item.pixmap().size())
+            item.setPixmap(pixmap)
+            meta["font"] = QFont(self.text_font)
+            meta["color"] = QColor(self.text_color)
+            meta["align_h"] = self.text_align_h
+            meta["align_v"] = self.text_align_v
+        self.changed.emit()
 
     def has_selection(self) -> bool:
         """유효한 선택 영역이 있는지 여부."""
@@ -1464,7 +1509,8 @@ class CanvasView(QGraphicsView):
             return
         pad = self._shape_pad() + self._arrowhead_margin()
         xs, ys = [p.x() for p in points], [p.y() for p in points]
-        left, top = min(xs) - pad, min(ys) - pad
+        content_origin = QPointF(min(xs), min(ys))
+        left, top = content_origin.x() - pad, content_origin.y() - pad
         w, h = max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad
         pixmap = QPixmap(max(int(round(w)), 1), max(int(round(h)), 1))
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -1472,15 +1518,24 @@ class CanvasView(QGraphicsView):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(self._shape_pen())
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        origin = QPointF(left, top)
-        draw_bezier_kind(painter, self.shape_subtool, [p - origin for p in points], self.draw_thickness)
+        points_local = [p - content_origin for p in points]
+        draw_bezier_kind(painter, self.shape_subtool, [p + QPointF(pad, pad) for p in points_local],
+                          self.draw_thickness)
         painter.end()
         self._push_undo()
-        self._add_pixmap(pixmap, QPoint(int(round(left)), int(round(top))))
+        item = self._add_pixmap(pixmap, QPoint(int(round(left)), int(round(top))))
+        self._shape_meta[id(item)] = {
+            "kind": "curve", "subtool": self.shape_subtool, "color": QColor(self.draw_color),
+            "thickness": self.draw_thickness, "pad": pad, "geometry": points_local,
+        }
+
+    @staticmethod
+    def _shape_pad_for(thickness: int) -> int:
+        """도형 획(pen) 두께가 픽스맵 경계에서 잘리지 않도록 필요한 여백."""
+        return int(math.ceil(thickness / 2)) + 2
 
     def _shape_pad(self) -> int:
-        """도형 획(pen) 두께가 픽스맵 경계에서 잘리지 않도록 필요한 여백."""
-        return int(math.ceil(self.draw_thickness / 2)) + 2
+        return self._shape_pad_for(self.draw_thickness)
 
     def _shape_pen(self) -> QPen:
         """도형/선 그리기에 쓸 pen (현재 두께/색, 둥근 이음새)을 만든다."""
@@ -1503,18 +1558,27 @@ class CanvasView(QGraphicsView):
         draw_bbox_shape(painter, self.shape_subtool, QRectF(pad, pad, w, h))
         painter.end()
         self._push_undo()
-        self._add_pixmap(pixmap, (rect.topLeft() - QPointF(pad, pad)).toPoint())
+        item = self._add_pixmap(pixmap, (rect.topLeft() - QPointF(pad, pad)).toPoint())
+        self._shape_meta[id(item)] = {
+            "kind": "bbox", "subtool": self.shape_subtool, "color": QColor(self.draw_color),
+            "thickness": self.draw_thickness, "pad": pad, "geometry": QSizeF(w, h),
+        }
+
+    @staticmethod
+    def _arrowhead_margin_for(subtool: str, thickness: int) -> int:
+        """화살표 날개가 픽스맵 밖으로 잘리지 않도록 필요한 추가 여백."""
+        if subtool not in ARROW_KINDS:
+            return 0
+        return int(math.ceil(arrowhead_length(thickness))) + 2
 
     def _arrowhead_margin(self) -> int:
-        """화살표 날개가 픽스맵 밖으로 잘리지 않도록 필요한 추가 여백."""
-        if self.shape_subtool not in ARROW_KINDS:
-            return 0
-        return int(math.ceil(arrowhead_length(self.draw_thickness))) + 2
+        return self._arrowhead_margin_for(self.shape_subtool, self.draw_thickness)
 
     def _commit_line_shape(self, p1: QPointF, p2: QPointF) -> None:
         """드래그로 정의된 직선(화살표 포함 가능)을 래스터화해 새 아이템으로 추가한다."""
         pad = self._shape_pad() + self._arrowhead_margin()
-        left, top = min(p1.x(), p2.x()) - pad, min(p1.y(), p2.y()) - pad
+        content_origin = QPointF(min(p1.x(), p2.x()), min(p1.y(), p2.y()))
+        left, top = content_origin.x() - pad, content_origin.y() - pad
         w = abs(p2.x() - p1.x()) + 2 * pad
         h = abs(p2.y() - p1.y()) + 2 * pad
         pixmap = QPixmap(max(int(round(w)), 1), max(int(round(h)), 1))
@@ -1522,11 +1586,83 @@ class CanvasView(QGraphicsView):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(self._shape_pen())
-        origin = QPointF(left, top)
-        draw_line_kind(painter, self.shape_subtool, p1 - origin, p2 - origin, self.draw_thickness)
+        p1_local, p2_local = p1 - content_origin, p2 - content_origin
+        draw_line_kind(painter, self.shape_subtool, p1_local + QPointF(pad, pad),
+                        p2_local + QPointF(pad, pad), self.draw_thickness)
         painter.end()
         self._push_undo()
-        self._add_pixmap(pixmap, QPoint(int(round(left)), int(round(top))))
+        item = self._add_pixmap(pixmap, QPoint(int(round(left)), int(round(top))))
+        self._shape_meta[id(item)] = {
+            "kind": "line", "subtool": self.shape_subtool, "color": QColor(self.draw_color),
+            "thickness": self.draw_thickness, "pad": pad, "geometry": (p1_local, p2_local),
+        }
+
+    def _restyle_selected_shape_items(self) -> None:
+        """이미 확정된 도형/선/자유곡선이 선택되어 있으면, 방금 바뀐 두께/색으로
+        다시 래스터화해 즉시 반영한다 (화면상 위치는 그대로 유지).
+
+        item.pos()가 마지막 래스터화 시점의 pad만큼 콘텐츠 좌상단에서
+        안쪽으로 들어가 있다는 불변식을 이용해, 도형이 그 뒤 이동됐어도
+        content_top_left(씬 좌표)를 정확히 복원한 뒤 새 pad로 다시 배치한다.
+        """
+        targets = [it for it in self._scene.selectedItems() if id(it) in self._shape_meta]
+        if not targets:
+            return
+        self._push_undo()
+        pen = self._shape_pen()
+        for item in targets:
+            meta = self._shape_meta[id(item)]
+            kind = meta["kind"]
+            subtool = meta["subtool"]
+            content_top_left = item.pos() + QPointF(meta["pad"], meta["pad"])
+
+            if kind == "bbox":
+                size: QSizeF = meta["geometry"]
+                pad = self._shape_pad()
+                w, h = max(int(round(size.width())), 1), max(int(round(size.height())), 1)
+                pixmap = QPixmap(w + 2 * pad, h + 2 * pad)
+                pixmap.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                draw_bbox_shape(painter, subtool, QRectF(pad, pad, w, h))
+                painter.end()
+            elif kind == "line":
+                p1_local, p2_local = meta["geometry"]
+                pad = self._shape_pad() + self._arrowhead_margin_for(subtool, self.draw_thickness)
+                w = abs(p2_local.x() - p1_local.x()) + 2 * pad
+                h = abs(p2_local.y() - p1_local.y()) + 2 * pad
+                pixmap = QPixmap(max(int(round(w)), 1), max(int(round(h)), 1))
+                pixmap.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(pen)
+                draw_line_kind(painter, subtool, p1_local + QPointF(pad, pad),
+                                p2_local + QPointF(pad, pad), self.draw_thickness)
+                painter.end()
+            else:  # curve
+                points_local: list[QPointF] = meta["geometry"]
+                pad = self._shape_pad() + self._arrowhead_margin_for(subtool, self.draw_thickness)
+                xs = [p.x() for p in points_local]
+                ys = [p.y() for p in points_local]
+                w, h = max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad
+                pixmap = QPixmap(max(int(round(w)), 1), max(int(round(h)), 1))
+                pixmap.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                draw_bezier_kind(painter, subtool, [p + QPointF(pad, pad) for p in points_local],
+                                  self.draw_thickness)
+                painter.end()
+
+            item.setPixmap(pixmap)
+            item.setPos(content_top_left - QPointF(pad, pad))
+            meta["color"] = QColor(self.draw_color)
+            meta["thickness"] = self.draw_thickness
+            meta["pad"] = pad
+        self.changed.emit()
 
     # ---------- 그리기(브러시/지우개/형광펜) ---------- #
     def _pixel_align(self, point: QPointF) -> QPointF:

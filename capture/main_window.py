@@ -1289,6 +1289,12 @@ class MainWindow(QMainWindow):
             return
         if not v.paste_image():
             self.statusBar().showMessage("클립보드에 이미지가 없습니다.", 2500)
+            return
+        # 붙여넣은 이미지는 바로 위치를 옮길 수 있어야 하는데, 붙여넣기
+        # 직전에 다른 도구(그리기/텍스트 등)가 활성 상태였다면 그 도구가
+        # 마우스 입력을 가로채 드래그 이동이 되지 않는다. '이동' 도구로 전환한다.
+        self._move_action.setChecked(True)
+        self._set_tool("move")
 
     def paste_as_new_tab(self) -> None:
         """클립보드 이미지를 새 탭으로 추가한다."""
