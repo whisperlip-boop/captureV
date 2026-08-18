@@ -200,6 +200,14 @@ class CanvasView(QGraphicsView):
         self._pending_move_snapshot: Optional[dict] = None
         self._pending_move_positions: Optional[dict[int, QPointF]] = None
 
+        # '이동' 도구에서 선택된 아이템이 하나뿐일 때, PicPick처럼 그 테두리에
+        # 크기 조절 핸들을 보여주고 드래그로 크기를 바꿀 수 있게 한다.
+        self._item_resize_item: Optional[QGraphicsPixmapItem] = None
+        self._item_resize_handle: Optional[tuple[int, int]] = None
+        self._item_resize_drag_ref: Optional[tuple[QPointF, QRectF]] = None
+        self._item_resize_source_pixmap: Optional[QPixmap] = None
+        self._item_resize_pending_snapshot: Optional[dict] = None
+
         # 선택 영역 테두리를 움직이는 점선("marching ants")으로 표시하기 위한
         # 애니메이션 phase. 선택이 없을 때는 갱신해도 다시 그릴 필요가 없으므로
         # _tick_marching_ants에서 그 경우엔 update()를 생략해 불필요한 반복
@@ -896,6 +904,12 @@ class CanvasView(QGraphicsView):
             self._shape_origin = None
             self._shape_rect = QRectF()
             self._curve_drag_index = None
+        if tool != "move":
+            self._item_resize_item = None
+            self._item_resize_handle = None
+            self._item_resize_drag_ref = None
+            self._item_resize_source_pixmap = None
+            self._item_resize_pending_snapshot = None
         self.viewport().update()
 
     def set_draw_options(self, subtool: str, thickness: int, color: QColor) -> None:
@@ -1075,6 +1089,102 @@ class CanvasView(QGraphicsView):
                 return key
         return None
 
+    # ---------- 아이템 크기 조절 핸들 ---------- #
+    def _resizable_selected_item(self) -> Optional[QGraphicsPixmapItem]:
+        """'이동' 도구에서 크기 조절 핸들을 보여줄 대상을 반환한다.
+
+        붙여넣기/텍스트/도형 등으로 놓인 아이템이 정확히 하나만 선택되어
+        있을 때만 PicPick처럼 테두리에 크기 조절 핸들을 보여준다. 여러
+        개를 함께 선택했을 때는(예: Ctrl+A) 항목별 크기가 다를 수 있어
+        핸들을 보여주지 않는다.
+        """
+        if self.tool != "move":
+            return None
+        selected = [it for it in self._scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
+        return selected[0] if len(selected) == 1 else None
+
+    @staticmethod
+    def _item_pixmap_rect(item: QGraphicsPixmapItem) -> QRectF:
+        """item의 실제 픽스맵 사각형(씬 좌표)을 반환한다.
+
+        QGraphicsPixmapItem.sceneBoundingRect()는 SmoothTransformation
+        보간 여백으로 사방이 0.5px씩 더 넓게 나와(예: 50x50 픽스맵이
+        (-0.5,-0.5,51,51)), 이 값을 그대로 setPos()에 되먹이면 매 크기
+        조절마다 위치가 조금씩 밀린다. item.pos()+pixmap 크기 그대로
+        쓰는 이 사각형이 텍스트 편집 오버레이 등 다른 곳에서도 이미
+        '아이템의 진짜 위치/크기'로 쓰는 값이라 여기서도 이걸 기준으로
+        삼는다.
+        """
+        return QRectF(item.pos(), QSizeF(item.pixmap().size()))
+
+    def _item_resize_handle_rects(self, item: QGraphicsPixmapItem) -> dict[tuple[int, int], QRectF]:
+        """item의 8방향 크기 조절 핸들 사각형을 계산한다."""
+        return self._handles_for(self._item_pixmap_rect(item), self._handle_size_scene())
+
+    def _item_resize_handle_at(self, item: QGraphicsPixmapItem, view_pos: QPoint) -> Optional[tuple[int, int]]:
+        """view_pos 에 해당하는 item의 크기 조절 핸들 키를 찾는다. 없으면 None."""
+        sp = self.mapToScene(view_pos)
+        for key, hr in self._item_resize_handle_rects(item).items():
+            if hr.contains(sp):
+                return key
+        return None
+
+    def _item_resize_move(self, view_pos: QPoint) -> None:
+        """이동 도구: 아이템 크기 조절 드래그를 갱신한다(픽스맵을 다시 스케일).
+
+        드래그 중에는 매번 드래그 시작 시점의 원본 픽스맵(_item_resize_source_pixmap)
+        에서부터 다시 스케일해, 이미 축소된 픽스맵을 반복해서 재스케일하며
+        품질이 계속 저하되는 것을 막는다.
+        """
+        item = self._item_resize_item
+        handle = self._item_resize_handle
+        if item is None or handle is None or self._item_resize_drag_ref is None:
+            return
+        pixmap = self._item_resize_source_pixmap
+        if pixmap is None or pixmap.isNull():
+            return
+        sp = self.mapToScene(view_pos)
+        start, rect0 = self._item_resize_drag_ref
+        hx, hy = handle
+        d = sp - start
+        left, top, right, bottom = rect0.left(), rect0.top(), rect0.right(), rect0.bottom()
+        if hx < 0:
+            left = min(left + d.x(), right - MIN_SELECTION)
+        elif hx > 0:
+            right = max(right + d.x(), left + MIN_SELECTION)
+        if hy < 0:
+            top = min(top + d.y(), bottom - MIN_SELECTION)
+        elif hy > 0:
+            bottom = max(bottom + d.y(), top + MIN_SELECTION)
+        new_rect = QRectF(left, top, right - left, bottom - top)
+        w = max(int(round(new_rect.width())), 1)
+        h = max(int(round(new_rect.height())), 1)
+        item.setPixmap(pixmap.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation))
+        item.setPos(new_rect.topLeft())
+        self.viewport().update()
+
+    def _item_resize_release(self) -> None:
+        """이동 도구: 아이템 크기 조절 드래그를 마치고, 실제로 크기가 바뀌었으면 되돌리기에 기록한다."""
+        item = self._item_resize_item
+        snapshot = self._item_resize_pending_snapshot
+        drag_ref = self._item_resize_drag_ref
+        self._item_resize_item = None
+        self._item_resize_handle = None
+        self._item_resize_drag_ref = None
+        self._item_resize_source_pixmap = None
+        self._item_resize_pending_snapshot = None
+        if item is None or snapshot is None or drag_ref is None:
+            return
+        _, original_rect = drag_ref
+        if self._item_pixmap_rect(item) == original_rect:
+            return
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self.MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self.changed.emit()
+
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
         """뷰포트 배경과 캔버스 영역을 그린다(투명 배경이면 체커보드, 아니면 흰색)."""
         painter.fillRect(rect, self.backgroundBrush())
@@ -1136,6 +1246,15 @@ class CanvasView(QGraphicsView):
             painter.save()
             painter.setBrush(Qt.BrushStyle.NoBrush)
             self._draw_marching_ants(painter, bounds, scale)
+            painter.restore()
+
+        resize_item = self._resizable_selected_item()
+        if resize_item is not None:
+            painter.save()
+            painter.setPen(QPen(QColor(0x33, 0x33, 0x33), 1.0 / scale))
+            painter.setBrush(QBrush(Qt.GlobalColor.white))
+            for hr in self._item_resize_handle_rects(resize_item).values():
+                painter.drawRect(hr)
             painter.restore()
 
         if self.tool == "select" and self.has_selection():
@@ -1251,6 +1370,21 @@ class CanvasView(QGraphicsView):
                 self._shape_press(event.position().toPoint())
                 event.accept()
                 return
+            # '이동' 도구: 선택된 아이템이 하나뿐이고 그 크기 조절 핸들 위를
+            # 눌렀으면 크기 조절을 시작하고, 뒤이은 기본 아이템 드래그(이동)
+            # 처리로 넘어가지 않도록 여기서 끝낸다.
+            resize_item = self._resizable_selected_item()
+            if resize_item is not None:
+                handle = self._item_resize_handle_at(resize_item, event.position().toPoint())
+                if handle is not None:
+                    self._item_resize_item = resize_item
+                    self._item_resize_handle = handle
+                    self._item_resize_drag_ref = (self.mapToScene(event.position().toPoint()),
+                                                   self._item_pixmap_rect(resize_item))
+                    self._item_resize_source_pixmap = QPixmap(resize_item.pixmap())
+                    self._item_resize_pending_snapshot = self._snapshot()
+                    event.accept()
+                    return
             # '이동' 도구: 아이템 드래그가 실제로 위치를 바꿀 경우에만 되돌리기
             # 항목으로 기록하기 위해, 드래그 시작 시점의 상태를 미리 잡아둔다.
             self._pending_move_snapshot = self._snapshot()
@@ -1913,7 +2047,16 @@ class CanvasView(QGraphicsView):
         # 자기 커서를 덮어씌울 수도 있다(예: 선택 조절 핸들 위일 때).
         if not (event.buttons() & Qt.MouseButton.LeftButton):
             h = self._canvas_handle_at(pos)
+            if h is None:
+                resize_item = self._resizable_selected_item()
+                if resize_item is not None:
+                    h = self._item_resize_handle_at(resize_item, pos)
             self.viewport().setCursor(CURSORS[h] if h is not None else Qt.CursorShape.ArrowCursor)
+
+        if self._item_resize_item is not None:
+            self._item_resize_move(pos)
+            event.accept()
+            return
 
         if self.tool == "select":
             self._select_move(pos)
@@ -2000,6 +2143,10 @@ class CanvasView(QGraphicsView):
             self._drag_handle = None
             self._canvas_resize_preview = None
             self.viewport().update()
+            event.accept()
+            return
+        if self._item_resize_item is not None:
+            self._item_resize_release()
             event.accept()
             return
         if self.tool == "select":
