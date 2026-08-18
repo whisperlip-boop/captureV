@@ -26,6 +26,14 @@ class _AngleSpinBox(QDoubleSpinBox):
     1도 단위 감각과 어긋난다(0도에서 아래로 한 번 누르면 359.0도가
     아니라 359.9도가 됨). 화살표 클릭(stepBy)만 360을 나머지로 하는
     순환 계산으로 대체해, 0도 아래는 359.0도로 이어지게 한다.
+
+    다만 setWrapping(True) 자체는 그대로 켜 둬야 한다. 이 값이 꺼져
+    있으면(기본값) 값이 최솟값(0.0)일 때 Qt가 아래쪽 화살표 버튼을
+    자동으로 비활성화해버려(최댓값일 때는 위쪽 버튼), 정확히 0.0도인
+    기본 상태에서는 화살표를 눌러도 반응이 없는 것처럼 보인다. 실제
+    순환 계산은 stepBy 재정의가 전담하므로 setWrapping의 기본 계산
+    로직 자체는 쓰이지 않고, 버튼을 계속 눌릴 수 있게 하는 용도로만
+    남겨둔다.
     """
 
     def stepBy(self, steps: int) -> None:
@@ -65,6 +73,7 @@ class RotateAngleDialog(QDialog):
         self._angle_spin.setDecimals(ANGLE_DECIMALS)
         self._angle_spin.setRange(ANGLE_MIN, ANGLE_MAX)
         self._angle_spin.setSingleStep(ANGLE_STEP)
+        self._angle_spin.setWrapping(True)
         self._angle_spin.setValue(initial_angle)
         angle_row.addWidget(self._angle_spin)
         layout.addLayout(angle_row)
