@@ -191,6 +191,9 @@ class CanvasView(QGraphicsView):
         self._text_editing_item: Optional[QGraphicsPixmapItem] = None
         self._text_new_rect: Optional[QRectF] = None
         self._text_meta: dict[int, dict] = {}      # id(item) -> {text, font, color, align_h, align_v}
+        self._text_drag_item: Optional[QGraphicsPixmapItem] = None
+        self._text_drag_start_scene: Optional[QPointF] = None
+        self._text_drag_item_start_pos: Optional[QPointF] = None
 
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
@@ -517,12 +520,17 @@ class CanvasView(QGraphicsView):
             return
         transformed = transform(image.copy(x0, y0, w, h))
         painter = QPainter(image)
+        # 기본 합성 모드(SourceOver)는 알파 블렌딩이라, 변형 결과의 투명한
+        # 부분에는 그 자리에 남아있던 원본 픽셀이 그대로 비쳐 보인다(대칭
+        # 이동/회전 전후 이미지가 겹쳐 보이는 원인). Source로 지정해 해당
+        # 영역을 완전히 덮어써야 한다.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.drawImage(x0, y0, transformed)
         painter.end()
         self._replace_with_flattened(image)
 
-    def _rotate_90(self, degrees: int) -> None:
-        """대상 영역을 90도 단위로 회전한다 (degrees는 90 또는 -90).
+    def _rotate_by_degrees(self, degrees: float) -> None:
+        """대상 영역을 임의의 각도로 회전한다 (양수는 시계 방향, 음수는 반시계 방향).
 
         선택 영역이 없으면 캔버스 전체(이미지+캔버스 크기)를 함께 회전한다.
         선택 영역이 있으면 PicPick과 동일하게, 선택 영역 자체를 회전된
@@ -542,6 +550,7 @@ class CanvasView(QGraphicsView):
         new_w = min(rotated.width(), image.width() - x0)
         new_h = min(rotated.height(), image.height() - y0)
         painter = QPainter(image)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.drawImage(x0, y0, rotated)
         painter.end()
         self._replace_with_flattened(image)
@@ -549,7 +558,7 @@ class CanvasView(QGraphicsView):
 
     def rotate_right(self) -> None:
         """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 오른쪽(시계 방향)으로 90도 회전한다."""
-        self._rotate_90(90)
+        self._rotate_by_degrees(90)
 
     def rotate_180(self) -> None:
         """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 180도 회전한다."""
@@ -557,7 +566,16 @@ class CanvasView(QGraphicsView):
 
     def rotate_left(self) -> None:
         """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 왼쪽(반시계 방향)으로 90도 회전한다."""
-        self._rotate_90(-90)
+        self._rotate_by_degrees(-90)
+
+    def rotate_by_angle(self, degrees: float, clockwise: bool) -> None:
+        """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 지정한 각도만큼 회전한다.
+
+        Args:
+            degrees: 0.0~359.9 사이의 회전 각도(방향 무관 크기).
+            clockwise: True면 시계 방향, False면 반시계 방향으로 회전한다.
+        """
+        self._rotate_by_degrees(degrees if clockwise else -degrees)
 
     def flip_vertical(self) -> None:
         """대상 영역(선택 있으면 그 영역, 없으면 캔버스 전체)을 상하로 대칭 이동한다."""
@@ -870,6 +888,9 @@ class CanvasView(QGraphicsView):
         if tool != "text":
             self._text_state = "idle"
             self._text_rect = QRectF()
+            self._text_drag_item = None
+            self._text_drag_start_scene = None
+            self._text_drag_item_start_pos = None
         if tool != "shape":
             self._shape_state = "idle"
             self._shape_origin = None
@@ -1258,7 +1279,20 @@ class CanvasView(QGraphicsView):
 
     # ---------- 텍스트 ---------- #
     def _text_press(self, view_pos: QPoint) -> None:
-        """텍스트 도구: 새 텍스트 박스가 들어갈 영역 드래그를 시작한다."""
+        """텍스트 도구: 기존 텍스트 박스 위를 누르면 그 박스를 이동시키고,
+        빈 곳을 누르면 새 텍스트 박스가 들어갈 영역 드래그를 시작한다."""
+        item = self.itemAt(view_pos)
+        if isinstance(item, QGraphicsPixmapItem) and id(item) in self._text_meta:
+            self._text_state = "moving"
+            self._text_drag_item = item
+            self._text_drag_start_scene = self.mapToScene(view_pos)
+            self._text_drag_item_start_pos = QPointF(item.pos())
+            self._pending_move_snapshot = self._snapshot()
+            self._pending_move_positions = {
+                id(it): QPointF(it.pos()) for it in self._scene.items()
+                if isinstance(it, QGraphicsPixmapItem)
+            }
+            return
         sp = self.mapToScene(view_pos)
         self._text_state = "dragging"
         self._text_origin = sp
@@ -1266,14 +1300,28 @@ class CanvasView(QGraphicsView):
         self.viewport().update()
 
     def _text_move(self, view_pos: QPoint) -> None:
-        """텍스트 도구: 드래그 중인 영역을 갱신한다."""
+        """텍스트 도구: 박스 이동 드래그 또는 새 영역 드래그를 갱신한다."""
+        if self._text_state == "moving" and self._text_drag_item is not None:
+            sp = self.mapToScene(view_pos)
+            delta = sp - self._text_drag_start_scene
+            self._text_drag_item.setPos(self._text_drag_item_start_pos + delta)
+            self.viewport().update()
+            return
         if self._text_state == "dragging" and self._text_origin is not None:
             sp = self.mapToScene(view_pos)
             self._text_rect = QRectF(self._text_origin, sp).normalized()
             self.viewport().update()
 
     def _text_release(self) -> None:
-        """텍스트 도구: 드래그를 마치면 지정한 영역에 편집 오버레이를 연다."""
+        """텍스트 도구: 박스 이동 드래그를 확정하거나, 새 영역 드래그를 마치면
+        지정한 영역에 편집 오버레이를 연다."""
+        if self._text_state == "moving":
+            self._text_state = "idle"
+            self._text_drag_item = None
+            self._text_drag_start_scene = None
+            self._text_drag_item_start_pos = None
+            self._commit_pending_move()
+            return
         if self._text_state != "dragging":
             return
         self._text_state = "idle"
@@ -1323,14 +1371,21 @@ class CanvasView(QGraphicsView):
         overlay.text_edit.setFocus()
         overlay.text_edit.selectAll()
 
-    @staticmethod
-    def _style_text_edit(text_edit: QTextEdit, font: QFont, color: QColor, align_h: str) -> None:
+    def _style_text_edit(self, text_edit: QTextEdit, font: QFont, color: QColor, align_h: str) -> None:
         """편집 중인 텍스트칸에 폰트/색/가로 정렬을 실시간으로 반영한다.
 
         세로 정렬은 QTextEdit이 내용 세로 정렬을 지원하지 않아 여기서는
         반영하지 않고, 최종 래스터화(_rasterize_text) 시점에만 적용한다.
+
+        편집칸은 확대/축소 배율과 무관한 일반 위젯이지만, 최종 텍스트는
+        래스터화된 픽스맵으로 캔버스에 얹혀 화면 배율만큼 함께 확대/축소된다.
+        편집 중 보이는 글자 크기가 완성 후 크기와 다르게 느껴지지 않도록,
+        여기서도 현재 화면 배율을 곱해 같은 크기로 보이게 맞춘다.
         """
-        text_edit.setFont(font)
+        scale = self.transform().m11() or 1.0
+        display_font = QFont(font)
+        display_font.setPointSizeF(max(font.pointSizeF(), 1.0) * scale)
+        text_edit.setFont(display_font)
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
         cursor = text_edit.textCursor()

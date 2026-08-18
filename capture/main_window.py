@@ -43,6 +43,7 @@ from capture.logging_setup import get_log_dir
 from capture.palette import PaletteWidget
 from capture.percent_dialog import PercentSettingsDialog
 from capture.region_overlay import RegionOverlay
+from capture.rotate_angle_dialog import RotateAngleDialog
 from capture.shape_settings import ShapeSubtoolPanel
 from capture.shapes import LINE_KINDS, SHAPE_KINDS
 from capture.shortcut_dialog import ShortcutSettingsDialog
@@ -808,7 +809,10 @@ class MainWindow(QMainWindow):
         v.apply_hue_saturation(dialog.value1(), dialog.value2())
 
     def _populate_rotate_menu(self) -> None:
-        """'회전' 하위 메뉴(오른쪽/180도/왼쪽 회전, 상하/좌우 대칭 이동)를 구성한다."""
+        """'회전' 하위 메뉴(오른쪽/180도/왼쪽 회전, 자유 각도 회전, 상하/좌우 대칭 이동)를 구성한다."""
+        self._rotate_angle = 0.0
+        self._rotate_clockwise = True
+
         rotations = [
             ("오른쪽으로 90도 회전", "rotate-right.png", "rotate_right"),
             ("180도 회전", "rotation180.png", "rotate_180"),
@@ -819,12 +823,31 @@ class MainWindow(QMainWindow):
 
         self._rotate_menu.addSeparator()
 
+        angle_action = QAction(QIcon(str(get_resource_path("img/userrotate.png"))), "자유로운 각도로 회전", self)
+        angle_action.triggered.connect(self._open_rotate_angle_dialog)
+        self._rotate_menu.addAction(angle_action)
+
+        self._rotate_menu.addSeparator()
+
         flips = [
             ("상하 대칭 이동", "horizontal_flip.png", "flip_vertical"),
             ("좌우 대칭 이동", "RL_flip.png", "flip_horizontal"),
         ]
         for text, icon_file, method_name in flips:
             self._add_canvas_op_action(self._rotate_menu, text, icon_file, method_name)
+
+    def _open_rotate_angle_dialog(self) -> None:
+        """'자유로운 각도로 회전' 팝업을 열어 선택 영역(없으면 캔버스 전체)을 지정한 방향/각도로 회전한다."""
+        v = self.current_view()
+        if v is None:
+            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
+            return
+        dialog = RotateAngleDialog(self._rotate_angle, self._rotate_clockwise, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._rotate_angle = dialog.angle()
+        self._rotate_clockwise = dialog.is_clockwise()
+        v.rotate_by_angle(self._rotate_angle, self._rotate_clockwise)
 
     def _populate_resize_menu(self) -> None:
         """'크기 조절' 하위 메뉴(이미지 크기 변경/캔버스 크기 변경)를 구성한다."""
