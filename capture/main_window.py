@@ -1138,9 +1138,9 @@ class MainWindow(QMainWindow):
             QMessageBox.Icon.Warning, APP_NAME, f"'{name}'의 변경 내용을 저장하시겠습니까?",
             QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
             | QMessageBox.StandardButton.Cancel, self)
-        box.button(QMessageBox.StandardButton.Save).setText("저장")
-        box.button(QMessageBox.StandardButton.Discard).setText("저장 안 함(N)")
-        box.button(QMessageBox.StandardButton.Cancel).setText("취소")
+        box.button(QMessageBox.StandardButton.Save).setText("Save")
+        box.button(QMessageBox.StandardButton.Discard).setText("Don't Save (N)")
+        box.button(QMessageBox.StandardButton.Cancel).setText("Cancel")
         box.setDefaultButton(QMessageBox.StandardButton.Save)
         strip_minmax_buttons(box)
         discard_btn = box.button(QMessageBox.StandardButton.Discard)

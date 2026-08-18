@@ -42,8 +42,6 @@ class DualSliderDialog(QDialog):
         self.spin2, self.slider2 = self._add_row(layout, label2)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("확인(O)")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("취소(C)")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
