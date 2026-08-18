@@ -64,7 +64,7 @@ def main() -> None:
         # 아이콘을 보여준다 (지정하지 않으면 다른 파이썬 앱과 그룹화되거나
         # 인터프리터 기본 아이콘이 뜬다).
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("vuno.capturev.desktop.v1")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bskim.capturev.desktop.v1")
         except Exception:
             logger.exception("작업표시줄 AppUserModelID 설정 실패")
 
