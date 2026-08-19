@@ -46,15 +46,23 @@ relink or replace the Qt/PySide6 libraries as required by the LGPL.
 
 ## 3. Icon Assets
 
-All icons in the `img/` directory were obtained from Flaticon
+## 3. Icon Assets
+
+Some UI icons in the `img/` directory were obtained from Flaticon
 (https://www.flaticon.com/free-icon).
 
-Per Flaticon's free-icon license terms:
+These icons are used as UI assets in this software in accordance with
+Flaticon's applicable free-icon license terms.
 
-- These icons may be used, modified, and redistributed by anyone.
-- Attribution to Flaticon must be retained.
-- Modified versions must not be re-presented as one's own original
-  work / re-branded without attribution.
+The required attribution to Flaticon and the respective icon authors
+is retained in this project's documentation.
+
+The icons may have been resized, recolored, or otherwise modified to
+fit the software's user interface. Such modifications do not claim
+the original artwork as an original creation of this project.
+
+The icons are included as part of the software's UI and are not
+intended to be distributed as standalone icon assets.
 
 ## 4. Disclaimer
 
