@@ -1054,6 +1054,17 @@ class MainWindow(QMainWindow):
         for keys, slot in pairs:
             QShortcut(QKeySequence(keys), self).activated.connect(slot)
 
+        # 화살표 키 미세 이동은 길게 눌러도 반복 입력되지 않게 한다 - 그렇지
+        # 않으면 키를 잠깐만 누르고 있어도 되돌리기 스택(20개 제한)이 순식간에
+        # 이동 기록으로만 가득 차 그 전의 작업 내용을 되돌릴 수 없게 된다.
+        nudges = [
+            ("Left", (-1, 0)), ("Right", (1, 0)), ("Up", (0, -1)), ("Down", (0, 1)),
+        ]
+        for keys, (dx, dy) in nudges:
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(lambda dx=dx, dy=dy: self.nudge_selected_current(dx, dy))
+
     # ---------- 탭 ---------- #
     def current_view(self) -> Optional[CanvasView]:
         """현재 활성 탭의 CanvasView를 반환한다. 없으면 None."""
@@ -1380,6 +1391,12 @@ class MainWindow(QMainWindow):
         v = self.current_view()
         if v:
             v.delete_selected()
+
+    def nudge_selected_current(self, dx: int, dy: int) -> None:
+        """현재 탭에서 선택된 아이템을 화살표 키로 (dx, dy)px만큼 미세 이동한다."""
+        v = self.current_view()
+        if v:
+            v.nudge_selected(dx, dy)
 
     def _margin(self, px: int) -> None:
         """현재 탭 캔버스의 여백을 px만큼 조정한다."""

@@ -413,6 +413,23 @@ class CanvasView(QGraphicsView):
             self._shape_meta.pop(id(it), None)
         self.changed.emit()
 
+    def nudge_selected(self, dx: int, dy: int) -> None:
+        """선택된 아이템들을 화살표 키로 (dx, dy)px만큼 미세 이동한다.
+
+        마우스 드래그로는 정확한 위치 맞추기가 어려운 것을 보완하기 위한
+        기능이라, 누를 때마다 되돌리기 항목을 하나씩 남긴다(길게 눌러
+        빠르게 반복 입력되면 되돌리기 스택이 금방 다른 작업 기록을
+        밀어내므로, 이 단축키는 키를 계속 누르고 있어도 반복 입력되지
+        않도록 자동 반복을 꺼 두었다 - main_window._build_shortcuts 참고).
+        """
+        targets = [it for it in self._scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
+        if not targets:
+            return
+        self._push_undo()
+        for it in targets:
+            it.setPos(it.pos() + QPointF(dx, dy))
+        self.changed.emit()
+
     def canvas_rect(self) -> QRectF:
         """현재 캔버스(씬) 사각형을 반환한다(여백 조절 드래그 중이면 미리보기 크기)."""
         return self._canvas_resize_preview if self._canvas_resize_preview is not None else self._scene.sceneRect()
