@@ -52,8 +52,10 @@ Some UI icons in the `img/` directory were obtained from Flaticon
 These icons are used as UI assets in this software in accordance with
 Flaticon's applicable free-icon license terms.
 
-The required attribution to Flaticon and the respective icon authors
-is retained in this project's documentation.
+A per-icon designer attribution list is not included here: the
+download-time records needed to identify each icon's individual
+designer on Flaticon were not preserved, and the icons cannot be
+reliably traced back to their original listing after the fact.
 
 The icons may have been resized, recolored, or otherwise modified to
 fit the software's user interface. Such modifications do not claim
