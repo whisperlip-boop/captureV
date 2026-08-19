@@ -46,8 +46,6 @@ relink or replace the Qt/PySide6 libraries as required by the LGPL.
 
 ## 3. Icon Assets
 
-## 3. Icon Assets
-
 Some UI icons in the `img/` directory were obtained from Flaticon
 (https://www.flaticon.com/free-icon).
 
