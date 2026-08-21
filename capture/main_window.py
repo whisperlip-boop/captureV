@@ -11,10 +11,11 @@ from PySide6.QtCore import QPoint, QRect, QSettings, QSize, QStandardPaths, QUrl
 from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices,
                             QDragEnterEvent, QDropEvent, QFont, QGuiApplication, QIcon, QImage,
                             QKeySequence, QMouseEvent, QPixmap, QShortcut)
-from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-                                QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
-                                QMenu, QMessageBox, QSizePolicy, QSpinBox, QTabBar, QTabWidget,
-                                QToolBar, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QDialogButtonBox, QFileDialog,
+                                QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
+                                QMainWindow, QMenu, QMessageBox, QRadioButton, QSizePolicy, QSpinBox,
+                                QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget,
+                                QWidgetAction)
 
 from capture import screen_capture
 from capture.canvas_size_dialog import CanvasSizeDialog
@@ -24,7 +25,7 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                              BRIGHTNESS_CONTRAST_MIN, CANVAS_SURROUND_COLOR, DEFAULT_BLUR_PERCENT,
                              DEFAULT_CANVAS_SIZE_BG_COLOR, DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE,
                              DEFAULT_FIXED_CAPTURE_HEIGHT, DEFAULT_FIXED_CAPTURE_WIDTH,
-                             DEFAULT_MOSAIC_PERCENT, DEFAULT_NEW_CANVAS_HEIGHT,
+                             DEFAULT_MOSAIC_PERCENT, DEFAULT_NEW_CANVAS_BG_COLOR, DEFAULT_NEW_CANVAS_HEIGHT,
                              DEFAULT_NEW_CANVAS_WIDTH, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT,
                              DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS, EFFECT_MENU_ICON_PX,
                              FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, HUE_SATURATION_MAX,
@@ -40,7 +41,7 @@ from capture.dual_slider_dialog import DualSliderDialog
 from capture.hotkeys import HotkeyFilter, HotkeySpec, register_global_hotkeys, unregister_global_hotkeys
 from capture.image_resize_dialog import ImageResizeDialog
 from capture.logging_setup import get_log_dir
-from capture.palette import PaletteWidget
+from capture.palette import ColorDropdownButton, PaletteWidget
 from capture.percent_dialog import PercentSettingsDialog
 from capture.region_overlay import RegionOverlay
 from capture.rotate_angle_dialog import RotateAngleDialog
@@ -174,13 +175,17 @@ class MainWindow(QMainWindow):
         self._shape_subtool = (saved_shape_subtool if saved_shape_subtool in valid_shape_subtools
                                 else DEFAULT_SHAPE_SUBTOOL)
 
-        saved_thickness = int(self.settings.value("draw_thickness", DEFAULT_THICKNESS))
+        saved_thickness = int(str(self.settings.value("draw_thickness", DEFAULT_THICKNESS)))
         self._draw_thickness = min(max(saved_thickness, THICKNESS_MIN), THICKNESS_MAX)
 
         self._draw_color = QColor(self.settings.value("draw_color", DEFAULT_DRAW_COLOR))
-        self._fill_tolerance = int(self.settings.value("fill_tolerance", DEFAULT_FILL_TOLERANCE))
-        self._new_canvas_width = int(self.settings.value("new_canvas_width", DEFAULT_NEW_CANVAS_WIDTH))
-        self._new_canvas_height = int(self.settings.value("new_canvas_height", DEFAULT_NEW_CANVAS_HEIGHT))
+        self._fill_tolerance = int(str(self.settings.value("fill_tolerance", DEFAULT_FILL_TOLERANCE)))
+        self._new_canvas_width = int(str(self.settings.value("new_canvas_width", DEFAULT_NEW_CANVAS_WIDTH)))
+        self._new_canvas_height = int(str(self.settings.value("new_canvas_height", DEFAULT_NEW_CANVAS_HEIGHT)))
+        self._new_canvas_bg_color = QColor(
+            self.settings.value("new_canvas_bg_color", DEFAULT_NEW_CANVAS_BG_COLOR))
+        self._new_canvas_bg_transparent = bool(
+            self.settings.value("new_canvas_bg_transparent", False, type=bool))
         self._canvas_size_bg_color = QColor(
             self.settings.value("canvas_size_bg_color", DEFAULT_CANVAS_SIZE_BG_COLOR))
         self._color_pick_target: str = "draw"      # 색상 추출이 그리기 색/텍스트 색 중 어디로 갈지
@@ -293,7 +298,7 @@ class MainWindow(QMainWindow):
         self._toolbar.addWidget(container)
 
     def _open_new_canvas_settings_dialog(self) -> None:
-        """'신규' 버튼 클릭 시 생성할 캔버스 크기(Width/Height)를 설정한다."""
+        """'신규' 버튼 클릭 시 생성할 캔버스의 크기(Width/Height)와 배경을 설정한다."""
         dialog = QDialog(self)
         dialog.setWindowTitle("새로 만들기 설정")
         strip_minmax_buttons(dialog)
@@ -309,6 +314,29 @@ class MainWindow(QMainWindow):
         height_spin.setValue(self._new_canvas_height)
         form.addRow("Height (px):", height_spin)
 
+        color_ctrl = ColorDropdownButton(self._new_canvas_bg_color, self.settings, label="색",
+                                          vertical=True, settings_key="new_canvas_custom_colors",
+                                          parent=dialog)
+        color_ctrl.startColorPicking.connect(lambda: self._start_new_canvas_color_picking(dialog, color_ctrl))
+
+        custom_radio = QRadioButton("사용자 지정색", dialog)
+        transparent_radio = QRadioButton("투명색", dialog)
+        bg_group = QButtonGroup(dialog)
+        bg_group.addButton(custom_radio)
+        bg_group.addButton(transparent_radio)
+        (transparent_radio if self._new_canvas_bg_transparent else custom_radio).setChecked(True)
+        color_ctrl.setEnabled(not self._new_canvas_bg_transparent)
+        custom_radio.toggled.connect(color_ctrl.setEnabled)
+
+        radio_col = QVBoxLayout()
+        radio_col.addWidget(custom_radio)
+        radio_col.addWidget(transparent_radio)
+        bg_row = QHBoxLayout()
+        bg_row.addWidget(color_ctrl)
+        bg_row.addLayout(radio_col)
+        bg_row.addStretch()
+        form.addRow(bg_row)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -318,12 +346,44 @@ class MainWindow(QMainWindow):
             return
         self._new_canvas_width = width_spin.value()
         self._new_canvas_height = height_spin.value()
+        self._new_canvas_bg_color = color_ctrl.color()
+        self._new_canvas_bg_transparent = transparent_radio.isChecked()
         self.settings.setValue("new_canvas_width", self._new_canvas_width)
         self.settings.setValue("new_canvas_height", self._new_canvas_height)
-        logger.info("신규 캔버스 크기 설정: %dx%d", self._new_canvas_width, self._new_canvas_height)
+        self.settings.setValue("new_canvas_bg_color", self._new_canvas_bg_color.name())
+        self.settings.setValue("new_canvas_bg_transparent", self._new_canvas_bg_transparent)
+        logger.info("신규 캔버스 설정: %dx%d, 배경=%s", self._new_canvas_width, self._new_canvas_height,
+                    "투명" if self._new_canvas_bg_transparent else self._new_canvas_bg_color.name())
+
+    def _start_new_canvas_color_picking(self, dialog: QDialog, color_ctrl: ColorDropdownButton) -> None:
+        """'새로 만들기 설정' 안에서 색상 추출 도구를 시작한다.
+
+        다이얼로그가 모달(exec())로 열려 있는 동안에는 다른 창이 클릭을
+        받을 수 없으므로, 추출하는 동안만 다이얼로그를 잠시 숨기고 오버레이가
+        닫히면(추출 완료/취소 모두) 다시 보여준다.
+        """
+        dialog.hide()
+        overlay = ColorPickOverlay()
+        dialog._pick_overlay = overlay     # GC로 창이 사라지지 않도록 붙잡아 둔다
+
+        def on_picked(color: QColor) -> None:
+            color_ctrl.add_custom_color(color)
+            color_ctrl.set_color(color)
+
+        def on_closed() -> None:
+            dialog._pick_overlay = None
+            dialog.show()
+            dialog.activateWindow()
+
+        overlay.picked.connect(on_picked)
+        overlay.destroyed.connect(on_closed)
+        overlay.show()
+        overlay.activateWindow()
+        overlay.raise_()
+        overlay.setFocus()
 
     def _create_new_canvas(self) -> None:
-        """흰색 캔버스로 새 탭을 생성한다.
+        """설정된 배경(사용자 지정색/투명)의 새 캔버스로 새 탭을 생성한다.
 
         클립보드에 이미지가 있으면 그 이미지의 크기를 사용하고(내용은
         붙여넣지 않고 크기만 참고), 없으면 '새로 만들기 설정'에서 지정한
@@ -334,8 +394,12 @@ class MainWindow(QMainWindow):
             width, height = clipboard_image.width(), clipboard_image.height()
         else:
             width, height = self._new_canvas_width, self._new_canvas_height
-        image = QImage(width, height, QImage.Format.Format_RGB32)
-        image.fill(Qt.GlobalColor.white)
+        if self._new_canvas_bg_transparent:
+            image = QImage(width, height, QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+        else:
+            image = QImage(width, height, QImage.Format.Format_RGB32)
+            image.fill(self._new_canvas_bg_color)
         self.add_tab(image, datetime.now().strftime("%Y-%m-%d_%H%M%S"))
         logger.info("신규 캔버스 생성: %dx%d", width, height)
 
@@ -1003,7 +1067,7 @@ class MainWindow(QMainWindow):
         """옵션 메뉴(단축키 설정, 캡처/편집/저장 하위 메뉴)를 구성한다."""
         # QMenuBar.addMenu()의 반환값을 Python 쪽에서 참조하지 않으면 GC로
         # 실제 QMenu 객체가 삭제되어 메뉴가 비는 문제가 있어 self에 보관한다.
-        self._options_menu = self.menuBar().addMenu("옵션")
+        self._options_menu = self.menuBar().addMenu("☰ 옵션")
 
         self._shortcut_settings_action = QAction("캡처 단축키 설정...", self)
         self._shortcut_settings_action.triggered.connect(self._open_shortcut_settings)
@@ -1054,15 +1118,15 @@ class MainWindow(QMainWindow):
         for keys, slot in pairs:
             QShortcut(QKeySequence(keys), self).activated.connect(slot)
 
-        # 화살표 키 미세 이동은 길게 눌러도 반복 입력되지 않게 한다 - 그렇지
-        # 않으면 키를 잠깐만 누르고 있어도 되돌리기 스택(20개 제한)이 순식간에
-        # 이동 기록으로만 가득 차 그 전의 작업 내용을 되돌릴 수 없게 된다.
+        # 화살표 키는 길게 눌러 계속 이동할 수 있도록 자동 반복을 그대로 둔다.
+        # 반복 입력이 되돌리기 스택을 낱개 이동 기록으로 채우지 않도록,
+        # 연속 입력을 하나의 되돌리기 항목으로 묶는 처리는
+        # CanvasView.nudge_selected 쪽에서 담당한다.
         nudges = [
             ("Left", (-1, 0)), ("Right", (1, 0)), ("Up", (0, -1)), ("Down", (0, 1)),
         ]
         for keys, (dx, dy) in nudges:
             shortcut = QShortcut(QKeySequence(keys), self)
-            shortcut.setAutoRepeat(False)
             shortcut.activated.connect(lambda dx=dx, dy=dy: self.nudge_selected_current(dx, dy))
 
     # ---------- 탭 ---------- #
@@ -1186,7 +1250,7 @@ class MainWindow(QMainWindow):
         self._zoom_label.setVisible(has_view)
 
         has_last_region = self.last_region is not None
-        if has_last_region:
+        if self.last_region is not None:
             self._last_region_label.setText(
                 f"마지막 영역 {self.last_region.width()} x {self.last_region.height()}")
         self._last_region_label.setVisible(has_last_region)
@@ -1231,8 +1295,8 @@ class MainWindow(QMainWindow):
 
     def start_fixed_capture(self) -> None:
         """너비/높이를 입력받아 고정 크기 캡처를 시작한다 (마지막 입력값을 다음에도 기본값으로 제안)."""
-        default_w = int(self.settings.value("fixed_capture_width", DEFAULT_FIXED_CAPTURE_WIDTH))
-        default_h = int(self.settings.value("fixed_capture_height", DEFAULT_FIXED_CAPTURE_HEIGHT))
+        default_w = int(str(self.settings.value("fixed_capture_width", DEFAULT_FIXED_CAPTURE_WIDTH)))
+        default_h = int(str(self.settings.value("fixed_capture_height", DEFAULT_FIXED_CAPTURE_HEIGHT)))
         w, ok = self._get_int("고정 크기 캡처", "너비(px):", default_w, 8, 20000)
         if not ok:
             return
@@ -1297,7 +1361,7 @@ class MainWindow(QMainWindow):
         ]
         specs.append(HotkeySpec("repeat", QKeySequence("Ctrl+Shift+R"), self.repeat_capture))
 
-        app = QApplication.instance()
+        app = cast(QApplication, QApplication.instance())
         self.hotkey_filter = register_global_hotkeys(app, specs)
 
     def _open_shortcut_settings(self) -> None:
@@ -1345,8 +1409,10 @@ class MainWindow(QMainWindow):
             return
         v.commit_pending_edit()
         if v.has_selection():
-            QGuiApplication.clipboard().setImage(v.render_selection())
-            self.statusBar().showMessage("선택 영역을 클립보드에 복사했습니다.", 2000)
+            img = v.render_selection()
+            if img is not None:
+                QGuiApplication.clipboard().setImage(img)
+                self.statusBar().showMessage("선택 영역을 클립보드에 복사했습니다.", 2000)
             return
         QGuiApplication.clipboard().setImage(v.render_image())
         self.statusBar().showMessage("전체 캔버스를 클립보드에 복사했습니다.", 2000)
@@ -1466,7 +1532,9 @@ class MainWindow(QMainWindow):
             if directory:
                 os.makedirs(directory, exist_ok=True)
             quality = 100 if fmt == "JPEG" else -1
-            saved = v.render_image().save(path, fmt, quality)
+            # PySide6 QImage.save()의 타입 스텁은 format 인자를 bytes로 표기하지만
+            # 실제로는 bytes를 넘기면 런타임 오류가 나고 str만 정상 동작한다(스텁 오류).
+            saved = v.render_image().save(path, fmt, quality)  # type: ignore[call-overload]
         except OSError:
             logger.exception("저장 실패: %s", path)
             self._warn(f"저장 실패:\n{path}")

@@ -96,6 +96,9 @@ class CanvasView(QGraphicsView):
     viewChanged = Signal()      # 확대/축소 등 문서 내용과 무관한 뷰 상태 변경 (상태바 갱신용, dirty 표시 없음)
 
     MAX_UNDO = 20
+    _NUDGE_TICK_MS = 15             # 화살표 키를 계속 누르고 있을 때 일정한 속도로 이동시키는 간격
+    _NUDGE_HOLD_CONFIRM_MS = 700    # 처음 누른 뒤 이만큼 안에 다시 입력되면 '계속 누르고 있음'으로 간주
+    _NUDGE_RELEASE_TIMEOUT_MS = 120  # 계속 이동 중 이만큼 입력이 없으면 키를 뗀 것으로 간주
 
     def __init__(self, image: QImage, parent=None) -> None:
         """캔버스를 생성하고 원본 이미지를 배경 아이템으로 추가한다.
@@ -122,7 +125,7 @@ class CanvasView(QGraphicsView):
         self.setMouseTracking(True)
 
         self._scene.setSceneRect(0, 0, max(image.width(), 1), max(image.height(), 1))
-        self.base_item: QGraphicsPixmapItem = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
+        self.base_item: QGraphicsPixmapItem = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0), movable=False)
         self.draw_item: QGraphicsPixmapItem = self._add_draw_layer()
 
         # 배경이 투명한 PNG를 불러온 경우, 캔버스 빈 영역(여백 확장 등)과
@@ -200,6 +203,8 @@ class CanvasView(QGraphicsView):
         self._pending_move_snapshot: Optional[dict] = None
         self._pending_move_positions: Optional[dict[int, QPointF]] = None
 
+        self._nudge_states: dict[tuple[int, int], dict] = {}   # (dx, dy) -> 화살표 키 연속 이동 상태
+
         # '이동' 도구에서 선택된 아이템이 하나뿐일 때, PicPick처럼 그 테두리에
         # 크기 조절 핸들을 보여주고 드래그로 크기를 바꿀 수 있게 한다.
         self._item_resize_item: Optional[QGraphicsPixmapItem] = None
@@ -238,10 +243,17 @@ class CanvasView(QGraphicsView):
         painter.setPen(dash_pen)
         painter.drawRect(rect)
 
-    def _add_pixmap(self, pixmap: QPixmap, pos: QPoint) -> QGraphicsPixmapItem:
-        """씬에 이동/선택 가능한 픽스맵 아이템을 추가한다."""
+    def _add_pixmap(self, pixmap: QPixmap, pos: QPoint, movable: bool = True) -> QGraphicsPixmapItem:
+        """씬에 선택 가능한 픽스맵 아이템을 추가한다.
+
+        movable=False(배경 원본 캡처 이미지)는 캔버스 밖으로 드래그되어
+        벗어나면 안 되므로 ItemIsMovable을 주지 않는다.
+        """
         item = QGraphicsPixmapItem(pixmap)
-        item.setFlags(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable | QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable)
+        flags = QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable
+        if movable:
+            flags |= QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable
+        item.setFlags(flags)
         item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         item.setPos(pos)
         item.setZValue(len(self._scene.items()))
@@ -314,7 +326,10 @@ class CanvasView(QGraphicsView):
         for entry in sorted(snapshot["items"], key=lambda e: e["z"]):
             item = QGraphicsPixmapItem(entry["pixmap"])
             if not entry.get("is_draw"):
-                item.setFlags(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable | QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable)
+                flags = QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable
+                if not entry.get("is_base"):
+                    flags |= QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable
+                item.setFlags(flags)
             item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
             item.setPos(entry["pos"])
             item.setZValue(entry["z"])
@@ -413,22 +428,76 @@ class CanvasView(QGraphicsView):
             self._shape_meta.pop(id(it), None)
         self.changed.emit()
 
+    def _nudge_state(self, dx: int, dy: int) -> dict:
+        """(dx, dy) 방향의 화살표 키 연속 이동 상태를 반환한다(없으면 새로 만든다).
+
+        방향별로 상태를 따로 두어, 두 방향키를 동시에 눌러 대각선으로
+        이동하는 경우에도 각자 독립적으로 '계속 누르고 있음'을 추적한다.
+        """
+        state = self._nudge_states.get((dx, dy))
+        if state is not None:
+            return state
+        timer = QTimer(self)
+        timer.setInterval(self._NUDGE_TICK_MS)
+        timer.timeout.connect(lambda: self._apply_nudge(dx, dy))
+        watchdog = QTimer(self)
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(lambda: self._on_nudge_release(dx, dy))
+        state = {"phase": "idle", "timer": timer, "watchdog": watchdog}
+        self._nudge_states[(dx, dy)] = state
+        return state
+
+    def _apply_nudge(self, dx: int, dy: int) -> None:
+        """선택된 아이템들을 (dx, dy)px만큼 실제로 옮긴다(되돌리기 기록은 하지 않는다)."""
+        targets = [it for it in self._scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
+        if not targets:
+            return
+        for it in targets:
+            it.setPos(it.pos() + QPointF(dx, dy))
+        self.changed.emit()
+
+    def _on_nudge_release(self, dx: int, dy: int) -> None:
+        """일정 시간 입력이 없으면 (dx, dy) 방향키를 뗀 것으로 보고 연속 이동을 멈춘다."""
+        state = self._nudge_states.get((dx, dy))
+        if state is None:
+            return
+        state["timer"].stop()
+        state["phase"] = "idle"
+
     def nudge_selected(self, dx: int, dy: int) -> None:
         """선택된 아이템들을 화살표 키로 (dx, dy)px만큼 미세 이동한다.
 
         마우스 드래그로는 정확한 위치 맞추기가 어려운 것을 보완하기 위한
-        기능이라, 누를 때마다 되돌리기 항목을 하나씩 남긴다(길게 눌러
-        빠르게 반복 입력되면 되돌리기 스택이 금방 다른 작업 기록을
-        밀어내므로, 이 단축키는 키를 계속 누르고 있어도 반복 입력되지
-        않도록 자동 반복을 꺼 두었다 - main_window._build_shortcuts 참고).
+        기능이다. PicPick과 동일하게 두 단계로 동작한다:
+        1) 짧게 한 번 누르면(탭) 그 자체로 하나의 되돌리기 항목이 되는
+           1px 이동을 한다.
+        2) 계속 눌러 OS 키 반복이 시작되면(_NUDGE_HOLD_CONFIRM_MS 이내에
+           다음 입력이 이어지면) 그때부터는 되돌리기 항목 하나를 새로
+           열어두고, 실제 이동은 OS의 (불규칙할 수 있는) 반복 속도가
+           아니라 내부 타이머(_NUDGE_TICK_MS)로 일정한 속도로 계속한다.
+           키를 떼서 입력이 _NUDGE_RELEASE_TIMEOUT_MS 이상 끊기면 이동을
+           멈춘다. 즉, 20px을 눌러 이동했다면 되돌리기는 '탭 1px' +
+           '계속 이동 19px' 두 항목으로 남아, 한 번의 되돌리기로 19px만큼
+           되돌아간다.
         """
         targets = [it for it in self._scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
         if not targets:
             return
-        self._push_undo()
-        for it in targets:
-            it.setPos(it.pos() + QPointF(dx, dy))
-        self.changed.emit()
+        state = self._nudge_state(dx, dy)
+        if state["phase"] == "idle":
+            self._push_undo()
+            self._apply_nudge(dx, dy)
+            state["phase"] = "pending"
+            state["watchdog"].setInterval(self._NUDGE_HOLD_CONFIRM_MS)
+        elif state["phase"] == "pending":
+            self._push_undo()
+            self._apply_nudge(dx, dy)
+            state["phase"] = "continuous"
+            state["timer"].start()
+            state["watchdog"].setInterval(self._NUDGE_RELEASE_TIMEOUT_MS)
+        # "continuous": 내부 타이머가 이미 이동을 담당하므로 여기서는 움직이지 않고
+        # 아래에서 워치독만 갱신해 '아직 누르고 있음'을 알린다.
+        state["watchdog"].start()
 
     def canvas_rect(self) -> QRectF:
         """현재 캔버스(씬) 사각형을 반환한다(여백 조절 드래그 중이면 미리보기 크기)."""
@@ -511,7 +580,7 @@ class CanvasView(QGraphicsView):
         self._text_meta = {}
         self._shape_meta = {}
         self._scene.setSceneRect(0, 0, max(image.width(), 1), max(image.height(), 1))
-        self.base_item = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0))
+        self.base_item = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0), movable=False)
         self.draw_item = self._add_draw_layer()
         self._transparent_background = self._has_transparency(image)
         self.changed.emit()
@@ -1026,9 +1095,12 @@ class CanvasView(QGraphicsView):
     def cut_selection(self, fill_color: Optional[QColor] = None) -> Optional[QImage]:
         """선택 영역을 잘라낸다.
 
-        선택 영역의 픽셀을 렌더링해 반환하고, 원본 캡처 이미지(base_item)에서
-        선택 영역과 겹치는 부분을 fill_color로 채운다. 다른 붙여넣은 이미지에는
-        영향을 주지 않는다.
+        선택 영역의 픽셀을 렌더링해 반환하고, 선택 영역과 겹치는 모든 픽스맵
+        아이템(원본 캡처 이미지, 그리기 레이어, 붙여넣은 이미지, 텍스트/도형
+        상자)에서 겹치는 부분을 fill_color로 채운다. 아이템을 삭제하지는
+        않고 겹친 부분만 지우므로, 붙여넣은 이미지 위에서 잘라내도(선택
+        영역이 base_item이 아닌 다른 아이템 위에 있어도) 화면에서 실제로
+        사라진다.
 
         Args:
             fill_color: 잘라낸 자리를 채울 색. None이면 배경이 투명인
@@ -1044,11 +1116,18 @@ class CanvasView(QGraphicsView):
             fill_color = QColor(Qt.GlobalColor.transparent if self._transparent_background
                                  else Qt.GlobalColor.white)
 
-        base_rect = QRectF(self.base_item.pos(), QSizeF(self.base_item.pixmap().size()))
-        fill_rect = self._select_rect.intersected(base_rect).translated(-self.base_item.pos())
-        if not fill_rect.isEmpty():
-            self._push_undo()
-            pm = QPixmap(self.base_item.pixmap())
+        cleared = False
+        for item in self._scene.items():
+            if not isinstance(item, QGraphicsPixmapItem):
+                continue
+            item_rect = self._item_pixmap_rect(item)
+            fill_rect = self._select_rect.intersected(item_rect).translated(-item.pos())
+            if fill_rect.isEmpty():
+                continue
+            if not cleared:
+                self._push_undo()
+                cleared = True
+            pm = QPixmap(item.pixmap())
             painter = QPainter(pm)
             # 기본 SourceOver 블렌딩에서는 완전 투명한 색으로 fillRect해도
             # 알파가 0이라 기존 픽셀이 그대로 남는다. Source 모드로 덮어써야
@@ -1056,10 +1135,11 @@ class CanvasView(QGraphicsView):
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
             painter.fillRect(fill_rect, fill_color)
             painter.end()
-            self.base_item.setPixmap(pm)
+            item.setPixmap(pm)
 
         self.clear_selection()
-        self.changed.emit()
+        if cleared:
+            self.changed.emit()
         return img
 
     # ---------- 핸들 공통 ---------- #
@@ -1119,6 +1199,15 @@ class CanvasView(QGraphicsView):
             return None
         selected = [it for it in self._scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
         return selected[0] if len(selected) == 1 else None
+
+    def _movable_item_at(self, view_pos: QPoint) -> Optional[QGraphicsPixmapItem]:
+        """view_pos 아래에 이동 가능한(붙여넣기/텍스트/도형) 아이템이 있으면 반환한다."""
+        item = self.itemAt(view_pos)
+        if isinstance(item, QGraphicsPixmapItem) and bool(
+            item.flags() & QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable
+        ):
+            return item
+        return None
 
     @staticmethod
     def _item_pixmap_rect(item: QGraphicsPixmapItem) -> QRectF:
@@ -2068,7 +2157,14 @@ class CanvasView(QGraphicsView):
                 resize_item = self._resizable_selected_item()
                 if resize_item is not None:
                     h = self._item_resize_handle_at(resize_item, pos)
-            self.viewport().setCursor(CURSORS[h] if h is not None else Qt.CursorShape.ArrowCursor)
+            if h is not None:
+                self.viewport().setCursor(CURSORS[h])
+            elif self.tool == "move" and self._movable_item_at(pos) is not None:
+                # 붙여넣은/텍스트/도형 아이템 내부: 드래그로 이동 가능함을 사방
+                # 화살표 커서로 미리 알려준다.
+                self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
         if self._item_resize_item is not None:
             self._item_resize_move(pos)
@@ -2101,6 +2197,13 @@ class CanvasView(QGraphicsView):
             return
 
         super().mouseMoveEvent(event)
+        if self.tool == "move" and (event.buttons() & Qt.MouseButton.LeftButton):
+            # 선택 테두리의 점선(marching ants)은 실제 QGraphicsItem이 아니라
+            # drawForeground에서 매 프레임 새 위치에 직접 그리는 것이라, Qt의
+            # 최소 갱신(dirty region) 추적이 아이템 이동분만 지우고 이전 프레임의
+            # 점선 잔상은 못 지운다. 아이템을 드래그하는 동안은 뷰포트 전체를
+            # 다시 그려 잔상이 남지 않게 한다.
+            self.viewport().update()
 
     def _select_move(self, view_pos: QPoint) -> None:
         """선택 도구: 이동/조절 드래그 또는 일반 드래그, 커서 갱신을 처리한다."""
