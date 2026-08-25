@@ -674,7 +674,8 @@ class MainWindow(QMainWindow):
 
         효과/회전/크기 조절은 하위 메뉴를 나중에 하나씩 채울 자리라 지금은 빈
         메뉴만 달아 화살표만 보이게 해둔다. 색상 추출은 팔레트의 기존 색상
-        추출 도구(그리기 색 추출)로 바로 연결되는 바로가기다.
+        추출 도구(그리기 색 추출)로 바로 연결되는 바로가기다. 왼쪽 구분선
+        바깥에는 '모든 탭 닫기' 아이콘 버튼을 함께 둔다.
         """
         self._effect_menu = QMenu(self)
         self._rotate_menu = QMenu(self)
@@ -695,6 +696,17 @@ class MainWindow(QMainWindow):
         self._pick_btn.clicked.connect(self._start_color_picking)
         pick_btn = self._pick_btn
 
+        # '모든 탭 닫기'는 도구가 아니라 즉시 실행되는 동작이라 2x2 그리드에
+        # 넣지 않고, 그룹 왼쪽 구분선 바깥에 아이콘만 따로 둔다(글자를 넣으면
+        # 소형 버튼들과 같은 종류로 보여 실수로 누를 위험이 있다).
+        self._close_all_btn = QToolButton()
+        self._close_all_btn.setIcon(QIcon(str(get_resource_path("img/allclose.png"))))
+        self._close_all_btn.setIconSize(QSize(MINI_TOOL_ICON_PX, MINI_TOOL_ICON_PX))
+        self._close_all_btn.setToolTip("모든 탭 닫기")
+        self._close_all_btn.setStyleSheet(
+            "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }")
+        self._close_all_btn.clicked.connect(self._close_all_tabs)
+
         # 네 버튼 너비를 통일해 화살표(v)가 텍스트 길이와 무관하게 항상
         # 같은 위치(오른쪽 끝)에 오도록 한다. 폭을 맞추지 않으면 짧은 글자의
         # 버튼(효과/회전)은 화살표가 글자 바로 옆에 붙어버린다.
@@ -703,19 +715,25 @@ class MainWindow(QMainWindow):
         for b in buttons:
             b.setFixedWidth(width)
 
+        # '모든 탭 닫기' 버튼과 구분선까지 한 그리드에 담는다. 버튼을 별도
+        # 레이아웃에 두면 두 줄 그리드의 위쪽 줄과 높이·수직 위치가 어긋나
+        # ('효과'보다 위로 8px 정도 뜬다), 같은 행(row 0)에 넣어야 '효과'와
+        # 정확히 같은 높이에 놓인다. 구분선은 두 줄 전체 높이로 span 한다.
         grid = QGridLayout()
-        grid.setSpacing(4)
-        grid.addWidget(effect_btn, 0, 0)
-        grid.addWidget(rotate_btn, 0, 1)
-        grid.addWidget(resize_btn, 1, 0)
-        grid.addWidget(pick_btn, 1, 1)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(self._close_all_btn, 0, 0)
+        grid.addWidget(self._make_mini_group_divider(), 0, 1, 2, 1)
+        grid.addWidget(effect_btn, 0, 2)
+        grid.addWidget(rotate_btn, 0, 3)
+        grid.addWidget(resize_btn, 1, 2)
+        grid.addWidget(pick_btn, 1, 3)
+        grid.addWidget(self._make_mini_group_divider(), 0, 4, 2, 1)
 
         layout = QHBoxLayout()
         layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(6)
-        layout.addWidget(self._make_mini_group_divider())
         layout.addLayout(grid)
-        layout.addWidget(self._make_mini_group_divider())
 
         container = QWidget()
         container.setLayout(layout)
@@ -1087,6 +1105,10 @@ class MainWindow(QMainWindow):
             return a
 
         self._capture_menu = self._options_menu.addMenu("캡처")
+        # 라벨의 단축키 표기는 설정에서 바뀔 수 있으므로 하드코딩하지 않고
+        # _sync_region_capture_label()로 현재 설정값을 반영한다.
+        self._region_capture_action = add(self._capture_menu, "", self.start_capture)
+        self._sync_region_capture_label()
         add(self._capture_menu, "고정 크기 캡처...", self.start_fixed_capture)
         add(self._capture_menu, "마지막 영역 반복 (Ctrl+Shift+R)", self.repeat_capture)
 
@@ -1202,11 +1224,52 @@ class MainWindow(QMainWindow):
             w.deleteLater()
         self._update_status()
 
-    def _confirm_close_dirty_tab(self, index: int, view: CanvasView) -> bool:
-        """저장되지 않은 탭을 닫기 전에 저장/저장 안 함/취소를 묻는다.
+    def _close_all_tabs(self) -> None:
+        """열려 있는 모든 탭을 앞에서부터 차례로 닫는다.
+
+        미저장 탭을 만나면 그 탭으로 전환해 내용을 보여준 뒤 저장 여부를
+        묻는다. 'All Save'/'All No'를 고르면 남은 미저장 탭에는 더 묻지 않고
+        같은 선택을 적용하고, 'Cancel'을 고르면 그 탭부터는 그대로 남긴다.
+        All Save 중 저장이 취소·실패하면 데이터가 조용히 사라지지 않도록
+        그 탭부터 작업을 중단한다.
+        """
+        apply_to_all: Optional[str] = None
+        while self.tabs.count() > 0:
+            view = self.tabs.widget(0)
+            if not isinstance(view, CanvasView):
+                self.tabs.removeTab(0)
+                continue
+            view.commit_pending_edit()
+            if view.is_dirty:
+                choice = apply_to_all
+                if choice is None:
+                    # 어떤 탭에 대한 질문인지 눈으로 확인할 수 있게 먼저 보여준다.
+                    self.tabs.setCurrentIndex(0)
+                    choice = self._ask_close_all_dirty_tab(0)
+                    if choice == "cancel":
+                        break
+                    if choice in ("save_all", "discard_all"):
+                        apply_to_all = choice
+                if choice in ("save", "save_all"):
+                    self.save_current(view)
+                    if view.is_dirty:
+                        logger.info("모든 탭 닫기 중단: 저장 취소·실패 (%s)", self.tabs.tabText(0))
+                        break
+            self.tabs.removeTab(0)
+            view.deleteLater()
+        self._update_status()
+
+    def _make_dirty_close_box(self, index: int) -> QMessageBox:
+        """저장되지 않은 탭을 닫기 전 확인 팝업(Save/Don't Save/Cancel)을 만든다.
+
+        '모든 탭 닫기'용 팝업은 여기에 버튼만 더 붙여 쓰므로, 두 팝업의
+        공통 부분만 만들어 돌려준다(exec()는 호출한 쪽에서 한다).
+
+        Args:
+            index: 확인 대상 탭 인덱스.
 
         Returns:
-            탭을 닫아도 되면 True, 취소하면 False.
+            아직 실행하지 않은 QMessageBox.
         """
         name = self.tabs.tabText(index)
         box = QMessageBox(
@@ -1220,6 +1283,15 @@ class MainWindow(QMainWindow):
         strip_minmax_buttons(box)
         discard_btn = box.button(QMessageBox.StandardButton.Discard)
         QShortcut(QKeySequence(Qt.Key.Key_N), box).activated.connect(discard_btn.click)
+        return box
+
+    def _confirm_close_dirty_tab(self, index: int, view: CanvasView) -> bool:
+        """저장되지 않은 탭을 닫기 전에 저장/저장 안 함/취소를 묻는다.
+
+        Returns:
+            탭을 닫아도 되면 True, 취소하면 False.
+        """
+        box = self._make_dirty_close_box(index)
         result = box.exec()
 
         if result == QMessageBox.StandardButton.Cancel:
@@ -1228,6 +1300,40 @@ class MainWindow(QMainWindow):
             return True
         self.save_current(view)
         return not view.is_dirty
+
+    def _ask_close_all_dirty_tab(self, index: int) -> str:
+        """'모든 탭 닫기' 중 미저장 탭을 만났을 때 처리 방법을 묻는다.
+
+        기본 팝업에 'All Save'(남은 전부 저장)와 'All No'(남은 전부 저장
+        안 함) 버튼을 더한다. 제목줄 X로 닫는 것은 Cancel과 같이 본다.
+
+        Args:
+            index: 확인 대상 탭 인덱스.
+
+        Returns:
+            "save" / "discard" / "save_all" / "discard_all" / "cancel".
+        """
+        box = self._make_dirty_close_box(index)
+        all_save_btn = box.addButton("All Save", QMessageBox.ButtonRole.ActionRole)
+        all_no_btn = box.addButton("All No (O)", QMessageBox.ButtonRole.ActionRole)
+        QShortcut(QKeySequence(Qt.Key.Key_O), box).activated.connect(all_no_btn.click)
+        box.exec()
+
+        # 사용자 정의 버튼이 섞이면 exec()의 반환값이 표준 버튼 값이 아니므로
+        # 어떤 버튼이 눌렸는지는 clickedButton()으로 판별해야 한다.
+        clicked = box.clickedButton()
+        if clicked is None:
+            return "cancel"
+        if clicked is all_save_btn:
+            return "save_all"
+        if clicked is all_no_btn:
+            return "discard_all"
+        standard = box.standardButton(clicked)
+        if standard == QMessageBox.StandardButton.Save:
+            return "save"
+        if standard == QMessageBox.StandardButton.Discard:
+            return "discard"
+        return "cancel"
 
     def _on_tab_changed(self, *_args) -> None:
         """탭을 벗어나기 전 편집 중인 텍스트/자유곡선을 반영하고, 새 탭에 도구/옵션을 반영한다."""
@@ -1364,12 +1470,23 @@ class MainWindow(QMainWindow):
         app = cast(QApplication, QApplication.instance())
         self.hotkey_filter = register_global_hotkeys(app, specs)
 
+    def _sync_region_capture_label(self) -> None:
+        """'영역 지정 캡처' 메뉴 라벨에 현재 설정된 전역 단축키를 함께 표시한다.
+
+        단축키를 "없음"으로 둔 경우에는 괄호 없이 이름만 표시한다.
+        """
+        action = next(a for a in CAPTURE_ACTIONS if a.action_id == "region")
+        seq = load_shortcut(self.settings, action)
+        text = seq.toString(QKeySequence.SequenceFormat.NativeText)
+        self._region_capture_action.setText(f"{action.label} ({text})" if text else action.label)
+
     def _open_shortcut_settings(self) -> None:
         """캡처 단축키 설정 다이얼로그를 열고, 저장되면 전역 단축키를 다시 등록한다."""
         dialog = ShortcutSettingsDialog(self.settings, self)
         if dialog.exec() == ShortcutSettingsDialog.DialogCode.Accepted:
             unregister_global_hotkeys(self.hotkey_filter)
             self._register_hotkeys()
+            self._sync_region_capture_label()
             self.statusBar().showMessage("캡처 단축키를 저장했습니다.", 3000)
 
     def _open_log_folder(self) -> None:
