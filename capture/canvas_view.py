@@ -376,13 +376,14 @@ class CanvasView(QGraphicsView):
         return True
 
     def paste_image(self, image: Optional[QImage] = None) -> bool:
-        """클립보드(또는 전달된) 이미지를 캔버스 중앙에 붙여넣는다.
+        """클립보드(또는 전달된) 이미지를 지금 화면에 보이는 캔버스 영역 중앙에 붙여넣는다.
 
-        현재 보이는 뷰포트(스크롤/줌 상태)가 아니라 캔버스(씬) 자체의
-        중앙을 기준으로 한다. 뷰포트 기준으로 하면 캔버스가 뷰포트보다 큰
-        경우(막 만든 탭이 아직 화면에 다 안 보이는 경우 등) 뷰포트 중앙과
-        캔버스 중앙이 달라져, 캔버스 크기와 똑같은 이미지를 붙여도 구석이
-        어긋나 여백이 생기는 문제가 있었다.
+        캔버스를 크게 늘려 스크롤한 상태에서 캔버스 중앙에 붙여넣으면 화면
+        밖에 놓여 사용자가 찾지 못하므로, 보이는 영역(뷰포트 ∩ 캔버스)을
+        기준으로 한다. 다만 붙여넣는 이미지가 캔버스 안에 들어가는 크기면
+        캔버스 경계를 넘지 않도록 위치를 당긴다. 이 보정 덕분에 캔버스와
+        크기가 똑같은 이미지는 스크롤/줌 상태와 무관하게 항상 딱 맞게
+        (0, 0) 기준으로 붙는다.
 
         Args:
             image: 붙여넣을 이미지. None이면 클립보드 이미지를 사용한다.
@@ -395,8 +396,18 @@ class CanvasView(QGraphicsView):
         if image is None or image.isNull():
             return False
         self._push_undo()
-        center = self._scene.sceneRect().center()
-        pos = QPoint(int(center.x() - image.width() / 2), int(center.y() - image.height() / 2))
+        scene_rect = self._scene.sceneRect()
+        visible = self.mapToScene(self.viewport().rect()).boundingRect().intersected(scene_rect)
+        if visible.isEmpty():
+            visible = scene_rect
+        center = visible.center()
+        x = center.x() - image.width() / 2
+        y = center.y() - image.height() / 2
+        if image.width() <= scene_rect.width():
+            x = min(max(x, scene_rect.left()), scene_rect.right() - image.width())
+        if image.height() <= scene_rect.height():
+            y = min(max(y, scene_rect.top()), scene_rect.bottom() - image.height())
+        pos = QPoint(int(round(x)), int(round(y)))
         item = self._add_pixmap(QPixmap.fromImage(image), pos)
         self._scene.clearSelection()
         item.setSelected(True)
@@ -2061,12 +2072,47 @@ class CanvasView(QGraphicsView):
         self.draw_item.setPixmap(pm)
 
     # ---------- 채우기 ---------- #
+    def _item_cover_mask(self, item: QGraphicsPixmapItem, w: int, h: int,
+                         scene_rect: QRectF) -> np.ndarray:
+        """아이템이 화면을 실제로 덮는 픽셀(알파>0)을 캔버스 크기 bool 마스크로 반환한다.
+
+        Args:
+            item: 대상 픽스맵 아이템.
+            w: 캔버스(렌더 이미지) 너비.
+            h: 캔버스(렌더 이미지) 높이.
+            scene_rect: 현재 캔버스 영역. 마스크 좌표의 원점 기준이다.
+
+        Returns:
+            (h, w) 모양의 bool 배열. 아이템이 캔버스 밖에 있으면 전부 False.
+        """
+        img = item.pixmap().toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        iw, ih = img.width(), img.height()
+        mask = np.zeros((h, w), dtype=bool)
+        if iw == 0 or ih == 0:
+            return mask
+        stride = img.bytesPerLine()
+        buf = np.frombuffer(img.constBits(), dtype=np.uint8, count=stride * ih)
+        alpha = buf.reshape(ih, stride)[:, :iw * 4].reshape(ih, iw, 4)[:, :, 3] > 0
+        ox = int(round(item.pos().x() - scene_rect.left()))
+        oy = int(round(item.pos().y() - scene_rect.top()))
+        x0, y0 = max(ox, 0), max(oy, 0)
+        x1, y1 = min(ox + iw, w), min(oy + ih, h)
+        if x0 >= x1 or y0 >= y1:
+            return mask
+        mask[y0:y1, x0:x1] = alpha[y0 - oy:y1 - oy, x0 - ox:x1 - ox]
+        return mask
+
     def fill_at(self, view_pos: QPoint) -> bool:
         """클릭 지점과 연결된, 허용 범위 내의 인접 색상 영역을 draw_color로 채운다.
 
-        화면에 실제로 보이는 색(원본 이미지 + 그리기 레이어 + 다른 이미지가
-        합쳐진 결과)을 기준으로 영역을 찾고, 채운 결과는 그리기 레이어에만
-        그린다 (원본/다른 이미지는 건드리지 않음).
+        영역 판정은 화면에 실제로 보이는 색(원본 이미지 + 그리기 레이어 +
+        붙여넣은 이미지가 합쳐진 결과)을 기준으로 하되, 채우는 범위와 대상은
+        '클릭 지점에서 보이는 최상단 아이템' 하나로 한정한다. 그 아이템이
+        가려지지 않은 부분만 채우고, 결과도 그 아이템의 픽스맵에 직접 그린다.
+
+        예전에는 결과를 항상 그리기 레이어에 그린 뒤 그 레이어를 최상단으로
+        올렸는데, 허용 범위 안의 색이 캔버스 배경까지 이어지는 경우(밝은 UI
+        스크린샷은 대개 그렇다) 붙여넣은 다른 이미지들까지 통째로 덮여 사라졌다.
 
         Args:
             view_pos: 뷰(위젯) 좌표의 클릭 지점.
@@ -2100,6 +2146,30 @@ class CanvasView(QGraphicsView):
         mask = np.all(np.abs(arr - target) <= threshold, axis=2)
         labeled, _ = ndimage.label(mask)
         region = labeled == labeled[y, x]
+
+        # 클릭 지점에서 보이는 최상단 아이템을 찾고, 그 아이템이 위 아이템에
+        # 가려지지 않은 부분으로 채울 영역을 제한한다. 아무 아이템도 없는 빈
+        # 캔버스 배경을 클릭했으면 그리기 레이어에 그리되, 아이템이 덮은 곳은
+        # 건드리지 않는다.
+        items = sorted((it for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)),
+                       key=lambda it: it.zValue(), reverse=True)
+        masks = {id(it): self._item_cover_mask(it, w, h, scene_rect) for it in items}
+        target_item: Optional[QGraphicsPixmapItem] = None
+        above = np.zeros((h, w), dtype=bool)
+        for it in items:
+            if masks[id(it)][y, x]:
+                target_item = it
+                break
+            above |= masks[id(it)]
+        if target_item is None:
+            target_item = self.draw_item
+            allowed = np.ones((h, w), dtype=bool)
+            for it in items:
+                if it is not self.draw_item:
+                    allowed &= ~masks[id(it)]
+        else:
+            allowed = masks[id(target_item)] & ~above
+        region &= allowed
         pixel_count = int(region.sum())
         if pixel_count == 0:
             return False
@@ -2113,14 +2183,18 @@ class CanvasView(QGraphicsView):
         fill_arr[region] = [c.blue(), c.green(), c.red(), 255]
 
         self._push_undo()
-        pm = QPixmap(self.draw_item.pixmap())
+        pm = QPixmap(target_item.pixmap())
         painter = QPainter(pm)
-        painter.drawImage(scene_rect.topLeft() - self.draw_item.pos(), fill_img)
+        # 씬 크기 이미지를 아이템 로컬 좌표로 옮겨 그린다. 아이템 픽스맵
+        # 경계에서 자동으로 잘리므로 다른 아이템으로 번지지 않는다.
+        painter.drawImage(scene_rect.topLeft() - target_item.pos(), fill_img)
         painter.end()
-        self.draw_item.setPixmap(pm)
-        self.draw_item.setZValue(len(self._scene.items()))
+        target_item.setPixmap(pm)
         self.changed.emit()
-        logger.info("채우기: (%d, %d)에서 %d픽셀, 허용범위=%d%%", x, y, pixel_count, self.fill_tolerance)
+        kind = ("배경" if target_item is self.base_item
+                else "그리기 레이어" if target_item is self.draw_item else "이미지")
+        logger.info("채우기: (%d, %d) %s 대상, %d픽셀, 허용범위=%d%%",
+                    x, y, kind, pixel_count, self.fill_tolerance)
         return True
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
