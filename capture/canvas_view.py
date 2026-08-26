@@ -2079,7 +2079,7 @@ class CanvasView(QGraphicsView):
         if not scene_rect.contains(sp):
             return False
 
-        composed = self.render_image().convertToFormat(QImage.Format.Format_RGB32)
+        composed = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
         w, h = composed.width(), composed.height()
         x = int(sp.x() - scene_rect.left())
         y = int(sp.y() - scene_rect.top())
@@ -2088,7 +2088,12 @@ class CanvasView(QGraphicsView):
 
         stride = composed.bytesPerLine()
         buf = np.frombuffer(composed.constBits(), dtype=np.uint8, count=stride * h)
-        arr = buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4)[:, :, :3].astype(np.int16)
+        arr = buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4).astype(np.int16)
+        # 완전 투명 픽셀의 RGB는 합성 과정에서 임의값(보통 0)이 되어 의미가
+        # 없으므로 0으로 정규화한 뒤, 알파를 네 번째 비교 채널로 함께 쓴다.
+        # RGB만 비교하면 알파만 다른 투명 배경과 같은 색 도형(예: 검은 아이콘
+        # + 투명 배경)이 한 영역으로 이어져 배경까지 함께 채워진다.
+        arr[arr[:, :, 3] == 0, :3] = 0
 
         target = arr[y, x]
         threshold = self.fill_tolerance / 100 * 255
