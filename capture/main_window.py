@@ -1142,14 +1142,24 @@ class MainWindow(QMainWindow):
 
         # 화살표 키는 길게 눌러 계속 이동할 수 있도록 자동 반복을 그대로 둔다.
         # 반복 입력이 되돌리기 스택을 낱개 이동 기록으로 채우지 않도록,
-        # 연속 입력을 하나의 되돌리기 항목으로 묶는 처리는
-        # CanvasView.nudge_selected 쪽에서 담당한다.
+        # 연속 입력을 하나의 되돌리기 항목으로 묶는 처리와, 사람의 연타를
+        # 자동 반복으로 오인하지 않는 판정은 CanvasView.nudge_selected가 담당한다.
         nudges = [
             ("Left", (-1, 0)), ("Right", (1, 0)), ("Up", (0, -1)), ("Down", (0, 1)),
         ]
         for keys, (dx, dy) in nudges:
             shortcut = QShortcut(QKeySequence(keys), self)
             shortcut.activated.connect(lambda dx=dx, dy=dy: self.nudge_selected_current(dx, dy))
+
+        # Ctrl+화살표: 한 번 누를 때마다 정확히 1px. 연속 이동 판정을 아예 거치지
+        # 않으므로 아무리 빨리 연타해도 가속이 붙지 않는다. 자동 반복도 끄는데,
+        # 켜두면 키를 누르고 있는 동안 1px 이동이 되돌리기 스택(MAX_UNDO=20)을
+        # 가득 채워 그 전 편집 기록이 밀려나기 때문이다.
+        for keys, (dx, dy) in nudges:
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{keys}"), self)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(
+                lambda dx=dx, dy=dy: self.nudge_selected_current(dx, dy, single_step=True))
 
     # ---------- 탭 ---------- #
     def current_view(self) -> Optional[CanvasView]:
@@ -1575,11 +1585,17 @@ class MainWindow(QMainWindow):
         if v:
             v.delete_selected()
 
-    def nudge_selected_current(self, dx: int, dy: int) -> None:
-        """현재 탭에서 선택된 아이템을 화살표 키로 (dx, dy)px만큼 미세 이동한다."""
+    def nudge_selected_current(self, dx: int, dy: int, single_step: bool = False) -> None:
+        """현재 탭에서 선택된 아이템을 화살표 키로 (dx, dy)px만큼 미세 이동한다.
+
+        Args:
+            dx: 가로 이동량(px).
+            dy: 세로 이동량(px).
+            single_step: True면 가속 없이 항상 1px만 움직인다(Ctrl+화살표).
+        """
         v = self.current_view()
         if v:
-            v.nudge_selected(dx, dy)
+            v.nudge_selected(dx, dy, single_step=single_step)
 
     def _margin(self, px: int) -> None:
         """현재 탭 캔버스의 여백을 px만큼 조정한다."""

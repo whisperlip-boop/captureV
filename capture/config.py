@@ -6,6 +6,7 @@
 핸들별 커서 모양, 강조 색상 등 모든 모듈이 공유하는 값을 모아둔다.
 """
 
+import ctypes
 import os
 import sys
 from pathlib import Path
@@ -20,6 +21,9 @@ MIN_SELECTION: int = 4
 IS_WIN: bool = sys.platform == "win32"
 TOOLBAR_ICON_PX: int = 40
 
+SPI_GETKEYBOARDDELAY: int = 0x0016     # SystemParametersInfo: 키 자동 반복 시작 지연 조회
+DEFAULT_KEY_REPEAT_DELAY_MS: int = 500  # 조회 실패 시 사용할 Windows 기본값
+
 
 def get_resource_path(relative_path: str) -> Path:
     """PyInstaller 번들 여부에 따라 리소스 파일의 절대 경로를 반환한다.
@@ -33,6 +37,32 @@ def get_resource_path(relative_path: str) -> Path:
     """
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
     return base / relative_path
+
+
+def get_key_repeat_delay_ms() -> int:
+    """OS에 설정된 '키를 누른 뒤 자동 반복이 시작되기까지의 지연'을 ms로 반환한다.
+
+    화살표 키 연타를 '꾹 누르고 있음'으로 오인하지 않으려면 이 값이 필요하다.
+    OS 자동 반복은 이 지연보다 빨리 올 수 없으므로, 두 번째 입력이 이보다
+    충분히 빨리 들어왔다면 사람이 연타한 것으로 확정할 수 있다.
+
+    Windows의 SPI_GETKEYBOARDDELAY는 0~3 범위의 단계값이며 각각 250/500/750/
+    1000ms에 대응한다(제어판 '키보드 속성'에서 사용자가 바꿀 수 있다).
+
+    Returns:
+        자동 반복 시작 지연(ms). 조회할 수 없으면 Windows 기본값인 500.
+    """
+    if not IS_WIN:
+        return DEFAULT_KEY_REPEAT_DELAY_MS
+    try:
+        step = ctypes.c_uint()
+        if not ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETKEYBOARDDELAY, 0, ctypes.byref(step), 0):
+            return DEFAULT_KEY_REPEAT_DELAY_MS
+        return 250 * (min(step.value, 3) + 1)
+    except Exception:
+        # 설정을 못 읽는다고 기능이 죽어서는 안 되므로 기본값으로 넘어간다.
+        return DEFAULT_KEY_REPEAT_DELAY_MS
 
 
 def get_settings_path() -> Path:

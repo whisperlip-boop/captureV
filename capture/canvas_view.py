@@ -4,6 +4,7 @@
 
 import logging
 import math
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -21,7 +22,8 @@ from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHE
                              DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL, DEFAULT_TEXT_COLOR,
                              DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS, HANDLE_PX, HANDLES,
                              HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION, SHARPEN_AMOUNT_SCALE,
-                             SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN)
+                             SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN,
+                             get_key_repeat_delay_ms)
 from capture.shapes import (ARROW_KINDS, DEFAULT_ROUNDED_RADIUS_RATIO, FREEHAND_KINDS,
                              arrowhead_length, clamp_radius_ratio, draw_bbox_shape, draw_bezier_kind,
                              draw_line_kind, is_line_kind, lock_square, rounded_radius,
@@ -98,8 +100,18 @@ class CanvasView(QGraphicsView):
 
     MAX_UNDO = 20
     _NUDGE_TICK_MS = 15             # 화살표 키를 계속 누르고 있을 때 일정한 속도로 이동시키는 간격
-    _NUDGE_HOLD_CONFIRM_MS = 700    # 처음 누른 뒤 이만큼 안에 다시 입력되면 '계속 누르고 있음'으로 간주
     _NUDGE_RELEASE_TIMEOUT_MS = 120  # 계속 이동 중 이만큼 입력이 없으면 키를 뗀 것으로 간주
+    # '계속 누르고 있음' 판정 구간. 두 번째 입력이 OS 자동 반복 지연 근처에 들어올
+    # 때만 홀드로 본다. 예전에는 "0~700ms 안에 두 번째 입력이 오면 홀드"였는데,
+    # 사람의 연타 간격(150~400ms)이 통째로 그 안에 들어가 연타가 연속 이동으로
+    # 오인됐다. OS 자동 반복은 설정된 지연보다 빨리 올 수 없으므로, 그보다 충분히
+    # 빠른 입력은 사람의 연타로 확정할 수 있다.
+    # 자동 반복의 첫 이벤트는 OS 지연보다 '빨리' 올 수 없다(늦게 올 수는 있다).
+    # 그래서 이 여유는 클 필요가 없고, 오히려 크면 느린 연타(400ms 등)가 홀드로
+    # 오인된다. 이벤트 전달 지터를 흡수할 만큼만 둔다.
+    _NUDGE_HOLD_EARLY_MARGIN_MS = 50    # (OS 지연 - 이 값)보다 빠르면 연타로 본다
+    _NUDGE_HOLD_LATE_MARGIN_MS = 250    # (OS 지연 + 이 값)까지 기다렸다 홀드 판정을 접는다
+    _NUDGE_HOLD_MIN_MS = 120            # OS 지연을 최소로 설정해도 이보다 짧게는 보지 않는다
 
     def __init__(self, image: QImage, parent=None) -> None:
         """캔버스를 생성하고 원본 이미지를 배경 아이템으로 추가한다.
@@ -461,7 +473,7 @@ class CanvasView(QGraphicsView):
         watchdog = QTimer(self)
         watchdog.setSingleShot(True)
         watchdog.timeout.connect(lambda: self._on_nudge_release(dx, dy))
-        state = {"phase": "idle", "timer": timer, "watchdog": watchdog}
+        state = {"phase": "idle", "timer": timer, "watchdog": watchdog, "last_press": 0.0}
         self._nudge_states[(dx, dy)] = state
         return state
 
@@ -482,32 +494,58 @@ class CanvasView(QGraphicsView):
         state["timer"].stop()
         state["phase"] = "idle"
 
-    def nudge_selected(self, dx: int, dy: int) -> None:
+    def nudge_selected(self, dx: int, dy: int, single_step: bool = False) -> None:
         """선택된 아이템들을 화살표 키로 (dx, dy)px만큼 미세 이동한다.
 
         마우스 드래그로는 정확한 위치 맞추기가 어려운 것을 보완하기 위한
-        기능이다. PicPick과 동일하게 두 단계로 동작한다:
+        기능이다. 두 단계로 동작한다:
         1) 짧게 한 번 누르면(탭) 그 자체로 하나의 되돌리기 항목이 되는
            1px 이동을 한다.
-        2) 계속 눌러 OS 키 반복이 시작되면(_NUDGE_HOLD_CONFIRM_MS 이내에
-           다음 입력이 이어지면) 그때부터는 되돌리기 항목 하나를 새로
-           열어두고, 실제 이동은 OS의 (불규칙할 수 있는) 반복 속도가
+        2) 계속 눌러 OS 키 반복이 시작되면 그때부터는 되돌리기 항목 하나를
+           새로 열어두고, 실제 이동은 OS의 (불규칙할 수 있는) 반복 속도가
            아니라 내부 타이머(_NUDGE_TICK_MS)로 일정한 속도로 계속한다.
            키를 떼서 입력이 _NUDGE_RELEASE_TIMEOUT_MS 이상 끊기면 이동을
            멈춘다. 즉, 20px을 눌러 이동했다면 되돌리기는 '탭 1px' +
-           '계속 이동 19px' 두 항목으로 남아, 한 번의 되돌리기로 19px만큼
-           되돌아간다.
+           '계속 이동 19px' 두 항목으로 남는다.
+
+        2)의 판정은 두 번째 입력이 OS 자동 반복 지연 근처에 들어왔는지로
+        한다. 사람이 아무리 빨리 연타해도 그 지연보다 빨리 오는 입력은 자동
+        반복일 수 없으므로, 연타는 계속 1)로 처리되어 1px씩만 움직인다.
+
+        Args:
+            dx: 가로 이동량(px).
+            dy: 세로 이동량(px).
+            single_step: True면 연속 이동 판정을 아예 거치지 않고 항상 1px만
+                움직인다(Ctrl+화살표). 가속이 절대 걸리면 안 되는 미세 조정용.
         """
         targets = [it for it in self._scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
         if not targets:
             return
+
+        if single_step:
+            # 상태 기계를 거치지 않으므로 아무리 빨리 연타해도 연속 이동으로
+            # 넘어가지 않는다. 한 번 누를 때마다 되돌리기 항목 하나 + 1px.
+            self._push_undo()
+            self._apply_nudge(dx, dy)
+            return
+
         state = self._nudge_state(dx, dy)
+        now = time.monotonic()
         if state["phase"] == "idle":
             self._push_undo()
             self._apply_nudge(dx, dy)
             state["phase"] = "pending"
-            state["watchdog"].setInterval(self._NUDGE_HOLD_CONFIRM_MS)
+            state["last_press"] = now
+            state["watchdog"].setInterval(self._hold_late_ms())
         elif state["phase"] == "pending":
+            if (now - state["last_press"]) * 1000 < self._hold_early_ms():
+                # OS 자동 반복 지연보다 빨리 왔다 = 사람이 연타한 것.
+                # 새 탭으로 취급해 되돌리기 항목을 따로 남기고 1px만 움직인다.
+                self._push_undo()
+                self._apply_nudge(dx, dy)
+                state["last_press"] = now
+                state["watchdog"].start()
+                return
             self._push_undo()
             self._apply_nudge(dx, dy)
             state["phase"] = "continuous"
@@ -516,6 +554,15 @@ class CanvasView(QGraphicsView):
         # "continuous": 내부 타이머가 이미 이동을 담당하므로 여기서는 움직이지 않고
         # 아래에서 워치독만 갱신해 '아직 누르고 있음'을 알린다.
         state["watchdog"].start()
+
+    def _hold_early_ms(self) -> int:
+        """이보다 빠른 두 번째 입력은 자동 반복일 수 없으므로 연타로 확정한다."""
+        return max(get_key_repeat_delay_ms() - self._NUDGE_HOLD_EARLY_MARGIN_MS,
+                   self._NUDGE_HOLD_MIN_MS)
+
+    def _hold_late_ms(self) -> int:
+        """이 시간까지 두 번째 입력이 없으면 홀드가 아니라고 보고 판정을 접는다."""
+        return get_key_repeat_delay_ms() + self._NUDGE_HOLD_LATE_MARGIN_MS
 
     def canvas_rect(self) -> QRectF:
         """현재 캔버스(씬) 사각형을 반환한다(여백 조절 드래그 중이면 미리보기 크기)."""
