@@ -22,8 +22,9 @@ from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHE
                              DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS, HANDLE_PX, HANDLES,
                              HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION, SHARPEN_AMOUNT_SCALE,
                              SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN)
-from capture.shapes import (ARROW_KINDS, FREEHAND_KINDS, arrowhead_length, draw_bbox_shape,
-                             draw_bezier_kind, draw_line_kind, is_line_kind, lock_square,
+from capture.shapes import (ARROW_KINDS, DEFAULT_ROUNDED_RADIUS_RATIO, FREEHAND_KINDS,
+                             arrowhead_length, clamp_radius_ratio, draw_bbox_shape, draw_bezier_kind,
+                             draw_line_kind, is_line_kind, lock_square, rounded_radius,
                              snap_line_angle)
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,12 @@ class CanvasView(QGraphicsView):
         self._item_resize_drag_ref: Optional[tuple[QPointF, QRectF]] = None
         self._item_resize_source_pixmap: Optional[QPixmap] = None
         self._item_resize_pending_snapshot: Optional[dict] = None
+
+        # '이동' 도구에서 둥근 사각형 하나만 선택했을 때 윗변에 보이는 노란
+        # 조절점을 드래그해 모서리 반지름을 바꾸는 상태.
+        self._radius_drag_item: Optional[QGraphicsPixmapItem] = None
+        self._radius_drag_start_ratio: Optional[float] = None
+        self._radius_drag_pending_snapshot: Optional[dict] = None
 
         # 선택 영역 테두리를 움직이는 점선("marching ants")으로 표시하기 위한
         # 애니메이션 phase. 선택이 없을 때는 갱신해도 다시 그릴 필요가 없으므로
@@ -1007,6 +1014,9 @@ class CanvasView(QGraphicsView):
             self._item_resize_drag_ref = None
             self._item_resize_source_pixmap = None
             self._item_resize_pending_snapshot = None
+            self._radius_drag_item = None
+            self._radius_drag_start_ratio = None
+            self._radius_drag_pending_snapshot = None
         self.viewport().update()
 
     def set_draw_options(self, subtool: str, thickness: int, color: QColor) -> None:
@@ -1296,6 +1306,127 @@ class CanvasView(QGraphicsView):
         _, original_rect = drag_ref
         if self._item_pixmap_rect(item) == original_rect:
             return
+        self._rerasterize_resized_bbox_shape(item, original_rect)
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self.MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self.changed.emit()
+
+    def _rerasterize_resized_bbox_shape(self, item: QGraphicsPixmapItem, original_rect: QRectF) -> None:
+        """크기 조절이 끝난 바운딩 박스 도형을 새 크기로 벡터 다시 그리기 한다.
+
+        드래그 중에는 픽스맵을 스케일해 보여주지만, 그대로 두면 획이 뭉개지고
+        _shape_meta의 geometry/pad가 실제 픽스맵과 어긋나 이후 반지름 조절점
+        위치·두께 변경 재래스터화가 틀어진다. 스케일된 콘텐츠 영역을 정확히
+        계산해 같은 자리에 선명하게 다시 그리고 meta도 맞춘다.
+        """
+        meta = self._shape_meta.get(id(item))
+        if meta is None or meta["kind"] != "bbox":
+            return
+        if original_rect.width() <= 0 or original_rect.height() <= 0:
+            return
+        pad: int = meta["pad"]
+        size: QSizeF = meta["geometry"]
+        new_rect = self._item_pixmap_rect(item)
+        sx = new_rect.width() / original_rect.width()
+        sy = new_rect.height() / original_rect.height()
+        # 스케일 후 콘텐츠(획 중심선 기준 바운딩 박스)의 씬 좌표 좌상단/크기
+        content_top_left = new_rect.topLeft() + QPointF(pad * sx, pad * sy)
+        new_size = QSizeF(max(size.width() * sx, 1.0), max(size.height() * sy, 1.0))
+        pen = self._shape_pen_for(meta["color"], meta["thickness"])
+        pixmap = self._render_bbox_pixmap(meta["subtool"], new_size, pad, pen,
+                                          meta.get("radius_ratio", DEFAULT_ROUNDED_RADIUS_RATIO))
+        item.setPixmap(pixmap)
+        item.setPos(content_top_left - QPointF(pad, pad))
+        meta["geometry"] = QSizeF(pixmap.width() - 2 * pad, pixmap.height() - 2 * pad)
+
+    # ---------- 둥근 사각형 반지름 조절점 ---------- #
+    def _radius_handle_item(self) -> Optional[QGraphicsPixmapItem]:
+        """반지름 조절점을 보여줄 둥근 사각형 아이템을 반환한다.
+
+        '이동' 도구에서 선택했을 때뿐 아니라, '도형' 도구로 방금 그린 직후에도
+        (그 도형이 선택 상태로 남아 있으므로) 바로 조절할 수 있게 두 도구에서
+        모두 보여준다. 여러 개가 선택되어 있으면 보여주지 않는다.
+        """
+        if self.tool not in ("move", "shape"):
+            return None
+        selected = [it for it in self._scene.selectedItems() if isinstance(it, QGraphicsPixmapItem)]
+        if len(selected) != 1:
+            return None
+        item = selected[0]
+        meta = self._shape_meta.get(id(item))
+        if meta is None or meta["kind"] != "bbox" or meta["subtool"] != "rounded_rect":
+            return None
+        return item
+
+    def _bbox_content_rect(self, item: QGraphicsPixmapItem) -> QRectF:
+        """바운딩 박스 도형 아이템의 콘텐츠(획 중심선) 사각형을 씬 좌표로 반환한다."""
+        meta = self._shape_meta[id(item)]
+        return QRectF(item.pos() + QPointF(meta["pad"], meta["pad"]), meta["geometry"])
+
+    def _radius_handle_rect(self, item: QGraphicsPixmapItem) -> QRectF:
+        """둥근 사각형 윗변 위, 좌상단에서 반지름만큼 오른쪽에 놓이는 조절점 사각형.
+
+        반지름이 0이면 좌상단 크기 조절 핸들과, 최대이면 상단 중앙 핸들과 겹쳐
+        서로 잡을 수 없게 되므로, 표시 위치는 두 핸들에서 핸들 한 칸씩 띄운
+        범위로 제한한다. 실제 반지름 값은 드래그한 마우스 x로 따로 계산한다.
+        """
+        meta = self._shape_meta[id(item)]
+        content = self._bbox_content_rect(item)
+        size = self._handle_size_scene()
+        r = rounded_radius(content, meta.get("radius_ratio", DEFAULT_ROUNDED_RADIUS_RATIO))
+        lo, hi = size, content.width() / 2 - size
+        cx = content.left() + (min(max(r, lo), hi) if hi >= lo else content.width() / 4)
+        return QRectF(cx - size / 2, content.top() - size / 2, size, size)
+
+    def _radius_handle_at(self, view_pos: QPoint) -> Optional[QGraphicsPixmapItem]:
+        """view_pos가 반지름 조절점 위이면 해당 둥근 사각형 아이템을 반환한다."""
+        item = self._radius_handle_item()
+        if item is None:
+            return None
+        if self._radius_handle_rect(item).contains(self.mapToScene(view_pos)):
+            return item
+        return None
+
+    def _radius_drag_press(self, item: QGraphicsPixmapItem) -> None:
+        """반지름 조절 드래그를 시작한다 (되돌리기 기록은 실제로 값이 바뀐 뒤 release에서)."""
+        meta = self._shape_meta[id(item)]
+        self._radius_drag_item = item
+        self._radius_drag_start_ratio = meta.get("radius_ratio", DEFAULT_ROUNDED_RADIUS_RATIO)
+        self._radius_drag_pending_snapshot = self._snapshot()
+
+    def _radius_drag_move(self, view_pos: QPoint) -> None:
+        """마우스 x 위치를 좌상단 기준 반지름으로 환산해 둥근 사각형을 다시 그린다."""
+        item = self._radius_drag_item
+        if item is None or id(item) not in self._shape_meta:
+            return
+        meta = self._shape_meta[id(item)]
+        content = self._bbox_content_rect(item)
+        short_side = min(content.width(), content.height())
+        if short_side <= 0:
+            return
+        sp = self.mapToScene(view_pos)
+        ratio = clamp_radius_ratio((sp.x() - content.left()) / short_side)
+        if ratio == meta.get("radius_ratio", DEFAULT_ROUNDED_RADIUS_RATIO):
+            return
+        meta["radius_ratio"] = ratio
+        pen = self._shape_pen_for(meta["color"], meta["thickness"])
+        item.setPixmap(self._render_bbox_pixmap(meta["subtool"], meta["geometry"], meta["pad"], pen, ratio))
+        self.viewport().update()
+
+    def _radius_drag_release(self) -> None:
+        """반지름 조절 드래그를 마치고, 값이 실제로 바뀌었으면 되돌리기에 기록한다."""
+        item = self._radius_drag_item
+        start_ratio = self._radius_drag_start_ratio
+        snapshot = self._radius_drag_pending_snapshot
+        self._radius_drag_item = None
+        self._radius_drag_start_ratio = None
+        self._radius_drag_pending_snapshot = None
+        if item is None or snapshot is None or id(item) not in self._shape_meta:
+            return
+        if self._shape_meta[id(item)].get("radius_ratio", DEFAULT_ROUNDED_RADIUS_RATIO) == start_ratio:
+            return
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self.MAX_UNDO:
             self._undo_stack.pop(0)
@@ -1372,6 +1503,15 @@ class CanvasView(QGraphicsView):
             painter.setBrush(QBrush(Qt.GlobalColor.white))
             for hr in self._item_resize_handle_rects(resize_item).values():
                 painter.drawRect(hr)
+            painter.restore()
+
+        radius_item = self._radius_handle_item()
+        if radius_item is not None:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor(0x33, 0x33, 0x33), 1.0 / scale))
+            painter.setBrush(QBrush(QColor(0xFF, 0xD7, 0x00)))
+            painter.drawEllipse(self._radius_handle_rect(radius_item))
             painter.restore()
 
         if self.tool == "select" and self.has_selection():
@@ -1465,6 +1605,13 @@ class CanvasView(QGraphicsView):
                 self._drag_handle = h
                 self._drag_start_view = event.position()
                 self._drag_start_rect = QRectF(self._scene.sceneRect())
+                event.accept()
+                return
+            # 둥근 사각형 반지름 조절점은 '이동'/'도형' 두 도구에서 모두 잡을 수
+            # 있어야 하므로, 도구별 분기보다 먼저 확인한다.
+            radius_item = self._radius_handle_at(event.position().toPoint())
+            if radius_item is not None:
+                self._radius_drag_press(radius_item)
                 event.accept()
                 return
             if self.tool == "select":
@@ -1749,6 +1896,7 @@ class CanvasView(QGraphicsView):
         참고), 이후 4개 제어점을 드래그로 조정하는 편집 모드로 들어간다.
         """
         sp = self.mapToScene(view_pos)
+        self._scene.clearSelection()
         self._shape_state = "dragging"
         self._shape_origin = sp
         self._shape_rect = QRectF(sp, QSizeF(0, 0))
@@ -1860,32 +2008,55 @@ class CanvasView(QGraphicsView):
     def _shape_pad(self) -> int:
         return self._shape_pad_for(self.draw_thickness)
 
-    def _shape_pen(self) -> QPen:
-        """도형/선 그리기에 쓸 pen (현재 두께/색, 둥근 이음새)을 만든다."""
-        pen = QPen(QColor(self.draw_color))
-        pen.setWidthF(max(self.draw_thickness, 1))
+    @staticmethod
+    def _shape_pen_for(color: QColor, thickness: int) -> QPen:
+        """도형/선 그리기에 쓸 pen (지정 두께/색, 둥근 이음새)을 만든다."""
+        pen = QPen(QColor(color))
+        pen.setWidthF(max(thickness, 1))
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         return pen
+
+    def _shape_pen(self) -> QPen:
+        """현재 도구 설정(두께/색)으로 도형/선 pen을 만든다."""
+        return self._shape_pen_for(QColor(self.draw_color), self.draw_thickness)
+
+    @staticmethod
+    def _render_bbox_pixmap(subtool: str, size: QSizeF, pad: int, pen: QPen, radius_ratio: float) -> QPixmap:
+        """바운딩 박스 도형을 pad 여백을 둔 투명 픽스맵에 래스터화한다.
+
+        최초 확정, 두께/색 변경, 크기 조절 후 재래스터화, 반지름 조절이 모두
+        같은 결과를 내도록 그리기 경로를 한 곳에 모은다.
+        """
+        w, h = max(int(round(size.width())), 1), max(int(round(size.height())), 1)
+        pixmap = QPixmap(w + 2 * pad, h + 2 * pad)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        draw_bbox_shape(painter, subtool, QRectF(pad, pad, w, h), radius_ratio)
+        painter.end()
+        return pixmap
 
     def _commit_bbox_shape(self, rect: QRectF) -> None:
         """드래그로 정의된 바운딩 박스 도형을 래스터화해 새(이동 가능한) 아이템으로 추가한다."""
         pad = self._shape_pad()
         w, h = max(int(round(rect.width())), 1), max(int(round(rect.height())), 1)
-        pixmap = QPixmap(w + 2 * pad, h + 2 * pad)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(self._shape_pen())
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        draw_bbox_shape(painter, self.shape_subtool, QRectF(pad, pad, w, h))
-        painter.end()
+        pixmap = self._render_bbox_pixmap(self.shape_subtool, QSizeF(w, h), pad, self._shape_pen(),
+                                          DEFAULT_ROUNDED_RADIUS_RATIO)
         self._push_undo()
         item = self._add_pixmap(pixmap, (rect.topLeft() - QPointF(pad, pad)).toPoint())
         self._shape_meta[id(item)] = {
             "kind": "bbox", "subtool": self.shape_subtool, "color": QColor(self.draw_color),
             "thickness": self.draw_thickness, "pad": pad, "geometry": QSizeF(w, h),
+            "radius_ratio": DEFAULT_ROUNDED_RADIUS_RATIO,
         }
+        if self.shape_subtool == "rounded_rect":
+            # 그린 직후 반지름 조절점이 바로 보이도록 선택 상태로 둔다.
+            self._scene.clearSelection()
+            item.setSelected(True)
+            self.viewport().update()
 
     @staticmethod
     def _arrowhead_margin_for(subtool: str, thickness: int) -> int:
@@ -1940,17 +2111,9 @@ class CanvasView(QGraphicsView):
             content_top_left = item.pos() + QPointF(meta["pad"], meta["pad"])
 
             if kind == "bbox":
-                size: QSizeF = meta["geometry"]
                 pad = self._shape_pad()
-                w, h = max(int(round(size.width())), 1), max(int(round(size.height())), 1)
-                pixmap = QPixmap(w + 2 * pad, h + 2 * pad)
-                pixmap.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(pixmap)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                painter.setPen(pen)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                draw_bbox_shape(painter, subtool, QRectF(pad, pad, w, h))
-                painter.end()
+                pixmap = self._render_bbox_pixmap(subtool, meta["geometry"], pad, pen,
+                                                  meta.get("radius_ratio", DEFAULT_ROUNDED_RADIUS_RATIO))
             elif kind == "line":
                 p1_local, p2_local = meta["geometry"]
                 pad = self._shape_pad() + self._arrowhead_margin_for(subtool, self.draw_thickness)
@@ -2236,7 +2399,9 @@ class CanvasView(QGraphicsView):
                 resize_item = self._resizable_selected_item()
                 if resize_item is not None:
                     h = self._item_resize_handle_at(resize_item, pos)
-            if h is not None:
+            if self._radius_handle_at(pos) is not None:
+                self.viewport().setCursor(Qt.CursorShape.SizeHorCursor)
+            elif h is not None:
                 self.viewport().setCursor(CURSORS[h])
             elif self.tool == "move" and self._movable_item_at(pos) is not None:
                 # 붙여넣은/텍스트/도형 아이템 내부: 드래그로 이동 가능함을 사방
@@ -2245,6 +2410,10 @@ class CanvasView(QGraphicsView):
             else:
                 self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
+        if self._radius_drag_item is not None:
+            self._radius_drag_move(pos)
+            event.accept()
+            return
         if self._item_resize_item is not None:
             self._item_resize_move(pos)
             event.accept()
@@ -2342,6 +2511,10 @@ class CanvasView(QGraphicsView):
             self._drag_handle = None
             self._canvas_resize_preview = None
             self.viewport().update()
+            event.accept()
+            return
+        if self._radius_drag_item is not None:
+            self._radius_drag_release()
             event.accept()
             return
         if self._item_resize_item is not None:

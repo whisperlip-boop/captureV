@@ -25,7 +25,8 @@ _LINE_KIND_KEYS: frozenset[str] = frozenset(key for key, _ in LINE_KINDS)
 FREEHAND_KINDS: frozenset[str] = frozenset({"freehand", "freehand_arrow"})
 ARROW_KINDS: frozenset[str] = frozenset({"line_arrow", "freehand_arrow"})
 
-_ROUNDED_RADIUS_RATIO = 0.25    # 둥근 사각형 모서리 반지름 = 짧은 변 * 이 비율
+DEFAULT_ROUNDED_RADIUS_RATIO = 0.25   # 둥근 사각형 기본 모서리 반지름 = 짧은 변 * 이 비율
+MAX_ROUNDED_RADIUS_RATIO = 0.5        # 이 비율에서 짧은 변 양 끝이 완전한 반원이 된다
 _ARROWHEAD_ANGLE_DEG = 25.0     # 화살표(^) 두 날개가 선 방향과 이루는 각도
 _ARROWHEAD_LEN_RATIO = 3.0      # 화살표 날개 길이 = 두께 * 이 배수
 _ARROWHEAD_LEN_MIN = 8.0        # 두께가 매우 얇아도 화살표가 보이도록 하는 최소 길이
@@ -52,12 +53,30 @@ def ngon_points(rect: QRectF, n: int, start_angle_deg: float) -> QPolygonF:
     return QPolygonF(points)
 
 
-def draw_bbox_shape(painter: QPainter, kind: str, rect: QRectF) -> None:
-    """바운딩 박스 rect 안에 도형(사각형/타원/삼각형/마름모/오각형/육각형 등)을 그린다."""
+def clamp_radius_ratio(ratio: float) -> float:
+    """둥근 사각형 반지름 비율을 허용 범위 [0, MAX_ROUNDED_RADIUS_RATIO]로 제한한다."""
+    return min(max(ratio, 0.0), MAX_ROUNDED_RADIUS_RATIO)
+
+
+def rounded_radius(rect: QRectF, ratio: float) -> float:
+    """rect 크기와 비율로 둥근 사각형의 실제 모서리 반지름(px)을 계산한다."""
+    return min(rect.width(), rect.height()) * clamp_radius_ratio(ratio)
+
+
+def draw_bbox_shape(painter: QPainter, kind: str, rect: QRectF,
+                    radius_ratio: float = DEFAULT_ROUNDED_RADIUS_RATIO) -> None:
+    """바운딩 박스 rect 안에 도형(사각형/타원/삼각형/마름모/오각형/육각형 등)을 그린다.
+
+    Args:
+        painter: 그릴 대상 painter (pen/brush는 호출 측에서 설정).
+        kind: SHAPE_KINDS의 내부 키.
+        rect: 도형의 바운딩 박스.
+        radius_ratio: 둥근 사각형 전용. 모서리 반지름을 짧은 변 대비 비율로 지정.
+    """
     if kind == "rectangle":
         painter.drawRect(rect)
     elif kind == "rounded_rect":
-        radius = min(rect.width(), rect.height()) * _ROUNDED_RADIUS_RATIO
+        radius = rounded_radius(rect, radius_ratio)
         painter.drawRoundedRect(rect, radius, radius)
     elif kind in ("ellipse", "circle"):
         painter.drawEllipse(rect)
