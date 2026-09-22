@@ -207,6 +207,64 @@ BRIGHTNESS_CONTRAST_MAX: int = 100
 HUE_SATURATION_MIN: int = -100
 HUE_SATURATION_MAX: int = 100
 
+# ---------- SVG 가져오기 ---------- #
+# SVG는 벡터라 정해진 픽셀 크기가 없어, 공칭 크기(width/height 또는 viewBox)에
+# 이 배율을 곱해 래스터화한다. 24x24 아이콘 SVG를 공칭 크기로 들여오면 확대
+# 시 뭉개지므로 기본값을 100%보다 크게 둔다.
+SVG_IMPORT_SCALE_MIN: int = 25
+SVG_IMPORT_SCALE_MAX: int = 1600
+DEFAULT_SVG_IMPORT_SCALE: int = 200
+SVG_IMPORT_SCALE_STEP: int = 25     # 슬라이더 +/- 버튼의 한 번 이동량(%)
+# 래스터화 결과의 긴 변 상한(4K 가로 해상도). 배율만 그대로 적용하면 큰 SVG에서
+# 크기가 폭발하므로(3000x2000 원본 x 800% = 24000x16000, 약 1.5GB) 반드시 제한한다.
+SVG_MAX_LONG_EDGE: int = 3840
+SVG_EXTENSIONS: frozenset[str] = frozenset({".svg", ".svgz"})
+
+# ---------- 저장 형식 ---------- #
+SAVE_FILTERS: str = ("PNG (*.png);;JPEG (*.jpg);;WebP (*.webp);;AVIF (*.avif);;"
+                     "TIFF (*.tif);;ICO (*.ico);;BMP (*.bmp)")
+# 열기 대화상자 필터. Qt가 읽을 수 있는 포맷을 전부 나열하면 목록이 지나치게
+# 길어지므로(pbm, xbm, wbmp, icns 등) 실제로 쓰이는 것만 추리고, 나머지는
+# "모든 파일"로 직접 골라 열 수 있게 한다.
+OPEN_FILTERS: str = (
+    "이미지 파일 (*.png *.jpg *.jpeg *.bmp *.webp *.avif *.svg *.svgz *.gif *.tif *.tiff *.ico);;"
+    "PNG (*.png);;JPEG (*.jpg *.jpeg);;WebP (*.webp);;AVIF (*.avif);;SVG (*.svg *.svgz);;"
+    "BMP (*.bmp);;모든 파일 (*)"
+)
+# 확장자 -> QImage.save()에 넘길 Qt 포맷 이름. 확장자와 실제 파일 내용이 어긋나는
+# 것을 막기 위해 저장 포맷은 항상 이 표에서 파생시킨다.
+#
+# 이 표는 화이트리스트다. "Qt가 쓸 수 있으면 무엇이든 허용"으로 넓히면 안 된다 -
+# Qt는 pbm/xbm/wbmp에 1비트 흑백, pgm에 흑백, icns/cur에 규격 크기로 조용히 변환해
+# 저장하면서 QImage.save()로는 성공(True)을 돌려주기 때문에, 사용자가 손실을
+# 알아차릴 방법이 없다. 추가하려면 해당 포맷의 왕복 결과를 먼저 실측할 것.
+SAVE_EXT_TO_FORMAT: dict[str, str] = {
+    "png": "PNG", "jpg": "JPEG", "jpeg": "JPEG", "webp": "WEBP", "avif": "AVIF",
+    "tif": "TIFF", "tiff": "TIFF", "ico": "ICO", "bmp": "BMP",
+}
+# Qt가 다루지 못해 Pillow를 거쳐 읽고 쓰는 포맷(capture.avif_io 참조).
+PILLOW_FORMATS: frozenset[str] = frozenset({"AVIF"})
+DEFAULT_SAVE_FORMAT: str = "PNG"
+# 포맷별 저장 품질(-1 = Qt 기본값). WebP는 Qt 핸들러가 quality >= 100일 때
+# 무손실로 인코딩하므로, 글자가 많은 화면 캡처가 뭉개지지 않도록 100을 쓴다.
+# AVIF는 100이어도 완전 무손실이 아니다(Pillow가 무손실을 지원하지 않는다).
+# 최대 품질 + 4:4:4로 오차를 채널당 2 이내로 억제한다 - capture/avif_io.py 참조.
+SAVE_QUALITY: dict[str, int] = {"JPEG": 100, "WEBP": 100, "AVIF": 100}
+
+# open_files()가 "열었던 파일에 Ctrl+S로 곧바로 덮어써도 되는" 확장자.
+# 저장 가능 여부(SAVE_EXT_TO_FORMAT)와는 다른 판단이라 표를 따로 둔다:
+# ICO는 16/32/48/256px 멀티사이즈를, TIFF는 여러 페이지를 담을 수 있는데 이 앱은
+# 단일 이미지만 쓸 수 있어, 열었던 원본을 덮어쓰면 나머지 프레임이 사라진다.
+# 그래서 저장 자체는 허용하되('다른 이름으로 저장'에서 사용자가 명시적으로 고를
+# 때) 원본 자동 덮어쓰기 대상에서는 뺀다.
+OVERWRITE_SAFE_EXTENSIONS: frozenset[str] = frozenset(
+    {"png", "jpg", "jpeg", "webp", "avif", "bmp"})
+
+# ICO 규격상 한 변의 최대 길이. 이보다 큰 이미지를 넘기면 Qt가 조용히 축소해
+# 저장하므로(1920x1080 -> 256x144, 그런데도 save()는 성공을 반환) 저장 전에
+# 사용자에게 확인을 받아야 한다.
+ICO_MAX_EDGE: int = 256
+
 # ---------- 도형 도구 ---------- #
 DEFAULT_SHAPE_SUBTOOL: str = "rectangle"
 SHAPE_ICON_PX: int = 26    # 도형/선 갤러리 아이콘 크기

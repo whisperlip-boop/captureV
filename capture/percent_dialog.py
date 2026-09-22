@@ -19,7 +19,7 @@ class PercentSettingsDialog(QDialog):
     """"%" 강도를 입력 박스와 슬라이더로 함께 조절하는 대화상자."""
 
     def __init__(self, window_title: str, label_text: str, initial_percent: int, minimum: int,
-                 maximum: int, parent: QWidget | None = None) -> None:
+                 maximum: int, parent: QWidget | None = None, step: int = 1) -> None:
         """대화상자를 구성한다.
 
         Args:
@@ -29,6 +29,8 @@ class PercentSettingsDialog(QDialog):
             minimum: 허용 최솟값(%).
             maximum: 허용 최댓값(%).
             parent: 부모 위젯.
+            step: 스핀박스 화살표와 -/+ 버튼의 한 번 이동량(%). 범위가 넓은
+                설정(예: 25~1600%)에서 1%씩 움직이면 조작이 번거로워 조정한다.
         """
         super().__init__(parent)
         self.setWindowTitle(window_title)
@@ -41,6 +43,7 @@ class PercentSettingsDialog(QDialog):
         top_row.addStretch()
         self.percent_spin = QSpinBox(self)
         self.percent_spin.setRange(minimum, maximum)
+        self.percent_spin.setSingleStep(step)
         self.percent_spin.setValue(initial_percent)
         top_row.addWidget(self.percent_spin)
         layout.addLayout(top_row)
@@ -51,6 +54,8 @@ class PercentSettingsDialog(QDialog):
         self.minus_btn.setFixedSize(_STEP_BTN_PX, _STEP_BTN_PX)
         self.slider = QSlider(Qt.Orientation.Horizontal, self)
         self.slider.setRange(minimum, maximum)
+        self.slider.setSingleStep(step)
+        self.slider.setPageStep(step * 4)
         self.slider.setValue(initial_percent)
         self.plus_btn = QToolButton(self)
         self.plus_btn.setText("+")
@@ -67,8 +72,8 @@ class PercentSettingsDialog(QDialog):
 
         self.percent_spin.valueChanged.connect(self.slider.setValue)
         self.slider.valueChanged.connect(self.percent_spin.setValue)
-        self.minus_btn.clicked.connect(lambda: self.slider.setValue(self.slider.value() - 1))
-        self.plus_btn.clicked.connect(lambda: self.slider.setValue(self.slider.value() + 1))
+        self.minus_btn.clicked.connect(lambda: self.slider.setValue(self.slider.value() - step))
+        self.plus_btn.clicked.connect(lambda: self.slider.setValue(self.slider.value() + step))
 
         # 너비를 넓히기 전(기본 크기)의 sizeHint를 먼저 구해야, 이미 넓어진
         # 크기에 다시 배수를 곱해 이중으로 커지는 것을 피할 수 있다. 슬라이더는

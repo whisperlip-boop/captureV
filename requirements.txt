@@ -1,0 +1,18 @@
+# CaptureV 실행/빌드에 필요한 패키지
+#
+# 설치:  pip install -r requirements.txt
+# 빌드:  pyinstaller CaptureV.spec
+
+PySide6>=6.9
+
+# AVIF 읽기/쓰기(capture/avif_io.py). Qt에는 AVIF 이미지 플러그인이 없어
+# Pillow의 libavif 코덱을 거친다. 11.3 미만 휠에는 AVIF 코덱이 포함되지 않아
+# AvifImagePlugin을 불러올 수 없으므로 반드시 11.3 이상이어야 한다.
+pillow>=11.3
+
+# 효과(모자이크/블러/언샵 마스킹)의 신호 처리와 픽셀 배열 연산
+numpy>=1.26
+scipy>=1.11
+
+# 빌드 도구 (실행에는 불필요)
+pyinstaller>=6.0

@@ -4,13 +4,15 @@
 
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Callable, Optional, cast
 
 from PySide6.QtCore import QPoint, QRect, QSettings, QSize, QStandardPaths, QUrl, Qt, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices,
                             QDragEnterEvent, QDropEvent, QFont, QGuiApplication, QIcon, QImage,
-                            QKeySequence, QMouseEvent, QPixmap, QShortcut)
+                            QImageReader, QKeySequence, QMouseEvent, QPixmap,
+                            QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QDialogButtonBox, QFileDialog,
                                 QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
                                 QMainWindow, QMenu, QMessageBox, QRadioButton, QSizePolicy, QSpinBox,
@@ -18,23 +20,26 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QDialogButto
                                 QWidgetAction)
 
 from capture import screen_capture
+from capture.avif_io import is_avif_path, read_avif, write_avif
 from capture.canvas_size_dialog import CanvasSizeDialog
 from capture.canvas_view import CanvasView
 from capture.color_pick_overlay import ColorPickOverlay
 from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHTNESS_CONTRAST_MAX,
-                             BRIGHTNESS_CONTRAST_MIN, CANVAS_SURROUND_COLOR, DEFAULT_BLUR_PERCENT,
-                             DEFAULT_CANVAS_SIZE_BG_COLOR, DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE,
-                             DEFAULT_FIXED_CAPTURE_HEIGHT, DEFAULT_FIXED_CAPTURE_WIDTH,
-                             DEFAULT_MOSAIC_PERCENT, DEFAULT_NEW_CANVAS_BG_COLOR, DEFAULT_NEW_CANVAS_HEIGHT,
-                             DEFAULT_NEW_CANVAS_WIDTH, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT,
-                             DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS, EFFECT_MENU_ICON_PX,
-                             FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, HUE_SATURATION_MAX,
-                             HUE_SATURATION_MIN, MINI_TOOL_DIVIDER_COLOR, MINI_TOOL_ICON_PX,
-                             MOSAIC_PERCENT_MAX, MOSAIC_PERCENT_MIN, NEW_CANVAS_SIZE_MAX,
-                             NEW_CANVAS_SIZE_MIN, SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN,
-                             TAB_SAVED_COLOR, TAB_UNSAVED_COLOR, THICKNESS_MAX, THICKNESS_MIN,
-                             TOOLBAR_ICON_PX, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN, get_resource_path,
-                             get_settings_path)
+                            BRIGHTNESS_CONTRAST_MIN, CANVAS_SURROUND_COLOR, DEFAULT_BLUR_PERCENT,
+                            DEFAULT_CANVAS_SIZE_BG_COLOR, DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE,
+                            DEFAULT_FIXED_CAPTURE_HEIGHT, DEFAULT_FIXED_CAPTURE_WIDTH, DEFAULT_MOSAIC_PERCENT,
+                            DEFAULT_NEW_CANVAS_BG_COLOR, DEFAULT_NEW_CANVAS_HEIGHT, DEFAULT_NEW_CANVAS_WIDTH,
+                            DEFAULT_SAVE_FORMAT, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT,
+                            DEFAULT_SVG_IMPORT_SCALE, DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS,
+                            EFFECT_MENU_ICON_PX, FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, HUE_SATURATION_MAX,
+                            HUE_SATURATION_MIN, ICO_MAX_EDGE, MINI_TOOL_DIVIDER_COLOR, MINI_TOOL_ICON_PX,
+                            MOSAIC_PERCENT_MAX, MOSAIC_PERCENT_MIN, NEW_CANVAS_SIZE_MAX, NEW_CANVAS_SIZE_MIN,
+                            OPEN_FILTERS, OVERWRITE_SAFE_EXTENSIONS, PILLOW_FORMATS, SAVE_EXT_TO_FORMAT,
+                            SAVE_FILTERS, SAVE_QUALITY, SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN,
+                            SVG_EXTENSIONS, SVG_IMPORT_SCALE_MAX, SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_STEP,
+                            SVG_MAX_LONG_EDGE, TAB_SAVED_COLOR, TAB_UNSAVED_COLOR, THICKNESS_MAX,
+                            THICKNESS_MIN, TOOLBAR_ICON_PX, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN,
+                            get_resource_path, get_settings_path)
 from capture.desktop_shot import DesktopShot
 from capture.dialog_utils import strip_minmax_buttons
 from capture.dual_slider_dialog import DualSliderDialog
@@ -188,6 +193,8 @@ class MainWindow(QMainWindow):
             self.settings.value("new_canvas_bg_transparent", False, type=bool))
         self._canvas_size_bg_color = QColor(
             self.settings.value("canvas_size_bg_color", DEFAULT_CANVAS_SIZE_BG_COLOR))
+        saved_svg_scale = int(str(self.settings.value("svg_import_scale", DEFAULT_SVG_IMPORT_SCALE)))
+        self._svg_import_scale = min(max(saved_svg_scale, SVG_IMPORT_SCALE_MIN), SVG_IMPORT_SCALE_MAX)
         self._color_pick_target: str = "draw"      # 색상 추출이 그리기 색/텍스트 색 중 어디로 갈지
 
         self._toolbar = QToolBar("main")
@@ -1087,9 +1094,19 @@ class MainWindow(QMainWindow):
         # 실제 QMenu 객체가 삭제되어 메뉴가 비는 문제가 있어 self에 보관한다.
         self._options_menu = self.menuBar().addMenu("☰ 옵션")
 
+        self._open_action = QAction("열기...", self)
+        self._open_action.setShortcut(QKeySequence("Ctrl+O"))
+        self._open_action.triggered.connect(self.open_files)
+        self._options_menu.addAction(self._open_action)
+        self._options_menu.addSeparator()
+
         self._shortcut_settings_action = QAction("캡처 단축키 설정...", self)
         self._shortcut_settings_action.triggered.connect(self._open_shortcut_settings)
         self._options_menu.addAction(self._shortcut_settings_action)
+
+        self._svg_scale_action = QAction("SVG 가져오기 배율...", self)
+        self._svg_scale_action.triggered.connect(self._open_svg_scale_dialog)
+        self._options_menu.addAction(self._svg_scale_action)
 
         self._log_folder_action = QAction("Log", self)
         self._log_folder_action.triggered.connect(self._open_log_folder)
@@ -1490,6 +1507,25 @@ class MainWindow(QMainWindow):
         text = seq.toString(QKeySequence.SequenceFormat.NativeText)
         self._region_capture_action.setText(f"{action.label} ({text})" if text else action.label)
 
+    def _open_svg_scale_dialog(self) -> None:
+        """SVG 가져오기 배율(%)을 입력받아 설정에 저장한다.
+
+        SVG는 벡터라 정해진 픽셀 크기가 없어, 파일의 공칭 크기에 이 배율을
+        곱해 래스터화한다. 파일마다 공칭 크기가 크게 다르므로 드롭할 때마다
+        묻지 않고 여기서 한 번 정해 계속 재사용한다.
+        """
+        dialog = PercentSettingsDialog(
+            "SVG 가져오기 배율", "배율 %", self._svg_import_scale,
+            SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_MAX, self, step=SVG_IMPORT_SCALE_STEP)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._svg_import_scale = dialog.percent()
+        self.settings.setValue("svg_import_scale", self._svg_import_scale)
+        self.statusBar().showMessage(
+            f"SVG 가져오기 배율: {self._svg_import_scale}% "
+            f"(긴 변 최대 {SVG_MAX_LONG_EDGE}px)", 4000)
+        logger.info("SVG 가져오기 배율 변경: %d%%", self._svg_import_scale)
+
     def _open_shortcut_settings(self) -> None:
         """캡처 단축키 설정 다이얼로그를 열고, 저장되면 전역 단축키를 다시 등록한다."""
         dialog = ShortcutSettingsDialog(self.settings, self)
@@ -1636,7 +1672,13 @@ class MainWindow(QMainWindow):
         if v.file_path is None:
             self.save_as_current(v)
             return
-        self._write_image(v, v.file_path, "PNG")
+        fmt = self._format_for_path(v.file_path)
+        if fmt is None:
+            # 저장된 경로의 확장자를 이 앱이 쓸 수 없는 경우(설정 파일을 손으로
+            # 고친 경우 등). 확장자와 다른 내용을 덮어쓰지 않도록 경로를 다시 묻는다.
+            self.save_as_current(v)
+            return
+        self._write_image(v, v.file_path, fmt)
 
     def save_as_current(self, view: Optional[CanvasView] = None) -> None:
         """파일 대화상자를 통해 경로/형식을 선택해 저장한다.
@@ -1650,25 +1692,129 @@ class MainWindow(QMainWindow):
         v.commit_pending_edit()
         start = v.file_path or os.path.join(
             self.save_dir, datetime.now().strftime("%Y-%m-%d_%H%M%S") + ".png")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "다른 이름으로 저장", start, "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp)")
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "다른 이름으로 저장", start, SAVE_FILTERS)
         if not path:
             return
-        fmt = os.path.splitext(path)[1].lstrip(".").upper() or "PNG"
-        fmt_str = "JPEG" if fmt in ("JPG", "JPEG") else fmt
-        self._write_image(v, path, fmt_str)
+        path = self._ensure_save_extension(path, selected_filter)
+        fmt = self._format_for_path(path)
+        if fmt is None:
+            self._warn("지원하지 않는 저장 형식입니다:\n"
+                       f"{os.path.basename(path)}\n\n"
+                       "PNG, JPEG, WebP, AVIF, BMP 중 하나의 확장자를 사용하세요.\n"
+                       "(SVG는 벡터 형식이라 편집 결과를 되돌려 저장할 수 없습니다.)")
+            return
+        self._write_image(v, path, fmt)
+
+    @staticmethod
+    def _ensure_save_extension(path: str, selected_filter: str) -> str:
+        """확장자 없이 파일명만 입력한 경우 대화상자에서 고른 필터의 확장자를 붙인다.
+
+        Qt의 저장 대화상자는 사용자가 확장자를 생략해도 그대로 반환하므로,
+        보정하지 않으면 확장자 없는 파일이 만들어진다.
+
+        Args:
+            path: 대화상자가 반환한 경로.
+            selected_filter: 대화상자에서 선택돼 있던 필터 문자열(예: "PNG (*.png)").
+
+        Returns:
+            확장자가 보장된 경로.
+        """
+        if os.path.splitext(path)[1]:
+            return path
+        match = re.search(r"\*(\.\w+)", selected_filter)
+        return path + (match.group(1) if match else ".png")
+
+    @staticmethod
+    def _format_for_path(path: str) -> Optional[str]:
+        """파일 경로의 확장자에 대응하는 Qt 이미지 포맷 이름을 반환한다.
+
+        확장자와 실제 파일 내용이 어긋나는 것을 막기 위해, 저장 포맷은 사용자가
+        고른 필터가 아니라 항상 최종 경로의 확장자에서 파생시킨다.
+
+        Args:
+            path: 저장할 파일 경로.
+
+        SAVE_EXT_TO_FORMAT은 화이트리스트다. "Qt가 쓸 수 있으면 무엇이든 허용"으로
+        넓히면 안 된다 - Qt는 pbm/xbm/wbmp를 1비트 흑백으로, pgm을 흑백으로,
+        icns/cur를 규격 크기로 조용히 변환해 저장하면서 QImage.save()로는 성공을
+        돌려주기 때문에, 사용자가 손실을 알아차릴 방법이 없다.
+
+        Returns:
+            Qt 포맷 이름(예: "PNG"). 이 앱이 쓸 수 없는 확장자면 None.
+        """
+        ext = os.path.splitext(path)[1].lstrip(".").lower()
+        if not ext:
+            return DEFAULT_SAVE_FORMAT
+        return SAVE_EXT_TO_FORMAT.get(ext)
+
+    def _confirm_ico_downscale(self, image: QImage) -> bool:
+        """ICO 저장 시 규격 한계로 축소가 일어나면 진행 여부를 확인한다.
+
+        ICO는 한 변이 최대 256px이라 Qt가 그보다 큰 이미지를 조용히 축소해
+        저장한다(1920x1080 -> 256x144). 그런데도 QImage.save()는 성공을 반환하므로
+        그냥 두면 "저장 완료" 메시지와 함께 원본 해상도가 사라진 것을 사용자가
+        알아차릴 수 없다.
+
+        Args:
+            image: 저장할 이미지.
+
+        Returns:
+            저장을 진행해도 되면 True, 사용자가 취소했으면 False.
+        """
+        long_edge = max(image.width(), image.height())
+        if long_edge <= ICO_MAX_EDGE:
+            return True
+        scale = ICO_MAX_EDGE / long_edge
+        target_w = max(round(image.width() * scale), 1)
+        target_h = max(round(image.height() * scale), 1)
+        box = QMessageBox(
+            QMessageBox.Icon.Warning, APP_NAME,
+            f"ICO는 한 변이 최대 {ICO_MAX_EDGE}px입니다.\n"
+            f"{image.width()}x{image.height()} 이미지는 "
+            f"{target_w}x{target_h}로 축소되어 저장됩니다.\n\n"
+            "원본 해상도를 유지하려면 PNG나 WebP로 저장하세요.",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel, self)
+        box.button(QMessageBox.StandardButton.Save).setText("축소해서 저장")
+        box.button(QMessageBox.StandardButton.Cancel).setText("취소")
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        strip_minmax_buttons(box)
+        if box.exec() != QMessageBox.StandardButton.Save:
+            logger.info("ICO 저장 취소(축소 거부): %dx%d", image.width(), image.height())
+            return False
+        logger.warning("ICO 저장으로 해상도 축소: %dx%d -> %dx%d",
+                       image.width(), image.height(), target_w, target_h)
+        return True
 
     def _write_image(self, v: CanvasView, path: str, fmt: str) -> None:
         """이미지를 지정 경로/포맷으로 저장하고, 성공하면 저장 상태를 갱신한다."""
+        # Qt는 할당 실패 시 예외를 던지지 않고 null QImage를 돌려준다(20000x20000
+        # ARGB32 = 1.6GB 캔버스 등). 이 null이 그대로 흘러가면 QImage.save()는
+        # False를 돌려줘 "저장 실패"로 처리되지만, AVIF 경로는 constBits()가 None을
+        # 반환해 TypeError로 터진다. 그래서 여기서 먼저 걸러낸다.
+        image = v.render_image()
+        if image.isNull():
+            logger.warning("렌더 실패로 저장 중단(메모리 부족 추정): %s", path)
+            self._warn(f"저장 실패:\n{path}")
+            return
+        if fmt == "ICO" and not self._confirm_ico_downscale(image):
+            return
         try:
             directory = os.path.dirname(path)
             if directory:
                 os.makedirs(directory, exist_ok=True)
-            quality = 100 if fmt == "JPEG" else -1
-            # PySide6 QImage.save()의 타입 스텁은 format 인자를 bytes로 표기하지만
-            # 실제로는 bytes를 넘기면 런타임 오류가 나고 str만 정상 동작한다(스텁 오류).
-            saved = v.render_image().save(path, fmt, quality)  # type: ignore[call-overload]
-        except OSError:
+            quality = SAVE_QUALITY.get(fmt, -1)
+            if fmt in PILLOW_FORMATS:
+                # Qt에 AVIF 플러그인이 없어 QImage.save()로는 저장할 수 없다.
+                write_avif(image, path, quality)
+                saved = True
+            else:
+                # PySide6 QImage.save()의 타입 스텁은 format 인자를 bytes로 표기하지만
+                # 실제로는 bytes를 넘기면 런타임 오류가 나고 str만 정상 동작한다(스텁 오류).
+                saved = image.save(path, fmt, quality)  # type: ignore[call-overload]
+        except (OSError, MemoryError):
+            # MemoryError는 OSError가 아니라, 큰 캔버스를 저장할 때 이걸 빼면
+            # 저장 실패가 예외로 앱까지 올라간다.
             logger.exception("저장 실패: %s", path)
             self._warn(f"저장 실패:\n{path}")
             return
@@ -1680,6 +1826,95 @@ class MainWindow(QMainWindow):
         else:
             logger.warning("이미지 저장 실패(포맷/경로 문제): %s", path)
             self._warn(f"저장 실패:\n{path}")
+
+    # ---------- 파일 로딩 ---------- #
+    def open_files(self) -> None:
+        """파일 대화상자로 고른 이미지들을 각각 새 탭으로 연다.
+
+        여러 파일을 한 번에 고를 수 있다. 이미지로 열 수 없는 파일은 건너뛰고
+        나머지를 모두 연 뒤 실패 목록을 한 번에 알려준다(파일 하나마다 경고를
+        띄우면 여러 개를 고른 경우 대화상자가 연달아 떠 방해가 된다).
+        """
+        start = str(self.settings.value("open_dir", self.save_dir))
+        paths, _ = QFileDialog.getOpenFileNames(self, "열기", start, OPEN_FILTERS)
+        if not paths:
+            return
+        self.settings.setValue("open_dir", os.path.dirname(paths[0]))
+
+        failed: list[str] = []
+        for path in paths:
+            image = self._load_image_file(path)
+            if image.isNull():
+                failed.append(os.path.basename(path))
+                logger.warning("열기 실패(이미지로 읽을 수 없음): %s", path)
+                continue
+            view = self.add_tab(image, os.path.basename(path))
+            # 원본을 그대로 덮어써도 잃을 것이 없는 포맷만 경로를 기억해 Ctrl+S가
+            # 곧바로 덮어쓰게 한다. "저장할 수 있는가"(_format_for_path)로 판단하면
+            # 안 된다 - ICO/TIFF는 저장은 되지만 멀티사이즈/멀티페이지가 단일
+            # 이미지로 납작해져, Ctrl+S 한 번에 원본이 파괴된다.
+            if os.path.splitext(path)[1].lstrip(".").lower() in OVERWRITE_SAFE_EXTENSIONS:
+                view.file_path = path
+                self._mark_saved(view, path)
+            logger.info("열기: %s (%dx%d)", path, image.width(), image.height())
+
+        if failed:
+            self._warn("이미지로 열 수 없어 건너뛴 파일:\n" + "\n".join(failed))
+
+    def _load_image_file(self, path: str) -> QImage:
+        """이미지 파일을 QImage로 읽는다.
+
+        AVIF는 Qt 플러그인이 없어 Pillow를 거치고(capture.avif_io), SVG/SVGZ는
+        설정된 배율로 래스터화하며, 나머지 포맷은 Qt에 그대로 맡긴다.
+
+        SVG를 QImage로 그냥 열면 공칭 크기(width/height 또는 viewBox) 그대로
+        래스터화되어, 24x24 아이콘 SVG는 24x24 비트맵이 되고 캔버스에서 확대하면
+        뭉개진다. 그래서 옵션의 '가져오기 배율'을 곱해 읽는다.
+
+        Args:
+            path: 읽을 파일의 로컬 경로.
+
+        Returns:
+            읽어들인 이미지. 실패하면 isNull()이 True인 빈 QImage.
+        """
+        if is_avif_path(path):
+            # Qt에 AVIF 플러그인이 없어 QImage(path)로는 항상 null이 나온다.
+            return read_avif(path)
+
+        if os.path.splitext(path)[1].lower() not in SVG_EXTENSIONS:
+            return QImage(path)
+
+        reader = QImageReader(path)
+        nominal = reader.size()
+        if not nominal.isValid() or nominal.isEmpty():
+            logger.warning("SVG 공칭 크기를 확인할 수 없음: %s (%s)", path, reader.errorString())
+            return QImage()
+
+        # 배율을 그대로 적용하면 큰 SVG에서 크기가 폭발하므로(원본 3000x2000에
+        # 800% = 24000x16000, 약 1.5GB) 긴 변을 4K 해상도로 제한한다.
+        scale = self._svg_import_scale / 100.0
+        long_edge = max(nominal.width(), nominal.height())
+        clamped = long_edge * scale > SVG_MAX_LONG_EDGE
+        if clamped:
+            scale = SVG_MAX_LONG_EDGE / long_edge
+        target = QSize(max(round(nominal.width() * scale), 1),
+                       max(round(nominal.height() * scale), 1))
+
+        reader.setScaledSize(target)
+        image = reader.read()
+        if image.isNull():
+            logger.warning("SVG 래스터화 실패: %s (%s)", path, reader.errorString())
+            return image
+
+        applied = round(scale * 100)
+        note = f" (긴 변 {SVG_MAX_LONG_EDGE}px 상한 적용)" if clamped else ""
+        self.statusBar().showMessage(
+            f"SVG 가져옴: {nominal.width()}x{nominal.height()} → {applied}%"
+            f" → {target.width()}x{target.height()}{note}", 5000)
+        logger.info("SVG 가져오기: %s (공칭 %dx%d, 배율 %d%% → %dx%d%s)",
+                    path, nominal.width(), nominal.height(), applied,
+                    target.width(), target.height(), " [상한 적용]" if clamped else "")
+        return image
 
     # ---------- 드래그&드롭 ---------- #
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:
@@ -1695,11 +1930,18 @@ class MainWindow(QMainWindow):
             return
         for url in md.urls():
             local_path = url.toLocalFile()
-            img = QImage(local_path)
+            img = self._load_image_file(local_path)
             if img.isNull():
                 logger.warning("드롭된 파일을 이미지로 열 수 없음: %s", local_path)
                 continue
-            self.add_tab(img, os.path.basename(local_path))
+            view = self.add_tab(img, os.path.basename(local_path))
+            # 드롭도 '파일 열기'이므로 Ctrl+O(open_files)와 같은 기준으로 원본
+            # 경로를 기억한다. 한쪽만 기억하면 같은 PNG인데도 드롭했을 때는
+            # Ctrl+S가 '다른 이름으로 저장'으로, Ctrl+O로 열었을 때는 덮어쓰기로
+            # 갈려 동작을 예측할 수 없다.
+            if os.path.splitext(local_path)[1].lstrip(".").lower() in OVERWRITE_SAFE_EXTENSIONS:
+                view.file_path = local_path
+                self._mark_saved(view, local_path)
 
     # ---------- 종료 ---------- #
     def closeEvent(self, event: QCloseEvent) -> None:
