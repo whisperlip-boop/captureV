@@ -11,7 +11,7 @@ import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QGuiApplication, QImage, QKeyEvent,
                             QMouseEvent, QPainter, QPainterPath, QPen, QPixmap,
-                            QResizeEvent, QShowEvent, QTextCharFormat, QTextCursor, QTransform,
+                            QResizeEvent, QShowEvent, QTextCharFormat, QTextDocument, QTransform,
                             QWheelEvent)
 from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QTextEdit,
                                 QToolButton, QWidget)
@@ -24,6 +24,8 @@ from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHE
                              HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION, SHARPEN_AMOUNT_SCALE,
                              SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN,
                              get_key_repeat_delay_ms)
+from capture.rich_text import (apply_to_whole_document, build_document, char_format_changes,
+                               h_align_flag, rasterize_document, scale_point_sizes, scaled_char_format)
 from capture.shapes import (ARROW_KINDS, DEFAULT_ROUNDED_RADIUS_RATIO, FREEHAND_KINDS,
                              arrowhead_length, clamp_radius_ratio, draw_bbox_shape, draw_bezier_kind,
                              draw_line_kind, is_line_kind, lock_square, rounded_radius,
@@ -166,6 +168,17 @@ class CanvasView(QGraphicsView):
         self.tool: str = "move"
         self._select_rect: QRectF = QRectF()
         self._select_state: str = "idle"          # idle | dragging | adjust
+        # 매직툴 선택: 캔버스(sceneRect) 크기의 픽셀 단위 bool 마스크와, 만들 당시의
+        # sceneRect. 캔버스 크기/원점이 바뀌면 좌표가 어긋나므로 무효로 본다.
+        self._magic_mask: Optional[np.ndarray] = None
+        self._magic_scene_rect: QRectF = QRectF()
+        # 점선 표시용: 마스크 안쪽 경계 픽셀 좌표(ys, xs), 그 경계를 감싸는 사각형의
+        # 좌상단(캔버스 픽셀 좌표), 그리고 점선을 그려 넣는 이미지와 마지막으로 그린 phase.
+        self._magic_edge: tuple[np.ndarray, np.ndarray] = (np.empty(0, int), np.empty(0, int))
+        self._magic_ants_origin: QPoint = QPoint()
+        self._magic_ants_image: Optional[QImage] = None
+        self._magic_ants_phase_drawn: int = -1
+        self.magic_tolerance: int = DEFAULT_FILL_TOLERANCE
         self._select_origin: Optional[QPointF] = None
         self._select_drag_handle: Optional[tuple[int, int] | str] = None
         self._select_drag_ref: Optional[tuple[QPointF, QRectF]] = None
@@ -180,7 +193,8 @@ class CanvasView(QGraphicsView):
         self.fill_tolerance: int = DEFAULT_FILL_TOLERANCE
 
         # shape_subtool: rectangle | rounded_rect | ellipse | circle | triangle | diamond |
-        # pentagon | hexagon | line | line_arrow | freehand | freehand_arrow
+        # pentagon | hexagon | line | line_arrow | line_double_arrow | freehand | freehand_arrow |
+        # freehand_double_arrow
         self.shape_subtool: str = DEFAULT_SHAPE_SUBTOOL
         self._shape_state: str = "idle"           # idle | dragging
         self._shape_origin: Optional[QPointF] = None
@@ -206,7 +220,12 @@ class CanvasView(QGraphicsView):
         self._text_overlay: Optional[_TextEditOverlay] = None
         self._text_editing_item: Optional[QGraphicsPixmapItem] = None
         self._text_new_rect: Optional[QRectF] = None
-        self._text_meta: dict[int, dict] = {}      # id(item) -> {text, font, color, align_h, align_v}
+        # 편집 중인 박스의 기본 서식 {font, color, align_h, align_v}과 편집칸을 열 때의 화면 배율
+        self._text_edit_base: dict = {}
+        self._text_edit_scale: float = 1.0
+        # id(item) -> {text, html, font, color, align_h, align_v}. html은 글자·문단별 서식을
+        # 담은 실제 크기 기준 문서이고, font/color/align_*는 박스 기본값이다.
+        self._text_meta: dict[int, dict] = {}
         self._text_drag_item: Optional[QGraphicsPixmapItem] = None
         self._text_drag_start_scene: Optional[QPointF] = None
         self._text_drag_item_start_pos: Optional[QPointF] = None
@@ -244,7 +263,7 @@ class CanvasView(QGraphicsView):
     def _tick_marching_ants(self) -> None:
         """선택 영역이 있을 때만 점선 애니메이션을 한 걸음 진행시키고 다시 그린다."""
         has_rect_selection = self.tool == "select" and self.has_selection()
-        if not has_rect_selection and not self._scene.selectedItems():
+        if not has_rect_selection and not self.has_magic_selection() and not self._scene.selectedItems():
             return
         self._marching_ants_phase = (self._marching_ants_phase + 1.0) % 8.0
         self.viewport().update()
@@ -261,6 +280,30 @@ class CanvasView(QGraphicsView):
         dash_pen.setDashOffset(self._marching_ants_phase + 4)
         painter.setPen(dash_pen)
         painter.drawRect(rect)
+
+    def _draw_magic_ants(self, painter: QPainter) -> None:
+        """매직툴 선택의 경계 픽셀을 검은색/흰색이 번갈아 움직이는 점선으로 그린다.
+
+        경계가 복잡하면(노이즈가 많은 사진 등) 선분이 수십만 개가 되어 매
+        프레임 선으로 그리기엔 너무 느리므로, 경계 픽셀에 직접 색을 넣은
+        이미지 한 장으로 그린다. phase가 바뀔 때만 색을 다시 칠한다.
+        """
+        if self._magic_ants_image is None:
+            return
+        phase = int(self._marching_ants_phase)
+        if phase != self._magic_ants_phase_drawn:
+            ys, xs = self._magic_edge
+            ox, oy = self._magic_ants_origin.x(), self._magic_ants_origin.y()
+            white = ((xs + ys + phase) // 4) % 2 == 1
+            arr = self._image_view(self._magic_ants_image)
+            arr[ys - oy, xs - ox] = [0, 0, 0, 255]
+            arr[ys[white] - oy, xs[white] - ox] = [255, 255, 255, 255]
+            self._magic_ants_phase_drawn = phase
+        scene_rect = self._magic_scene_rect
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        painter.drawImage(QPointF(scene_rect.left() + self._magic_ants_origin.x(),
+                                  scene_rect.top() + self._magic_ants_origin.y()),
+                          self._magic_ants_image)
 
     def _add_pixmap(self, pixmap: QPixmap, pos: QPoint, movable: bool = True) -> QGraphicsPixmapItem:
         """씬에 선택 가능한 픽스맵 아이템을 추가한다.
@@ -447,7 +490,14 @@ class CanvasView(QGraphicsView):
         self.viewport().update()
 
     def delete_selected(self) -> None:
-        """선택된 아이템을 삭제한다 (배경 아이템은 제외)."""
+        """선택된 아이템을 삭제한다 (배경 아이템은 제외).
+
+        매직툴 선택이 있으면 아이템 대신 그 영역 픽셀을 잘라내기와 같은 방식으로
+        지운다 (클립보드에는 넣지 않는다).
+        """
+        if self.has_magic_selection():
+            self.cut_magic_selection()
+            return
         targets = [it for it in self._scene.selectedItems() if it is not self.base_item]
         if not targets:
             return
@@ -1029,7 +1079,7 @@ class CanvasView(QGraphicsView):
 
     # ---------- 도구 ---------- #
     def set_tool(self, tool: str) -> None:
-        """활성 도구를 전환한다 ('move', 'select', 'draw', 'fill', 'text', 'shape').
+        """활성 도구를 전환한다 ('move', 'select', 'magic', 'draw', 'fill', 'text', 'shape').
 
         '선택' 도구를 벗어나면 진행 중이던 선택 영역을 지우고, 편집 중인
         텍스트 박스가 있으면 먼저 반영하고 닫는다.
@@ -1040,6 +1090,9 @@ class CanvasView(QGraphicsView):
         self.tool = tool
         if tool != "select":
             self.clear_selection()
+        # 매직툴 선택은 '채우기'로 선택 영역 전체를 칠할 수 있도록 두 도구 사이에서만 유지한다.
+        if tool not in ("magic", "fill"):
+            self.clear_magic_selection()
         if tool != "draw":
             self._stroke_path = None
             self._stroke_backup = None
@@ -1093,47 +1146,74 @@ class CanvasView(QGraphicsView):
         """채우기 도구의 색상 허용 범위(0~100%)를 설정한다."""
         self.fill_tolerance = tolerance_pct
 
-    def set_text_options(self, font: QFont, color: QColor, align_h: str, align_v: str) -> None:
-        """텍스트 도구의 폰트/색/정렬 기본값을 설정한다.
+    def set_magic_tolerance(self, tolerance_pct: int) -> None:
+        """매직툴의 색상 허용 범위(0~100%)를 설정한다."""
+        self.magic_tolerance = tolerance_pct
 
-        편집 중인 텍스트 박스가 있으면 즉시 반영한다 (세로 정렬은 QTextEdit이
-        내용 세로 정렬을 지원하지 않아 편집 중에는 항상 위쪽 기준으로 보이고,
-        편집을 마칠 때 최종 렌더링에만 반영된다).
+    def set_text_options(self, font: QFont, color: QColor, align_h: str, align_v: str) -> None:
+        """텍스트 도구의 폰트/색/정렬 기본값을 설정하고, 바뀐 속성만 편집 대상에 반영한다.
+
+        편집 중인 텍스트 박스가 있으면 블록(선택)한 글자에만 글자 서식을, 선택
+        영역이 걸친 문단(선택이 없으면 커서가 있는 문단)에 가로 정렬을 적용한다.
+        선택이 없을 때 바꾼 글자 서식은 이후 입력하는 글자에 쓰인다. 세로 정렬은
+        박스 단위이며, QTextEdit이 내용 세로 정렬을 지원하지 않아 편집을 마칠 때
+        최종 렌더링에만 반영된다. 편집 중이 아니면 선택된 텍스트 박스 전체에 반영한다.
         """
-        unchanged = (self.text_font == font and self.text_color == color
-                     and self.text_align_h == align_h and self.text_align_v == align_v)
+        fmt = char_format_changes(self.text_font, font, self.text_color, color)
+        new_align_h = align_h if align_h != self.text_align_h else None
+        new_align_v = align_v if align_v != self.text_align_v else None
         self.text_font = QFont(font)
         self.text_color = QColor(color)
         self.text_align_h = align_h
         self.text_align_v = align_v
         if self._text_overlay is not None:
-            self._style_text_edit(self._text_overlay.text_edit, self.text_font, self.text_color,
-                                   self.text_align_h)
+            text_edit = self._text_overlay.text_edit
+            if not fmt.isEmpty():
+                text_edit.mergeCurrentCharFormat(scaled_char_format(fmt, self._text_edit_scale))
+            if new_align_h is not None:
+                text_edit.setAlignment(h_align_flag(new_align_h))
+            if new_align_v is not None:
+                self._text_edit_base["align_v"] = new_align_v
             return
         # 값이 실제로 바뀐 경우에만 재래스터화한다. 탭 전환 등으로 이 메서드가
         # 동일한 값으로 반복 호출될 때마다 선택된 텍스트 박스를 다시 그리고
         # 실행취소 스택에 쌓는 것을 방지한다.
-        if not unchanged:
-            self._restyle_selected_text_items()
+        if not fmt.isEmpty() or new_align_h is not None or new_align_v is not None:
+            self._restyle_selected_text_items(fmt, new_align_h, new_align_v)
 
-    def _restyle_selected_text_items(self) -> None:
-        """편집을 마치고 확정된 텍스트 박스가 선택되어 있으면, 방금 바뀐
-        폰트/색/정렬로 다시 래스터화해 즉시 반영한다."""
+    def _restyle_selected_text_items(self, fmt: QTextCharFormat, align_h: Optional[str],
+                                     align_v: Optional[str]) -> None:
+        """편집을 마치고 확정된 텍스트 박스가 선택되어 있으면, 방금 바뀐 속성만
+        박스 전체에 적용해 다시 래스터화한다 (바꾸지 않은 글자별 서식은 유지).
+
+        Args:
+            fmt: 바뀐 글자 서식만 담은 서식 (실제 크기 기준).
+            align_h: 바뀐 가로 정렬, 바뀌지 않았으면 None.
+            align_v: 바뀐 세로 정렬, 바뀌지 않았으면 None.
+        """
         targets = [it for it in self._scene.selectedItems() if id(it) in self._text_meta]
         if not targets:
             return
         self._push_undo()
         for item in targets:
             meta = self._text_meta[id(item)]
-            pixmap = self._rasterize_text(meta["text"], self.text_font, self.text_color,
-                                           self.text_align_h, self.text_align_v,
-                                           item.pixmap().size())
-            item.setPixmap(pixmap)
-            meta["font"] = QFont(self.text_font)
-            meta["color"] = QColor(self.text_color)
-            meta["align_h"] = self.text_align_h
-            meta["align_v"] = self.text_align_v
+            doc = self._text_document(meta)
+            apply_to_whole_document(doc, fmt, align_h)
+            meta["html"] = doc.toHtml()
+            if align_h is not None:
+                meta["align_h"] = align_h
+            if align_v is not None:
+                meta["align_v"] = align_v
+            item.setPixmap(rasterize_document(doc, meta["color"], meta.get("align_v", "top"),
+                                              QSizeF(item.pixmap().size())))
         self.changed.emit()
+
+    def _text_document(self, meta: dict) -> QTextDocument:
+        """텍스트 박스 메타 정보로 실제 크기 기준 문서를 만든다 (html 이전 형식도 지원)."""
+        return build_document(meta.get("text", ""), meta.get("html"),
+                              QFont(meta.get("font", self.text_font)),
+                              QColor(meta.get("color", self.text_color)),
+                              meta.get("align_h", self.text_align_h))
 
     def has_selection(self) -> bool:
         """유효한 선택 영역이 있는지 여부."""
@@ -1209,6 +1289,245 @@ class CanvasView(QGraphicsView):
         if cleared:
             self.changed.emit()
         return img
+
+    # ---------- 매직툴 선택 ---------- #
+    def has_magic_selection(self) -> bool:
+        """유효한 매직툴 선택이 있는지 여부.
+
+        선택 후 캔버스 크기/원점이 바뀌었으면(여백 조절, 회전, 실행 취소 등)
+        마스크 좌표가 더 이상 맞지 않으므로 선택을 지우고 False를 반환한다.
+        """
+        if self._magic_mask is None:
+            return False
+        if self._magic_scene_rect != self._scene.sceneRect():
+            self.clear_magic_selection()
+            return False
+        return True
+
+    def clear_magic_selection(self) -> None:
+        """매직툴 선택을 지운다."""
+        if self._magic_mask is None:
+            return
+        self._magic_mask = None
+        self._magic_scene_rect = QRectF()
+        self._magic_edge = (np.empty(0, int), np.empty(0, int))
+        self._magic_ants_image = None
+        self.viewport().update()
+
+    def magic_select_at(self, view_pos: QPoint, mode: str = "replace") -> bool:
+        """클릭 지점과 이어진, 허용 범위 내 비슷한 색의 픽셀을 선택한다.
+
+        색 판정은 채우기와 동일하게 화면에 보이는 합성 결과를 기준으로 한다.
+
+        Args:
+            view_pos: 뷰(위젯) 좌표의 클릭 지점.
+            mode: 'replace'(새로 선택), 'add'(Shift, 기존 선택에 추가),
+                'subtract'(Alt, 기존 선택에서 빼기).
+
+        Returns:
+            선택이 바뀌었는지 여부 (클릭 지점이 캔버스 밖이면 False).
+        """
+        scene_rect = self._scene.sceneRect()
+        sp = self.mapToScene(view_pos)
+        if not scene_rect.contains(sp):
+            return False
+        composed = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        w, h = composed.width(), composed.height()
+        x = int(sp.x() - scene_rect.left())
+        y = int(sp.y() - scene_rect.top())
+        if not (0 <= x < w and 0 <= y < h):
+            return False
+        region = self._similar_region(composed, x, y, self.magic_tolerance)
+
+        current = self._magic_mask if self.has_magic_selection() else None
+        if mode == "add" and current is not None:
+            mask = current | region
+        elif mode == "subtract":
+            if current is None:
+                return False
+            mask = current & ~region
+        else:
+            mask = region
+        self._set_magic_mask(mask, scene_rect)
+        logger.info("매직툴 선택(%s): (%d, %d), 허용범위=%d%%, 선택 %d픽셀",
+                    mode, x, y, self.magic_tolerance, int(mask.sum()))
+        return True
+
+    def _set_magic_mask(self, mask: np.ndarray, scene_rect: QRectF) -> None:
+        """매직툴 선택 마스크를 설정하고 경계 점선을 다시 계산한다 (빈 마스크면 선택 해제)."""
+        if not mask.any():
+            self.clear_magic_selection()
+            return
+        self._magic_mask = mask
+        self._magic_scene_rect = QRectF(scene_rect)
+        # 상하좌우 이웃 중 하나라도 선택 밖(캔버스 밖 포함)인 선택 픽셀이 경계다.
+        padded = np.pad(mask, 1)
+        interior = (padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:])
+        ys, xs = np.nonzero(mask & ~interior)
+        self._magic_edge = (ys, xs)
+        x0, y0 = int(xs.min()), int(ys.min())
+        self._magic_ants_origin = QPoint(x0, y0)
+        self._magic_ants_image = QImage(int(xs.max()) - x0 + 1, int(ys.max()) - y0 + 1,
+                                        QImage.Format.Format_ARGB32)
+        self._magic_ants_image.fill(Qt.GlobalColor.transparent)
+        self._magic_ants_phase_drawn = -1
+        self.viewport().update()
+
+    def _magic_bounds(self) -> tuple[int, int, int, int]:
+        """매직툴 선택 마스크를 감싸는 최소 사각형 (x0, y0, x1, y1), 캔버스 픽셀 좌표."""
+        ys, xs = np.nonzero(self._magic_mask)
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+    def render_magic_selection(self) -> Optional[QImage]:
+        """매직툴 선택 영역을 감싸는 사각형 크기로 렌더링하고, 선택되지 않은 픽셀은 투명 처리한다.
+
+        Returns:
+            선택 영역 이미지. 선택이 없으면 None.
+        """
+        if not self.has_magic_selection():
+            return None
+        x0, y0, x1, y1 = self._magic_bounds()
+        composed = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
+        img = composed.copy(x0, y0, x1 - x0, y1 - y0)
+        arr = self._image_view(img)
+        arr[~self._magic_mask[y0:y1, x0:x1]] = 0
+        return img
+
+    def cut_magic_selection(self, fill_color: Optional[QColor] = None) -> Optional[QImage]:
+        """매직툴 선택 영역을 잘라낸다 (사각형 cut_selection과 같은 규칙).
+
+        선택 영역 이미지를 반환하고, 영역과 겹치는 모든 픽스맵 아이템의 해당
+        픽셀을 fill_color로 바꾼 뒤 선택을 해제한다.
+
+        Args:
+            fill_color: 잘라낸 자리를 채울 색. None이면 배경이 투명인
+                캔버스는 투명으로, 그렇지 않으면 흰색으로 채운다.
+
+        Returns:
+            잘라낸 영역의 이미지. 선택이 없으면 None.
+        """
+        img = self.render_magic_selection()
+        if img is None:
+            return None
+        if fill_color is None:
+            fill_color = QColor(Qt.GlobalColor.transparent if self._transparent_background
+                                 else Qt.GlobalColor.white)
+        items = [it for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)]
+        self._paint_mask_on_items([(it, self._magic_mask) for it in items], fill_color)
+        logger.info("매직툴 잘라내기: %d픽셀", int(self._magic_mask.sum()))
+        self.clear_magic_selection()
+        return img
+
+    def _fill_magic_selection_at(self, view_pos: QPoint) -> bool:
+        """채우기 도구로 매직툴 선택 영역 안을 클릭하면 선택 영역 전체를 draw_color로 채운다.
+
+        채우기와 같이 각 픽셀은 그 위치에서 보이는 최상단 아이템에 칠한다
+        (가려진 아래 아이템은 건드리지 않는다).
+
+        Returns:
+            선택 영역 채우기로 처리했는지 여부 (선택이 없거나 영역 밖이면 False).
+        """
+        if not self.has_magic_selection():
+            return False
+        scene_rect = self._scene.sceneRect()
+        sp = self.mapToScene(view_pos)
+        x = int(sp.x() - scene_rect.left())
+        y = int(sp.y() - scene_rect.top())
+        h, w = self._magic_mask.shape
+        if not (0 <= x < w and 0 <= y < h) or not self._magic_mask[y, x]:
+            return False
+
+        items = sorted((it for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)),
+                       key=lambda it: it.zValue(), reverse=True)
+        remaining = self._magic_mask.copy()
+        targets: list[tuple[QGraphicsPixmapItem, np.ndarray]] = []
+        for it in items:
+            part = remaining & self._item_cover_mask(it, w, h, scene_rect)
+            if part.any():
+                targets.append((it, part))
+                remaining &= ~part
+        # 어떤 아이템도 덮지 않은 곳(투명 캔버스의 빈 영역)은 그리기 레이어에 칠한다.
+        if remaining.any() and self.draw_item is not None:
+            targets.append((self.draw_item, remaining))
+        color = QColor(self.draw_color)
+        color.setAlpha(255)
+        self._paint_mask_on_items(targets, color)
+        logger.info("매직툴 선택 영역 채우기: %d픽셀, 색=%s", int(self._magic_mask.sum()), color.name())
+        return True
+
+    def _paint_mask_on_items(self, targets: list[tuple[QGraphicsPixmapItem, np.ndarray]],
+                             color: QColor) -> None:
+        """각 아이템의 픽스맵에서 캔버스 크기 마스크에 해당하는 픽셀을 color로 바꾼다.
+
+        먼저 해당 픽셀을 지우고(DestinationOut) 그 위에 색을 칠해, 반투명/투명
+        색도 기존 픽셀과 섞이지 않고 그대로 들어가게 한다. 실행 취소는 실제로
+        바뀌는 아이템이 있을 때만 한 번 기록한다.
+        """
+        scene_rect = self._scene.sceneRect()
+        pushed = False
+        for item, mask in targets:
+            item_rect = self._item_pixmap_rect(item).translated(-scene_rect.topLeft())
+            h, w = mask.shape
+            x0, y0 = max(int(item_rect.left()), 0), max(int(item_rect.top()), 0)
+            x1, y1 = min(int(math.ceil(item_rect.right())), w), min(int(math.ceil(item_rect.bottom())), h)
+            if x0 >= x1 or y0 >= y1 or not mask[y0:y1, x0:x1].any():
+                continue
+            if not pushed:
+                self._push_undo()
+                pushed = True
+            stencil = QImage(x1 - x0, y1 - y0, QImage.Format.Format_ARGB32)
+            stencil.fill(Qt.GlobalColor.transparent)
+            self._image_view(stencil)[mask[y0:y1, x0:x1]] = [color.blue(), color.green(), color.red(), 255]
+            offset = scene_rect.topLeft() + QPointF(x0, y0) - item.pos()
+            pm = QPixmap(item.pixmap())
+            painter = QPainter(pm)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
+            painter.drawImage(offset, stencil)
+            if color.alpha() > 0:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                painter.setOpacity(color.alphaF())
+                painter.drawImage(offset, stencil)
+            painter.end()
+            item.setPixmap(pm)
+        if pushed:
+            self.changed.emit()
+
+    @staticmethod
+    def _image_view(image: QImage) -> np.ndarray:
+        """ARGB32 QImage의 픽셀을 (h, w, 4) BGRA uint8 배열로 직접 가리키는 쓰기 가능한 뷰."""
+        w, h = image.width(), image.height()
+        stride = image.bytesPerLine()
+        buf = np.frombuffer(image.bits(), dtype=np.uint8, count=stride * h)
+        return buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
+
+    @staticmethod
+    def _similar_region(composed: QImage, x: int, y: int, tolerance_pct: int) -> np.ndarray:
+        """(x, y)와 이어진, 허용 범위 내 비슷한 색 픽셀의 bool 마스크를 구한다 (채우기·매직툴 공용).
+
+        Args:
+            composed: 화면에 보이는 합성 결과 (ARGB32, 캔버스 크기).
+            x: 기준 픽셀 x.
+            y: 기준 픽셀 y.
+            tolerance_pct: 채널별 최대 허용 차이 (0~100%, 255 기준).
+
+        Returns:
+            (h, w) bool 배열.
+        """
+        w, h = composed.width(), composed.height()
+        stride = composed.bytesPerLine()
+        buf = np.frombuffer(composed.constBits(), dtype=np.uint8, count=stride * h)
+        arr = buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4).astype(np.int16)
+        # 완전 투명 픽셀의 RGB는 합성 과정에서 임의값(보통 0)이 되어 의미가
+        # 없으므로 0으로 정규화한 뒤, 알파를 네 번째 비교 채널로 함께 쓴다.
+        # RGB만 비교하면 알파만 다른 투명 배경과 같은 색 도형(예: 검은 아이콘
+        # + 투명 배경)이 한 영역으로 이어져 배경까지 함께 채워진다.
+        arr[arr[:, :, 3] == 0, :3] = 0
+
+        target = arr[y, x]
+        threshold = tolerance_pct / 100 * 255
+        mask = np.all(np.abs(arr - target) <= threshold, axis=2)
+        labeled, _ = ndimage.label(mask)
+        return labeled == labeled[y, x]
 
     # ---------- 핸들 공통 ---------- #
     def _handle_size_scene(self) -> float:
@@ -1571,6 +1890,11 @@ class CanvasView(QGraphicsView):
                     painter.drawRect(hr)
             painter.restore()
 
+        if self.has_magic_selection():
+            painter.save()
+            self._draw_magic_ants(painter)
+            painter.restore()
+
         if self.tool == "text" and self._text_state == "dragging":
             painter.save()
             pen = QPen(ACCENT)
@@ -1669,8 +1993,16 @@ class CanvasView(QGraphicsView):
                 self._draw_press(event.position().toPoint())
                 event.accept()
                 return
+            if self.tool == "magic":
+                mods = event.modifiers()
+                mode = ("add" if mods & Qt.KeyboardModifier.ShiftModifier
+                        else "subtract" if mods & Qt.KeyboardModifier.AltModifier else "replace")
+                self.magic_select_at(event.position().toPoint(), mode)
+                event.accept()
+                return
             if self.tool == "fill":
-                self.fill_at(event.position().toPoint())
+                if not self._fill_magic_selection_at(event.position().toPoint()):
+                    self.fill_at(event.position().toPoint())
                 event.accept()
                 return
             if self.tool == "text":
@@ -1783,31 +2115,27 @@ class CanvasView(QGraphicsView):
         if self._text_overlay is not None:
             self._commit_text_overlay()
 
+        meta: dict = {}
         if existing_item is not None:
             rect = QRectF(existing_item.pos(), QSizeF(existing_item.pixmap().size()))
             meta = self._text_meta.get(id(existing_item), {})
-            text = meta.get("text", "")
-            font = QFont(meta.get("font", self.text_font))
-            color = QColor(meta.get("color", self.text_color))
-            align_h = meta.get("align_h", self.text_align_h)
-        else:
-            text = ""
-            font = QFont(self.text_font)
-            color = QColor(self.text_color)
-            align_h = self.text_align_h
 
         if rect is None:
             return
         self._text_editing_item = existing_item
         self._text_new_rect = QRectF(rect) if existing_item is None else None
+        self._text_edit_base = {"font": QFont(meta.get("font", self.text_font)),
+                                "color": QColor(meta.get("color", self.text_color)),
+                                "align_h": meta.get("align_h", self.text_align_h),
+                                "align_v": meta.get("align_v", self.text_align_v)}
+        self._text_edit_scale = self.transform().m11() or 1.0
 
         overlay = _TextEditOverlay(self.viewport())
         top_left = self.mapFromScene(rect.topLeft())
         bottom_right = self.mapFromScene(rect.bottomRight())
         size = QSize(max(bottom_right.x() - top_left.x(), 1), max(bottom_right.y() - top_left.y(), 1))
         overlay.setGeometry(QRect(top_left, size))
-        overlay.text_edit.setPlainText(text)
-        self._style_text_edit(overlay.text_edit, font, color, align_h)
+        self._load_text_edit(overlay.text_edit, meta.get("text", ""), meta.get("html"))
         overlay.closed.connect(self._commit_text_overlay)
         overlay.cancelled.connect(self._discard_text_overlay)
         self._text_overlay = overlay
@@ -1816,30 +2144,31 @@ class CanvasView(QGraphicsView):
         overlay.text_edit.setFocus()
         overlay.text_edit.selectAll()
 
-    def _style_text_edit(self, text_edit: QTextEdit, font: QFont, color: QColor, align_h: str) -> None:
-        """편집 중인 텍스트칸에 폰트/색/가로 정렬을 실시간으로 반영한다.
-
-        세로 정렬은 QTextEdit이 내용 세로 정렬을 지원하지 않아 여기서는
-        반영하지 않고, 최종 래스터화(_rasterize_text) 시점에만 적용한다.
+    def _load_text_edit(self, text_edit: QTextEdit, text: str, html: Optional[str]) -> None:
+        """편집칸에 박스 내용과 서식(_text_edit_base 기본값 + 글자·문단별 서식)을 채운다.
 
         편집칸은 확대/축소 배율과 무관한 일반 위젯이지만, 최종 텍스트는
         래스터화된 픽스맵으로 캔버스에 얹혀 화면 배율만큼 함께 확대/축소된다.
         편집 중 보이는 글자 크기가 완성 후 크기와 다르게 느껴지지 않도록,
-        여기서도 현재 화면 배율을 곱해 같은 크기로 보이게 맞춘다.
+        여기서도 모든 글자 크기에 화면 배율을 곱해 같은 크기로 보이게 맞춘다
+        (확정 시 _commit_text_overlay에서 배율을 되돌린다).
         """
-        scale = self.transform().m11() or 1.0
-        display_font = QFont(font)
-        display_font.setPointSizeF(max(font.pointSizeF(), 1.0) * scale)
+        base = self._text_edit_base
+        display_font = QFont(base["font"])
+        display_font.setPointSizeF(max(base["font"].pointSizeF(), 1.0) * self._text_edit_scale)
         text_edit.setFont(display_font)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(color))
-        cursor = text_edit.textCursor()
-        cursor.select(QTextCursor.SelectionType.Document)
-        cursor.mergeCharFormat(fmt)
-        text_edit.mergeCurrentCharFormat(fmt)
-        h_flags = {"left": Qt.AlignmentFlag.AlignLeft, "center": Qt.AlignmentFlag.AlignHCenter,
-                   "right": Qt.AlignmentFlag.AlignRight}
-        text_edit.setAlignment(h_flags.get(align_h, Qt.AlignmentFlag.AlignLeft))
+        if html:
+            text_edit.setHtml(html)
+            scale_point_sizes(text_edit.document(), self._text_edit_scale)
+        else:
+            text_edit.setPlainText(text)
+            text_edit.selectAll()
+            text_edit.setAlignment(h_align_flag(base["align_h"]))
+            # 선택이 있으면 전체 글자에, 빈 박스면 앞으로 입력할 글자에 기본 색을 적용한다.
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(base["color"]))
+            text_edit.mergeCurrentCharFormat(fmt)
+        text_edit.document().clearUndoRedoStacks()
 
     def commit_text_editing(self) -> None:
         """편집 중인 텍스트 오버레이가 있으면 반영하고 닫는다 (없으면 아무 동작 없음)."""
@@ -1866,6 +2195,11 @@ class CanvasView(QGraphicsView):
             return
         overlay = self._text_overlay
         text = overlay.text_edit.toPlainText()
+        base = self._text_edit_base
+        # 편집칸의 글자 크기는 화면 배율이 곱해져 있으므로 실제 크기로 되돌려 보관한다.
+        doc = overlay.text_edit.document().clone()
+        scale_point_sizes(doc, 1.0 / self._text_edit_scale)
+        doc.setDefaultFont(QFont(base["font"]))
         existing = self._text_editing_item
         rect = (QRectF(existing.pos(), QSizeF(existing.pixmap().size()))
                 if existing is not None else self._text_new_rect)
@@ -1886,10 +2220,9 @@ class CanvasView(QGraphicsView):
 
         if rect is None:
             return
-        pixmap = self._rasterize_text(text, self.text_font, self.text_color,
-                                       self.text_align_h, self.text_align_v, rect.size())
-        meta = {"text": text, "font": QFont(self.text_font), "color": QColor(self.text_color),
-                "align_h": self.text_align_h, "align_v": self.text_align_v}
+        meta = {"text": text, "html": doc.toHtml(), "font": QFont(base["font"]),
+                "color": QColor(base["color"]), "align_h": base["align_h"], "align_v": base["align_v"]}
+        pixmap = rasterize_document(doc, meta["color"], meta["align_v"], rect.size())
         self._push_undo()
         if existing is not None:
             existing.setPixmap(pixmap)
@@ -1914,26 +2247,6 @@ class CanvasView(QGraphicsView):
         self._text_new_rect = None
         overlay.setParent(None)
         overlay.deleteLater()
-
-    @staticmethod
-    def _rasterize_text(text: str, font: QFont, color: QColor, align_h: str, align_v: str,
-                         size: QSizeF) -> QPixmap:
-        """텍스트를 지정한 폰트/색/정렬로 지정 크기의 투명 배경 픽스맵에 그린다."""
-        w = max(int(round(size.width())), 1)
-        h = max(int(round(size.height())), 1)
-        pixmap = QPixmap(w, h)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setFont(font)
-        painter.setPen(QColor(color))
-        h_flags = {"left": Qt.AlignmentFlag.AlignLeft, "center": Qt.AlignmentFlag.AlignHCenter,
-                   "right": Qt.AlignmentFlag.AlignRight}[align_h]
-        v_flags = {"top": Qt.AlignmentFlag.AlignTop, "middle": Qt.AlignmentFlag.AlignVCenter,
-                   "bottom": Qt.AlignmentFlag.AlignBottom}[align_v]
-        painter.drawText(pixmap.rect(), int(h_flags | v_flags | Qt.TextFlag.TextWordWrap), text)
-        painter.end()
-        return pixmap
 
     # ---------- 도형/선 ---------- #
     def _shape_press(self, view_pos: QPoint) -> None:
@@ -2342,20 +2655,7 @@ class CanvasView(QGraphicsView):
         if not (0 <= x < w and 0 <= y < h):
             return False
 
-        stride = composed.bytesPerLine()
-        buf = np.frombuffer(composed.constBits(), dtype=np.uint8, count=stride * h)
-        arr = buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4).astype(np.int16)
-        # 완전 투명 픽셀의 RGB는 합성 과정에서 임의값(보통 0)이 되어 의미가
-        # 없으므로 0으로 정규화한 뒤, 알파를 네 번째 비교 채널로 함께 쓴다.
-        # RGB만 비교하면 알파만 다른 투명 배경과 같은 색 도형(예: 검은 아이콘
-        # + 투명 배경)이 한 영역으로 이어져 배경까지 함께 채워진다.
-        arr[arr[:, :, 3] == 0, :3] = 0
-
-        target = arr[y, x]
-        threshold = self.fill_tolerance / 100 * 255
-        mask = np.all(np.abs(arr - target) <= threshold, axis=2)
-        labeled, _ = ndimage.label(mask)
-        region = labeled == labeled[y, x]
+        region = self._similar_region(composed, x, y, self.fill_tolerance)
 
         # 클릭 지점에서 보이는 최상단 아이템을 찾고, 그 아이템이 위 아이템에
         # 가려지지 않은 부분으로 채울 영역을 제한한다. 아무 아이템도 없는 빈
@@ -2454,6 +2754,8 @@ class CanvasView(QGraphicsView):
                 # 붙여넣은/텍스트/도형 아이템 내부: 드래그로 이동 가능함을 사방
                 # 화살표 커서로 미리 알려준다.
                 self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
+            elif self.tool == "magic":
+                self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             else:
                 self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
@@ -2476,7 +2778,7 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
 
-        if self.tool == "fill":
+        if self.tool in ("fill", "magic"):
             event.accept()
             return
 
@@ -2576,7 +2878,7 @@ class CanvasView(QGraphicsView):
             self._draw_release()
             event.accept()
             return
-        if self.tool == "fill":
+        if self.tool in ("fill", "magic"):
             event.accept()
             return
         if self.tool == "text":
@@ -2629,9 +2931,12 @@ class CanvasView(QGraphicsView):
             self.viewport().update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        """선택 도구에서 Esc로 선택 영역을 취소한다."""
+        """Esc로 선택 도구의 사각형 선택 또는 매직툴 선택을 취소한다."""
         if self.tool == "select" and event.key() == Qt.Key.Key_Escape and self.has_selection():
             self.clear_selection()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.has_magic_selection():
+            self.clear_magic_selection()
             return
         super().keyPressEvent(event)
 

@@ -58,6 +58,8 @@ from capture.text_settings import TextSettingsPanel
 
 logger = logging.getLogger(__name__)
 
+_MAGIC_ARROW_PX = 12   # 매직툴 버튼 오른쪽 ▼(허용범위 메뉴) 영역 폭
+
 
 class _ClickableLabel(QLabel):
     """클릭을 신호로 알리는 QLabel (배율 표시 클릭 시 입력 팝업을 띄우는 데 사용)."""
@@ -185,6 +187,8 @@ class MainWindow(QMainWindow):
 
         self._draw_color = QColor(self.settings.value("draw_color", DEFAULT_DRAW_COLOR))
         self._fill_tolerance = int(str(self.settings.value("fill_tolerance", DEFAULT_FILL_TOLERANCE)))
+        saved_magic_tolerance = int(str(self.settings.value("magic_tolerance", DEFAULT_FILL_TOLERANCE)))
+        self._magic_tolerance = min(max(saved_magic_tolerance, FILL_TOLERANCE_MIN), FILL_TOLERANCE_MAX)
         self._new_canvas_width = int(str(self.settings.value("new_canvas_width", DEFAULT_NEW_CANVAS_WIDTH)))
         self._new_canvas_height = int(str(self.settings.value("new_canvas_height", DEFAULT_NEW_CANVAS_HEIGHT)))
         self._new_canvas_bg_color = QColor(
@@ -541,6 +545,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"채우기 허용 범위: {value}%", 2500)
         logger.info("채우기 허용 범위 변경: %d%%", value)
 
+    def _open_magic_tolerance_dialog(self) -> None:
+        """매직툴 허용 범위(%)를 입력받아 설정에 저장한다 (채우기 허용 범위와 별도)."""
+        value, ok = self._get_int(
+            "허용 범위", "매직툴 허용 범위 (%):\n(0 = 정확히 같은 색만, 100 = 거의 모든 인접 영역)",
+            self._magic_tolerance, FILL_TOLERANCE_MIN, FILL_TOLERANCE_MAX)
+        if not ok:
+            return
+        self._magic_tolerance = value
+        self.settings.setValue("magic_tolerance", value)
+        v = self.current_view()
+        if v is not None:
+            v.set_magic_tolerance(value)
+        self.statusBar().showMessage(f"매직툴 허용 범위: {value}%", 2500)
+        logger.info("매직툴 허용 범위 변경: %d%%", value)
+
     def _build_thickness_button(self) -> None:
         """'두께' 버튼(1~10px 하위 메뉴)을 구성한다."""
         self._thickness_group = QActionGroup(self)
@@ -714,6 +733,34 @@ class MainWindow(QMainWindow):
             "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }")
         self._close_all_btn.clicked.connect(self._close_all_tabs)
 
+        # 매직툴은 '모든 탭 닫기' 아래 빈 칸에 아이콘만 둔다. 다른 도구와 같은
+        # 그룹(_tool_group)에 넣어 배타적으로 선택되며, 오른쪽 ▾에서 허용 범위를 고른다.
+        self._magic_action = QAction(QIcon(str(get_resource_path("img/magic-tool.png"))), "매직툴", self)
+        self._magic_action.setCheckable(True)
+        self._magic_action.setToolTip(
+            "매직툴 (클릭한 지점과 비슷한 색 영역 선택, Shift+클릭 추가 / Alt+클릭 빼기 / Esc 해제)\n"
+            "Ctrl+C 복사, Ctrl+X 잘라내기, Delete 지우기, 채우기 도구로 영역 안 클릭 시 전체 채우기")
+        self._magic_action.triggered.connect(lambda: self._set_tool("magic"))
+        self._tool_group.addAction(self._magic_action)
+        magic_menu = QMenu(self)
+        magic_tolerance_action = QAction("허용범위...", self)
+        magic_tolerance_action.triggered.connect(self._open_magic_tolerance_dialog)
+        magic_menu.addAction(magic_tolerance_action)
+        self._magic_btn = QToolButton()
+        self._magic_btn.setDefaultAction(self._magic_action)
+        self._magic_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._magic_btn.setIconSize(QSize(MINI_TOOL_ICON_PX, MINI_TOOL_ICON_PX))
+        self._magic_btn.setMenu(magic_menu)
+        self._magic_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        # 스타일시트를 쓰면 ▼(menu-button) 자리가 따로 잡히지 않아 아이콘 위에 겹치므로,
+        # 오른쪽 padding으로 ▼ 폭만큼 공간을 확보하고 그 안에 ▼를 둔다.
+        self._magic_btn.setStyleSheet(
+            f"QToolButton {{ padding-right: {_MAGIC_ARROW_PX}px; }}"
+            f"QToolButton::menu-button {{ width: {_MAGIC_ARROW_PX}px; border: none; }}"
+            "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
+            "QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
+            "QToolButton:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }")
+
         # 네 버튼 너비를 통일해 화살표(v)가 텍스트 길이와 무관하게 항상
         # 같은 위치(오른쪽 끝)에 오도록 한다. 폭을 맞추지 않으면 짧은 글자의
         # 버튼(효과/회전)은 화살표가 글자 바로 옆에 붙어버린다.
@@ -729,7 +776,9 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(4)
-        grid.addWidget(self._close_all_btn, 0, 0)
+        # 매직툴은 ▼ 폭만큼 넓으므로 두 버튼을 왼쪽 정렬해 아이콘의 세로 줄을 맞춘다.
+        grid.addWidget(self._close_all_btn, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        grid.addWidget(self._magic_btn, 1, 0, Qt.AlignmentFlag.AlignLeft)
         grid.addWidget(self._make_mini_group_divider(), 0, 1, 2, 1)
         grid.addWidget(effect_btn, 0, 2)
         grid.addWidget(rotate_btn, 0, 3)
@@ -998,7 +1047,12 @@ class MainWindow(QMainWindow):
         self.settings.setValue("text_color", self._text_settings.color().name())
         self.settings.setValue("text_align_h", self._text_settings.align_h())
         self.settings.setValue("text_align_v", self._text_settings.align_v())
-        self._sync_view(self.current_view())
+        # _sync_view()는 set_tool()을 거치며 편집 중인 텍스트 박스를 확정해 버리므로,
+        # 편집 중 블록한 글자에 서식을 적용할 수 있도록 텍스트 옵션만 전달한다.
+        v = self.current_view()
+        if v is not None:
+            v.set_text_options(self._text_settings.current_font(), self._text_settings.color(),
+                               self._text_settings.align_h(), self._text_settings.align_v())
 
     def _sync_view(self, v: Optional[CanvasView]) -> None:
         """현재 도구·그리기/텍스트 옵션·채우기 허용범위를 지정한 캔버스에 반영한다."""
@@ -1008,6 +1062,7 @@ class MainWindow(QMainWindow):
         v.set_draw_options(self._draw_subtool, self._draw_thickness, self._draw_color)
         v.set_shape_subtool(self._shape_subtool)
         v.set_fill_tolerance(self._fill_tolerance)
+        v.set_magic_tolerance(self._magic_tolerance)
         v.set_text_options(self._text_settings.current_font(), self._text_settings.color(),
                             self._text_settings.align_h(), self._text_settings.align_v())
 
@@ -1571,6 +1626,12 @@ class MainWindow(QMainWindow):
         if v is None:
             return
         v.commit_pending_edit()
+        if v.has_magic_selection():
+            img = v.render_magic_selection()
+            if img is not None:
+                QGuiApplication.clipboard().setImage(img)
+                self.statusBar().showMessage("매직툴 선택 영역을 클립보드에 복사했습니다.", 2000)
+            return
         if v.has_selection():
             img = v.render_selection()
             if img is not None:
@@ -1586,7 +1647,7 @@ class MainWindow(QMainWindow):
         if v is None:
             return
         v.commit_pending_edit()
-        img = v.cut_selection()
+        img = v.cut_magic_selection() if v.has_magic_selection() else v.cut_selection()
         if img is None:
             self.statusBar().showMessage("선택 영역이 없습니다. 먼저 선택 도구로 영역을 지정하세요.", 3000)
             return

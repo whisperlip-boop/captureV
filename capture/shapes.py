@@ -18,12 +18,14 @@ SHAPE_KINDS: list[tuple[str, str]] = [
     ("triangle", "삼각형"), ("diamond", "마름모"), ("pentagon", "오각형"), ("hexagon", "육각형"),
 ]
 LINE_KINDS: list[tuple[str, str]] = [
-    ("line", "직선"), ("line_arrow", "직선 (끝점 화살표)"),
+    ("line", "직선"), ("line_arrow", "직선 (끝점 화살표)"), ("line_double_arrow", "직선 (양끝 화살표)"),
     ("freehand", "자유곡선"), ("freehand_arrow", "자유곡선 (끝점 화살표)"),
+    ("freehand_double_arrow", "자유곡선 (양끝 화살표)"),
 ]
 _LINE_KIND_KEYS: frozenset[str] = frozenset(key for key, _ in LINE_KINDS)
-FREEHAND_KINDS: frozenset[str] = frozenset({"freehand", "freehand_arrow"})
-ARROW_KINDS: frozenset[str] = frozenset({"line_arrow", "freehand_arrow"})
+FREEHAND_KINDS: frozenset[str] = frozenset({"freehand", "freehand_arrow", "freehand_double_arrow"})
+DOUBLE_ARROW_KINDS: frozenset[str] = frozenset({"line_double_arrow", "freehand_double_arrow"})
+ARROW_KINDS: frozenset[str] = frozenset({"line_arrow", "freehand_arrow"}) | DOUBLE_ARROW_KINDS
 
 DEFAULT_ROUNDED_RADIUS_RATIO = 0.25   # 둥근 사각형 기본 모서리 반지름 = 짧은 변 * 이 비율
 MAX_ROUNDED_RADIUS_RATIO = 0.5        # 이 비율에서 짧은 변 양 끝이 완전한 반원이 된다
@@ -125,24 +127,38 @@ def _draw_open_arrowhead(painter: QPainter, tip: QPointF, direction_angle_rad: f
 
 
 def draw_line_kind(painter: QPainter, kind: str, p1: QPointF, p2: QPointF, thickness: float) -> None:
-    """직선 종류(line/line_arrow)를 p1->p2 방향으로 그린다."""
+    """직선 종류(line/line_arrow/line_double_arrow)를 p1->p2 방향으로 그린다."""
     painter.drawLine(p1, p2)
     if kind in ARROW_KINDS:
         angle = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
         _draw_open_arrowhead(painter, p2, angle, thickness)
+    if kind in DOUBLE_ARROW_KINDS:
+        _draw_open_arrowhead(painter, p1, angle + math.pi, thickness)
 
 
 def draw_bezier_kind(painter: QPainter, kind: str, points: Sequence[QPointF], thickness: float) -> None:
-    """자유곡선 종류(freehand/freehand_arrow)를 4개 제어점(시작/제어1/제어2/끝)의
-    3차 베지에(cubic Bezier) 곡선으로 그린다."""
+    """자유곡선 종류(freehand/freehand_arrow/freehand_double_arrow)를 4개 제어점
+    (시작/제어1/제어2/끝)의 3차 베지에(cubic Bezier) 곡선으로 그린다."""
     p0, p1, p2, p3 = points
     path = QPainterPath()
     path.moveTo(p0)
     path.cubicTo(p1, p2, p3)
     painter.drawPath(path)
     if kind in ARROW_KINDS:
-        angle = math.atan2(p3.y() - p2.y(), p3.x() - p2.x())
-        _draw_open_arrowhead(painter, p3, angle, thickness)
+        _draw_open_arrowhead(painter, p3, _tangent_angle(p2, p3, (p1, p0)), thickness)
+    if kind in DOUBLE_ARROW_KINDS:
+        _draw_open_arrowhead(painter, p0, _tangent_angle(p1, p0, (p2, p3)), thickness)
+
+
+def _tangent_angle(control: QPointF, end: QPointF, fallbacks: Sequence[QPointF]) -> float:
+    """베지에 끝점에서 바깥쪽을 향하는 접선 각도(rad).
+
+    제어점이 끝점과 겹치면 접선이 정의되지 않으므로, 다음 제어점을 차례로 대신 쓴다.
+    """
+    for ref in (control, *fallbacks):
+        if ref != end:
+            return math.atan2(end.y() - ref.y(), end.x() - ref.x())
+    return 0.0
 
 
 def make_icon_pixmap(kind: str, size: int, margin: int = 5) -> QPixmap:

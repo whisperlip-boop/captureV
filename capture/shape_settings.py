@@ -14,6 +14,7 @@ from capture.config import SHAPE_ICON_PX, get_resource_path
 from capture.shapes import LINE_KINDS, SHAPE_KINDS, make_icon_pixmap
 
 _SHAPE_GRID_COLUMNS = 4
+_LINE_GRID_COLUMNS = 3   # 한 줄에 직선 계열, 다음 줄에 자유곡선 계열
 
 # 준비된 이미지 파일을 쓴다. 없는 종류만 make_icon_pixmap()으로 대체 생성한다.
 _CUSTOM_ICON_FILES: dict[str, str] = {
@@ -27,8 +28,10 @@ _CUSTOM_ICON_FILES: dict[str, str] = {
     "hexagon": "hexagon.png",
     "line": "diagonal-line.png",
     "line_arrow": "diagonal-line-arrow.png",
+    "line_double_arrow": "doublehead-arrow.png",
     "freehand": "free-curved.png",
     "freehand_arrow": "free-curved-arrow.png",
+    "freehand_double_arrow": "doubelhead-free-curved-arrow .png",
 }
 
 _TOGGLE_STYLE = (
@@ -39,7 +42,7 @@ _TOGGLE_STYLE = (
 
 
 class ShapeSubtoolPanel(QWidget):
-    """도형(사각형/타원/.../육각형) + 선(직선/자유곡선, 화살표 유무) 갤러리."""
+    """도형(사각형/타원/.../육각형) + 선(직선/자유곡선, 화살표 없음/끝점/양끝) 갤러리."""
 
     subtoolChosen = Signal(str)
 
@@ -65,7 +68,7 @@ class ShapeSubtoolPanel(QWidget):
         layout.addWidget(QLabel("도형"))
         layout.addLayout(self._make_grid(SHAPE_KINDS, _SHAPE_GRID_COLUMNS))
         layout.addWidget(QLabel("선"))
-        layout.addLayout(self._make_grid(LINE_KINDS, len(LINE_KINDS)))
+        layout.addLayout(self._make_grid(LINE_KINDS, _LINE_GRID_COLUMNS))
 
     def _make_grid(self, kinds: list[tuple[str, str]], columns: int) -> QGridLayout:
         """kinds의 각 항목을 아이콘 버튼으로 만들어 격자에 배치한다."""
