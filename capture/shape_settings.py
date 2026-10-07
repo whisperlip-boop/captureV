@@ -31,7 +31,7 @@ _CUSTOM_ICON_FILES: dict[str, str] = {
     "line_double_arrow": "doublehead-arrow.png",
     "freehand": "free-curved.png",
     "freehand_arrow": "free-curved-arrow.png",
-    "freehand_double_arrow": "doubelhead-free-curved-arrow.png",
+    "freehand_double_arrow": "doublehead-free-curved-arrow.png",
 }
 
 _TOGGLE_STYLE = (
