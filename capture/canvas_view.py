@@ -25,7 +25,8 @@ from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHE
                              SHARPEN_SIGMA, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN,
                              get_key_repeat_delay_ms)
 from capture.rich_text import (apply_to_whole_document, build_document, char_format_changes,
-                               h_align_flag, rasterize_document, scale_point_sizes, scaled_char_format)
+                               h_align_flag, rasterize_document, restore_point_sizes, scale_for_display,
+                               scaled_char_format)
 from capture.shapes import (ARROW_KINDS, DEFAULT_ROUNDED_RADIUS_RATIO, FREEHAND_KINDS,
                              arrowhead_length, clamp_radius_ratio, draw_bbox_shape, draw_bezier_kind,
                              draw_line_kind, is_line_kind, lock_square, rounded_radius,
@@ -172,11 +173,15 @@ class CanvasView(QGraphicsView):
         # sceneRect. 캔버스 크기/원점이 바뀌면 좌표가 어긋나므로 무효로 본다.
         self._magic_mask: Optional[np.ndarray] = None
         self._magic_scene_rect: QRectF = QRectF()
-        # 점선 표시용: 마스크 안쪽 경계 픽셀 좌표(ys, xs), 그 경계를 감싸는 사각형의
-        # 좌상단(캔버스 픽셀 좌표), 그리고 점선을 그려 넣는 이미지와 마지막으로 그린 phase.
+        # 점선 표시용. _magic_edge는 마스크의 경계 픽셀 좌표(ys, xs), _magic_bbox는
+        # 마스크를 감싸는 사각형(x0, y0, x1, y1). 나머지는 현재 뷰(배율·스크롤)에서
+        # 화면에 보이는 부분만 화면 픽셀 단위로 만든 점선 이미지와 그 캐시 키다.
         self._magic_edge: tuple[np.ndarray, np.ndarray] = (np.empty(0, int), np.empty(0, int))
+        self._magic_bbox: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._magic_ants_key: tuple = ()
         self._magic_ants_origin: QPoint = QPoint()
         self._magic_ants_image: Optional[QImage] = None
+        self._magic_ants_edge: tuple[np.ndarray, np.ndarray] = (np.empty(0, int), np.empty(0, int))
         self._magic_ants_phase_drawn: int = -1
         self.magic_tolerance: int = DEFAULT_FILL_TOLERANCE
         self._select_origin: Optional[QPointF] = None
@@ -282,28 +287,84 @@ class CanvasView(QGraphicsView):
         painter.drawRect(rect)
 
     def _draw_magic_ants(self, painter: QPainter) -> None:
-        """매직툴 선택의 경계 픽셀을 검은색/흰색이 번갈아 움직이는 점선으로 그린다.
+        """매직툴 선택의 경계를 검은색/흰색이 번갈아 움직이는 1픽셀 점선으로 그린다.
 
         경계가 복잡하면(노이즈가 많은 사진 등) 선분이 수십만 개가 되어 매
         프레임 선으로 그리기엔 너무 느리므로, 경계 픽셀에 직접 색을 넣은
-        이미지 한 장으로 그린다. phase가 바뀔 때만 색을 다시 칠한다.
+        이미지로 그린다. 확대/축소와 무관하게 항상 화면 1픽셀 두께가 되도록
+        이미지는 뷰 변환을 거치지 않는 화면 픽셀 단위로, 화면에 보이는 부분만
+        만든다. 뷰(배율·스크롤)가 바뀔 때만 다시 만들고, phase가 바뀔 때만
+        색을 다시 칠한다.
         """
-        if self._magic_ants_image is None:
+        if self._magic_mask is None:
+            return
+        if not self._update_magic_ants_image():
             return
         phase = int(self._marching_ants_phase)
         if phase != self._magic_ants_phase_drawn:
-            ys, xs = self._magic_edge
-            ox, oy = self._magic_ants_origin.x(), self._magic_ants_origin.y()
+            ys, xs = self._magic_ants_edge
             white = ((xs + ys + phase) // 4) % 2 == 1
-            arr = self._image_view(self._magic_ants_image)
-            arr[ys - oy, xs - ox] = [0, 0, 0, 255]
-            arr[ys[white] - oy, xs[white] - ox] = [255, 255, 255, 255]
+            arr = self._image_array(self._magic_ants_image)
+            arr[ys, xs] = [0, 0, 0, 255]
+            arr[ys[white], xs[white]] = [255, 255, 255, 255]
             self._magic_ants_phase_drawn = phase
-        scene_rect = self._magic_scene_rect
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-        painter.drawImage(QPointF(scene_rect.left() + self._magic_ants_origin.x(),
-                                  scene_rect.top() + self._magic_ants_origin.y()),
-                          self._magic_ants_image)
+        painter.resetTransform()
+        painter.drawImage(self._magic_ants_origin, self._magic_ants_image)
+
+    def _update_magic_ants_image(self) -> bool:
+        """현재 뷰에서 보이는 선택 경계를 화면 픽셀 단위 이미지로 (필요할 때만) 다시 만든다.
+
+        화면 픽셀마다 그 중심에 해당하는 마스크 픽셀을 취해 화면 해상도의
+        마스크를 만들고, 그 경계를 점선 픽셀로 삼는다. 축소 시에는 이 표본
+        추출로 얇은 부분이 건너뛰어 사라질 수 있어, 원본 경계 픽셀을 화면
+        좌표로 옮겨 모두 함께 찍는다.
+
+        Returns:
+            그릴 것이 있는지 여부 (선택이 화면 밖이면 False).
+        """
+        t = self.viewportTransform()
+        scale = t.m11() or 1.0
+        sr = self._magic_scene_rect
+        bx0, by0, bx1, by1 = self._magic_bbox
+        selection_scene = QRectF(sr.left() + bx0, sr.top() + by0, bx1 - bx0, by1 - by0)
+        visible_scene = t.inverted()[0].mapRect(QRectF(self.viewport().rect()))
+        roi = selection_scene.intersected(visible_scene)
+        if roi.isEmpty():
+            return False
+        dev = t.mapRect(roi)
+        dx0, dy0 = int(math.floor(dev.left())), int(math.floor(dev.top()))
+        dw = int(math.ceil(dev.right())) - dx0
+        dh = int(math.ceil(dev.bottom())) - dy0
+        if dw <= 0 or dh <= 0:
+            return False
+        key = (dx0, dy0, dw, dh, scale, t.dx(), t.dy())
+        if key == self._magic_ants_key:
+            return True
+
+        mask = self._magic_mask
+        mh, mw = mask.shape
+        # 사방 1픽셀 넓게 표본을 떠서, 화면 가장자리에 잘린 부분은 경계로 치지 않고
+        # 마스크(캔버스) 밖은 선택 밖으로 쳐 캔버스 가장자리에 닿은 선택도 테두리가 생긴다.
+        xi = np.floor((np.arange(-1, dw + 1) + dx0 + 0.5 - t.dx()) / scale - sr.left()).astype(int)
+        yi = np.floor((np.arange(-1, dh + 1) + dy0 + 0.5 - t.dy()) / scale - sr.top()).astype(int)
+        valid = ((yi >= 0) & (yi < mh))[:, None] & ((xi >= 0) & (xi < mw))[None, :]
+        sampled = mask[np.clip(yi, 0, mh - 1)[:, None], np.clip(xi, 0, mw - 1)[None, :]] & valid
+        if scale < 1.0:
+            ey, ex = self._magic_edge
+            px = np.floor((ex + 0.5 + sr.left()) * scale + t.dx()).astype(int) - dx0 + 1
+            py = np.floor((ey + 0.5 + sr.top()) * scale + t.dy()).astype(int) - dy0 + 1
+            keep = (px >= 0) & (px < dw + 2) & (py >= 0) & (py < dh + 2)
+            sampled[py[keep], px[keep]] = True
+        interior = (sampled[:-2, 1:-1] & sampled[2:, 1:-1] & sampled[1:-1, :-2] & sampled[1:-1, 2:])
+        ys, xs = np.nonzero(sampled[1:-1, 1:-1] & ~interior)
+
+        self._magic_ants_key = key
+        self._magic_ants_origin = QPoint(dx0, dy0)
+        self._magic_ants_edge = (ys, xs)
+        self._magic_ants_image = QImage(dw, dh, QImage.Format.Format_ARGB32)
+        self._magic_ants_image.fill(Qt.GlobalColor.transparent)
+        self._magic_ants_phase_drawn = -1
+        return True
 
     def _add_pixmap(self, pixmap: QPixmap, pos: QPoint, movable: bool = True) -> QGraphicsPixmapItem:
         """씬에 선택 가능한 픽스맵 아이템을 추가한다.
@@ -339,7 +400,11 @@ class CanvasView(QGraphicsView):
         return item
 
     def _resize_draw_layer(self, new_rect: QRectF, old_rect: QRectF) -> None:
-        """씬 크기가 바뀔 때 그리기 레이어를 새 크기로 만들고 기존 내용을 그대로 옮긴다."""
+        """씬 크기가 바뀔 때 그리기 레이어를 새 크기로 만들고 기존 내용을 그대로 옮긴다.
+
+        매직툴 선택 마스크는 캔버스 픽셀 좌표 기준이라 함께 무효화한다.
+        """
+        self.clear_magic_selection()
         new_pm = QPixmap(max(int(round(new_rect.width())), 1), max(int(round(new_rect.height())), 1))
         new_pm.fill(Qt.GlobalColor.transparent)
         painter = QPainter(new_pm)
@@ -406,6 +471,7 @@ class CanvasView(QGraphicsView):
             if "shape_meta" in entry:
                 self._shape_meta[id(item)] = dict(entry["shape_meta"])
         self._scene.setSceneRect(snapshot["scene_rect"])
+        self.clear_magic_selection()
         self._select_rect = QRectF(snapshot.get("select_rect", QRectF()))
         self._transparent_background = snapshot.get("transparent_background", self._transparent_background)
         self.changed.emit()
@@ -496,7 +562,7 @@ class CanvasView(QGraphicsView):
         지운다 (클립보드에는 넣지 않는다).
         """
         if self.has_magic_selection():
-            self.cut_magic_selection()
+            self._erase_magic_selection()
             return
         targets = [it for it in self._scene.selectedItems() if it is not self.base_item]
         if not targets:
@@ -690,6 +756,7 @@ class CanvasView(QGraphicsView):
         수 없다 (모두 하나의 배경으로 합쳐짐).
         """
         self._push_undo()
+        self.clear_magic_selection()
         for it in list(self._scene.items()):
             self._scene.removeItem(it)
         self._text_meta = {}
@@ -722,7 +789,10 @@ class CanvasView(QGraphicsView):
         """대상 영역(선택 있으면 그 영역, 없으면 전체)에 transform을 적용해 같은 자리에 그려 넣는다.
 
         회전 180도/대칭 이동처럼 가로세로 크기가 바뀌지 않는 변형에 쓴다.
+        매직툴 선택은 이런 효과의 대상이 아니므로(사각형 선택만 적용), 선택이
+        남아 있는 채로 전체가 바뀌어 혼동되지 않도록 먼저 지운다.
         """
+        self.clear_magic_selection()
         image = self.render_image()
         x0, y0, w, h = self._target_pixel_rect(image)
         if w <= 0 or h <= 0:
@@ -1292,17 +1362,12 @@ class CanvasView(QGraphicsView):
 
     # ---------- 매직툴 선택 ---------- #
     def has_magic_selection(self) -> bool:
-        """유효한 매직툴 선택이 있는지 여부.
+        """매직툴 선택이 있는지 여부.
 
-        선택 후 캔버스 크기/원점이 바뀌었으면(여백 조절, 회전, 실행 취소 등)
-        마스크 좌표가 더 이상 맞지 않으므로 선택을 지우고 False를 반환한다.
+        마스크는 캔버스 픽셀 좌표 기준이라 캔버스 크기/원점이나 픽셀 내용이
+        바뀌는 연산(여백 조절, 회전/대칭, 효과, 실행 취소)은 각자 선택을 지운다.
         """
-        if self._magic_mask is None:
-            return False
-        if self._magic_scene_rect != self._scene.sceneRect():
-            self.clear_magic_selection()
-            return False
-        return True
+        return self._magic_mask is not None
 
     def clear_magic_selection(self) -> None:
         """매직툴 선택을 지운다."""
@@ -1311,6 +1376,7 @@ class CanvasView(QGraphicsView):
         self._magic_mask = None
         self._magic_scene_rect = QRectF()
         self._magic_edge = (np.empty(0, int), np.empty(0, int))
+        self._magic_ants_key = ()
         self._magic_ants_image = None
         self.viewport().update()
 
@@ -1365,12 +1431,8 @@ class CanvasView(QGraphicsView):
         interior = (padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:])
         ys, xs = np.nonzero(mask & ~interior)
         self._magic_edge = (ys, xs)
-        x0, y0 = int(xs.min()), int(ys.min())
-        self._magic_ants_origin = QPoint(x0, y0)
-        self._magic_ants_image = QImage(int(xs.max()) - x0 + 1, int(ys.max()) - y0 + 1,
-                                        QImage.Format.Format_ARGB32)
-        self._magic_ants_image.fill(Qt.GlobalColor.transparent)
-        self._magic_ants_phase_drawn = -1
+        self._magic_bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        self._magic_ants_key = ()
         self.viewport().update()
 
     def _magic_bounds(self) -> tuple[int, int, int, int]:
@@ -1389,7 +1451,7 @@ class CanvasView(QGraphicsView):
         x0, y0, x1, y1 = self._magic_bounds()
         composed = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
         img = composed.copy(x0, y0, x1 - x0, y1 - y0)
-        arr = self._image_view(img)
+        arr = self._image_array(img)
         arr[~self._magic_mask[y0:y1, x0:x1]] = 0
         return img
 
@@ -1409,14 +1471,25 @@ class CanvasView(QGraphicsView):
         img = self.render_magic_selection()
         if img is None:
             return None
+        self._erase_magic_selection(fill_color)
+        return img
+
+    def _erase_magic_selection(self, fill_color: Optional[QColor] = None) -> None:
+        """매직툴 선택 영역과 겹치는 모든 픽스맵 아이템의 해당 픽셀을 fill_color로 바꾸고 선택을 해제한다.
+
+        Args:
+            fill_color: 지운 자리를 채울 색. None이면 배경이 투명인 캔버스는
+                투명으로, 그렇지 않으면 흰색으로 채운다.
+        """
+        if not self.has_magic_selection():
+            return
         if fill_color is None:
             fill_color = QColor(Qt.GlobalColor.transparent if self._transparent_background
                                  else Qt.GlobalColor.white)
         items = [it for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)]
         self._paint_mask_on_items([(it, self._magic_mask) for it in items], fill_color)
-        logger.info("매직툴 잘라내기: %d픽셀", int(self._magic_mask.sum()))
+        logger.info("매직툴 영역 지우기: %d픽셀", int(self._magic_mask.sum()))
         self.clear_magic_selection()
-        return img
 
     def _fill_magic_selection_at(self, view_pos: QPoint) -> bool:
         """채우기 도구로 매직툴 선택 영역 안을 클릭하면 선택 영역 전체를 draw_color로 채운다.
@@ -1477,7 +1550,7 @@ class CanvasView(QGraphicsView):
                 pushed = True
             stencil = QImage(x1 - x0, y1 - y0, QImage.Format.Format_ARGB32)
             stencil.fill(Qt.GlobalColor.transparent)
-            self._image_view(stencil)[mask[y0:y1, x0:x1]] = [color.blue(), color.green(), color.red(), 255]
+            self._image_array(stencil)[mask[y0:y1, x0:x1]] = [color.blue(), color.green(), color.red(), 255]
             offset = scene_rect.topLeft() + QPointF(x0, y0) - item.pos()
             pm = QPixmap(item.pixmap())
             painter = QPainter(pm)
@@ -1491,14 +1564,6 @@ class CanvasView(QGraphicsView):
             item.setPixmap(pm)
         if pushed:
             self.changed.emit()
-
-    @staticmethod
-    def _image_view(image: QImage) -> np.ndarray:
-        """ARGB32 QImage의 픽셀을 (h, w, 4) BGRA uint8 배열로 직접 가리키는 쓰기 가능한 뷰."""
-        w, h = image.width(), image.height()
-        stride = image.bytesPerLine()
-        buf = np.frombuffer(image.bits(), dtype=np.uint8, count=stride * h)
-        return buf.reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
 
     @staticmethod
     def _similar_region(composed: QImage, x: int, y: int, tolerance_pct: int) -> np.ndarray:
@@ -2159,7 +2224,7 @@ class CanvasView(QGraphicsView):
         text_edit.setFont(display_font)
         if html:
             text_edit.setHtml(html)
-            scale_point_sizes(text_edit.document(), self._text_edit_scale)
+            scale_for_display(text_edit.document(), self._text_edit_scale)
         else:
             text_edit.setPlainText(text)
             text_edit.selectAll()
@@ -2198,7 +2263,7 @@ class CanvasView(QGraphicsView):
         base = self._text_edit_base
         # 편집칸의 글자 크기는 화면 배율이 곱해져 있으므로 실제 크기로 되돌려 보관한다.
         doc = overlay.text_edit.document().clone()
-        scale_point_sizes(doc, 1.0 / self._text_edit_scale)
+        restore_point_sizes(doc, self._text_edit_scale)
         doc.setDefaultFont(QFont(base["font"]))
         existing = self._text_editing_item
         rect = (QRectF(existing.pos(), QSizeF(existing.pixmap().size()))

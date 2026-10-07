@@ -5,12 +5,20 @@
 텍스트 박스는 글자 일부만 크기/색/폰트를 바꾸거나 문단별로 정렬을 달리할 수
 있어, 내용을 서식이 포함된 HTML(QTextDocument.toHtml)로 보관한다. HTML의 글자
 크기는 항상 화면 배율 1 기준(실제 크기)이며, 확대/축소된 편집칸에 띄울 때만
-scale_point_sizes()로 배율을 곱한다.
+scale_for_display()로 배율을 곱하고, 확정 시 restore_point_sizes()로 되돌린다.
 """
+
+from typing import Callable
 
 from PySide6.QtCore import QRectF, QSizeF, Qt
 from PySide6.QtGui import (QAbstractTextDocumentLayout, QColor, QFont, QPainter, QPalette, QPixmap,
-                            QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextOption)
+                            QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat,
+                            QTextOption)
+
+# 편집칸에 띄울 때 배율을 곱하기 전의 실제 글자 크기(pt)를 보관하는 사용자 정의 서식 속성.
+# 배율을 곱한 값을 다시 나누면 반올림 오차가 쌓여 편집할 때마다 크기가 조금씩 변하므로,
+# 확정 시에는 이 값을 그대로 되돌려 쓴다. toHtml()에는 포함되지 않는다.
+ORIGINAL_POINT_SIZE = int(QTextFormat.Property.UserProperty) + 1
 
 H_ALIGN_FLAGS: dict[str, Qt.AlignmentFlag] = {
     "left": Qt.AlignmentFlag.AlignLeft, "center": Qt.AlignmentFlag.AlignHCenter,
@@ -54,46 +62,82 @@ def char_format_changes(old_font: QFont, new_font: QFont, old_color: QColor,
 
 
 def scaled_char_format(fmt: QTextCharFormat, factor: float) -> QTextCharFormat:
-    """fmt에 글자 크기가 있으면 factor배 한 사본을 반환한다."""
+    """fmt에 글자 크기가 있으면 표시용으로 factor배 하고 원래 크기를 함께 기록한 사본을 반환한다."""
     scaled = QTextCharFormat(fmt)
     if fmt.hasProperty(QTextCharFormat.Property.FontPointSize):
+        scaled.setProperty(ORIGINAL_POINT_SIZE, fmt.fontPointSize())
         scaled.setFontPointSize(round(fmt.fontPointSize() * factor, 2))
     return scaled
 
 
-def scale_point_sizes(doc: QTextDocument, factor: float) -> None:
-    """문서 안의 명시적 글자 크기(조각·빈 문단)를 모두 factor배 한다 (기본 폰트는 제외).
+def _explicit_size_formats(doc: QTextDocument) -> tuple[list[tuple[int, int, QTextCharFormat]],
+                                                        list[tuple[int, QTextCharFormat]]]:
+    """명시적 글자 크기가 있는 조각 (위치, 길이, 서식)과 빈 문단 (위치, 서식) 목록을 모은다.
 
-    편집칸 확대/축소 배율 반영 및 원래 크기 복원에 쓴다. 왕복 시 부동소수
-    오차가 쌓이지 않도록 소수 둘째 자리에서 반올림한다.
+    조각 경계는 서식 병합 중 합쳐질 수 있어, 순회를 끝낸 뒤 위치 기준으로 적용하기 위한 것.
     """
-    fragments: list[tuple[int, int, float]] = []
-    blocks: list[tuple[int, float]] = []
+    fragments: list[tuple[int, int, QTextCharFormat]] = []
+    blocks: list[tuple[int, QTextCharFormat]] = []
     block = doc.begin()
     while block.isValid():
         if block.charFormat().fontPointSize() > 0:
-            blocks.append((block.position(), block.charFormat().fontPointSize()))
+            blocks.append((block.position(), block.charFormat()))
         it = block.begin()
         while not it.atEnd():
             frag = it.fragment()
             if frag.isValid() and frag.charFormat().fontPointSize() > 0:
-                fragments.append((frag.position(), frag.length(), frag.charFormat().fontPointSize()))
+                fragments.append((frag.position(), frag.length(), frag.charFormat()))
             it += 1
         block = block.next()
+    return fragments, blocks
 
-    # 조각 경계는 서식 병합 중 합쳐질 수 있어, 순회가 끝난 뒤 위치 기준으로 적용한다.
+
+def _apply_size_formats(doc: QTextDocument, fragments: list[tuple[int, int, QTextCharFormat]],
+                        blocks: list[tuple[int, QTextCharFormat]],
+                        convert: Callable[[QTextCharFormat], QTextCharFormat]) -> None:
+    """수집한 조각·문단 서식을 convert로 바꾼 글자 크기 서식으로 병합한다."""
     cursor = QTextCursor(doc)
-    for pos, length, size in fragments:
+    for pos, length, fmt in fragments:
         cursor.setPosition(pos)
         cursor.setPosition(pos + length, QTextCursor.MoveMode.KeepAnchor)
-        fmt = QTextCharFormat()
-        fmt.setFontPointSize(round(size * factor, 2))
-        cursor.mergeCharFormat(fmt)
-    for pos, size in blocks:
+        cursor.mergeCharFormat(convert(fmt))
+    for pos, fmt in blocks:
         cursor.setPosition(pos)
-        fmt = QTextCharFormat()
-        fmt.setFontPointSize(round(size * factor, 2))
-        cursor.mergeBlockCharFormat(fmt)
+        cursor.mergeBlockCharFormat(convert(fmt))
+
+
+def scale_for_display(doc: QTextDocument, factor: float) -> None:
+    """편집칸 표시용으로 문서의 명시적 글자 크기를 모두 factor배 한다 (기본 폰트는 제외).
+
+    각 서식에 원래 크기를 ORIGINAL_POINT_SIZE로 남겨, 확정 시 restore_point_sizes()가
+    나눗셈 없이 정확히 되돌릴 수 있게 한다.
+    """
+    def convert(fmt: QTextCharFormat) -> QTextCharFormat:
+        out = QTextCharFormat()
+        out.setProperty(ORIGINAL_POINT_SIZE, fmt.fontPointSize())
+        out.setFontPointSize(round(fmt.fontPointSize() * factor, 2))
+        return out
+
+    fragments, blocks = _explicit_size_formats(doc)
+    _apply_size_formats(doc, fragments, blocks, convert)
+
+
+def restore_point_sizes(doc: QTextDocument, factor: float) -> None:
+    """편집칸 표시용 배율이 적용된 문서의 글자 크기를 실제 크기로 되돌린다.
+
+    scale_for_display()/scaled_char_format()을 거친 서식은 기록해 둔 원래 값을
+    그대로 쓰고, 기록이 없는 서식(예외적인 경로)만 factor로 나눈다.
+    """
+    def convert(fmt: QTextCharFormat) -> QTextCharFormat:
+        out = QTextCharFormat()
+        if fmt.hasProperty(ORIGINAL_POINT_SIZE):
+            out.setFontPointSize(float(fmt.property(ORIGINAL_POINT_SIZE)))
+        else:
+            out.setFontPointSize(round(fmt.fontPointSize() / factor, 2))
+        return out
+
+    fragments, blocks = _explicit_size_formats(doc)
+    _apply_size_formats(doc, fragments, blocks, convert)
 
 
 def build_document(text: str, html: str | None, font: QFont, color: QColor,

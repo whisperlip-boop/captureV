@@ -132,8 +132,8 @@ def draw_line_kind(painter: QPainter, kind: str, p1: QPointF, p2: QPointF, thick
     if kind in ARROW_KINDS:
         angle = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
         _draw_open_arrowhead(painter, p2, angle, thickness)
-    if kind in DOUBLE_ARROW_KINDS:
-        _draw_open_arrowhead(painter, p1, angle + math.pi, thickness)
+        if kind in DOUBLE_ARROW_KINDS:
+            _draw_open_arrowhead(painter, p1, angle + math.pi, thickness)
 
 
 def draw_bezier_kind(painter: QPainter, kind: str, points: Sequence[QPointF], thickness: float) -> None:
@@ -146,8 +146,8 @@ def draw_bezier_kind(painter: QPainter, kind: str, points: Sequence[QPointF], th
     painter.drawPath(path)
     if kind in ARROW_KINDS:
         _draw_open_arrowhead(painter, p3, _tangent_angle(p2, p3, (p1, p0)), thickness)
-    if kind in DOUBLE_ARROW_KINDS:
-        _draw_open_arrowhead(painter, p0, _tangent_angle(p1, p0, (p2, p3)), thickness)
+        if kind in DOUBLE_ARROW_KINDS:
+            _draw_open_arrowhead(painter, p0, _tangent_angle(p1, p0, (p2, p3)), thickness)
 
 
 def _tangent_angle(control: QPointF, end: QPointF, fallbacks: Sequence[QPointF]) -> float:
