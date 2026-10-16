@@ -146,6 +146,13 @@ NEW_CANVAS_SIZE_MAX: int = 20000
 DEFAULT_NEW_CANVAS_WIDTH: int = 500
 DEFAULT_NEW_CANVAS_HEIGHT: int = 500
 DEFAULT_NEW_CANVAS_BG_COLOR: str = "#FFFFFF"
+# '신규' > '프리셋' 하위 메뉴: (표시 이름, 가로, 세로)
+NEW_CANVAS_PRESETS: list[tuple[str, int, int]] = [
+    ("FHD", 1920, 1080), ("HD+", 1600, 900), ("HD", 1366, 768), ("WXGA", 1280, 800),
+    ("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480), ("FVC", 512, 512),
+    ("ICO-1", 256, 256), ("ICO-2", 128, 128), ("ICO-3", 64, 64), ("ICO-4", 48, 48),
+    ("ICO-5", 32, 32), ("ICO-6", 16, 16),
+]
 
 # ---------- 캔버스 확대/축소 ---------- #
 ZOOM_PERCENT_MIN: int = 1

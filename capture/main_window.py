@@ -33,7 +33,8 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                             DEFAULT_SVG_IMPORT_SCALE, DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS,
                             EFFECT_MENU_ICON_PX, FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, HUE_SATURATION_MAX,
                             HUE_SATURATION_MIN, ICO_MAX_EDGE, MINI_TOOL_DIVIDER_COLOR, MINI_TOOL_ICON_PX,
-                            MOSAIC_PERCENT_MAX, MOSAIC_PERCENT_MIN, NEW_CANVAS_SIZE_MAX, NEW_CANVAS_SIZE_MIN,
+                            MOSAIC_PERCENT_MAX, MOSAIC_PERCENT_MIN, NEW_CANVAS_PRESETS, NEW_CANVAS_SIZE_MAX,
+                            NEW_CANVAS_SIZE_MIN,
                             OPEN_FILTERS, OVERWRITE_SAFE_EXTENSIONS, PILLOW_FORMATS, SAVE_EXT_TO_FORMAT,
                             SAVE_FILTERS, SAVE_QUALITY, SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN,
                             SVG_EXTENSIONS, SVG_IMPORT_SCALE_MAX, SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_STEP,
@@ -289,6 +290,15 @@ class MainWindow(QMainWindow):
         new_from_settings_action = QAction("신규 캔버스", self)
         new_from_settings_action.triggered.connect(self._create_new_canvas_from_settings)
         self._new_menu.addAction(new_from_settings_action)
+        # addMenu("제목")이 반환한 QMenu는 PySide6에서 파이썬 지역 변수가 사라질 때
+        # 함께 삭제되므로, 부모를 지정해 직접 만들고 참조를 보관한다.
+        self._preset_menu = QMenu("프리셋", self)
+        self._new_menu.addMenu(self._preset_menu)
+        for name, width, height in NEW_CANVAS_PRESETS:
+            # QMenu는 탭 뒤 텍스트를 단축키 열로 따로 정렬해 그리므로, 이름 길이와
+            # 무관하게 해상도 "( )"가 한 줄로 맞춰진다.
+            action = self._preset_menu.addAction(f"{name}\t({width}x{height})")
+            action.triggered.connect(lambda _checked=False, w=width, h=height: self._add_blank_canvas(w, h))
         new_settings_action = QAction("새로 만들기 설정...", self)
         new_settings_action.triggered.connect(self._open_new_canvas_settings_dialog)
         self._new_menu.addAction(new_settings_action)
