@@ -13,8 +13,8 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QGuiApplication, QImage, QKeyE
                             QMouseEvent, QPainter, QPainterPath, QPen, QPixmap,
                             QResizeEvent, QShowEvent, QTextCharFormat, QTextDocument, QTransform,
                             QWheelEvent)
-from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QTextEdit,
-                                QToolButton, QWidget)
+from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QStyle,
+                                QStyleOptionGraphicsItem, QTextEdit, QToolButton, QWidget)
 from scipy import ndimage
 
 from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHECKER_DARK_COLOR,
@@ -33,6 +33,21 @@ from capture.shapes import (ARROW_KINDS, DEFAULT_ROUNDED_RADIUS_RATIO, FREEHAND_
                              snap_line_angle)
 
 logger = logging.getLogger(__name__)
+
+
+class _CanvasPixmapItem(QGraphicsPixmapItem):
+    """Qt 기본 선택 파선을 그리지 않는 픽스맵 아이템.
+
+    선택 테두리는 CanvasView.drawForeground가 선택 아이템 전체의 합집합으로
+    한 번만 그린다. 기본 파선까지 그리면 Ctrl+A 시 아이템마다 내부 점선이 생긴다.
+    """
+
+    def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem,
+              widget: Optional[QWidget] = None) -> None:
+        """선택 상태 플래그만 뺀 옵션으로 기본 paint를 호출한다."""
+        opt = QStyleOptionGraphicsItem(option)
+        opt.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, opt, widget)
 
 
 class _OverlayTextEdit(QTextEdit):
@@ -126,6 +141,10 @@ class CanvasView(QGraphicsView):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
+        # 선택 점선·크기 조절 핸들은 drawForeground가 아이템 경계 바깥까지 그리므로,
+        # 선택이 바뀌면 Qt의 최소 갱신(아이템 영역)만으로는 핸들 바깥쪽 절반이
+        # 잔상으로 남는다. 선택 변경 시 뷰포트 전체를 다시 그린다.
+        self._scene.selectionChanged.connect(self.viewport().update)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -372,7 +391,7 @@ class CanvasView(QGraphicsView):
         movable=False(배경 원본 캡처 이미지)는 캔버스 밖으로 드래그되어
         벗어나면 안 되므로 ItemIsMovable을 주지 않는다.
         """
-        item = QGraphicsPixmapItem(pixmap)
+        item = _CanvasPixmapItem(pixmap)
         flags = QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable
         if movable:
             flags |= QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable
@@ -393,7 +412,7 @@ class CanvasView(QGraphicsView):
         r = self._scene.sceneRect()
         pm = QPixmap(max(int(round(r.width())), 1), max(int(round(r.height())), 1))
         pm.fill(Qt.GlobalColor.transparent)
-        item = QGraphicsPixmapItem(pm)
+        item = _CanvasPixmapItem(pm)
         item.setPos(r.topLeft())
         item.setZValue(len(self._scene.items()))
         self._scene.addItem(item)
@@ -451,7 +470,7 @@ class CanvasView(QGraphicsView):
         self._text_meta = {}
         self._shape_meta = {}
         for entry in sorted(snapshot["items"], key=lambda e: e["z"]):
-            item = QGraphicsPixmapItem(entry["pixmap"])
+            item = _CanvasPixmapItem(entry["pixmap"])
             if not entry.get("is_draw"):
                 flags = QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable
                 if not entry.get("is_base"):
@@ -1302,7 +1321,9 @@ class CanvasView(QGraphicsView):
         r = self._select_rect
         img = QImage(max(int(round(r.width())), 1), max(int(round(r.height())), 1),
                      QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.transparent)
+        # render_image()와 같은 배경으로 채워야, 캔버스를 넓힌 빈 영역이 화면엔
+        # 흰색인데 복사본에서만 투명(알파 미지원 앱에 붙이면 검은색)이 되지 않는다.
+        img.fill(Qt.GlobalColor.transparent if self._transparent_background else Qt.GlobalColor.white)
         self._scene.clearSelection()
         painter = QPainter(img)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
@@ -1919,9 +1940,14 @@ class CanvasView(QGraphicsView):
             # 파선 테두리를 그리지만, 캔버스 경계와 좌표가 겹치면 위의 캔버스
             # 테두리(파란 실선)에 완전히 가려져 버린다. drawForeground는 모든
             # 아이템을 그린 "뒤"에 호출되므로, 여기서 다시 그려야 항상 위에 보인다.
-            bounds = QRectF()
-            for it in selected_items:
-                bounds = bounds.united(it.sceneBoundingRect())
+            # Ctrl+A처럼 선택 영역이 함께 있으면 복사/잘라내기 대상은 아이템
+            # 합집합이 아니라 그 영역(넓힌 빈 캔버스 포함)이므로 그것을 표시한다.
+            if self.has_selection():
+                bounds = QRectF(self._select_rect)
+            else:
+                bounds = QRectF()
+                for it in selected_items:
+                    bounds = bounds.united(it.sceneBoundingRect())
             painter.save()
             painter.setBrush(Qt.BrushStyle.NoBrush)
             self._draw_marching_ants(painter, bounds, scale)
@@ -2101,6 +2127,16 @@ class CanvasView(QGraphicsView):
                 if isinstance(it, QGraphicsPixmapItem)
             }
         super().mousePressEvent(event)
+        self._drop_stale_select_all()
+
+    def _drop_stale_select_all(self) -> None:
+        """이동 도구에서 클릭으로 일부 아이템만 선택되면 Ctrl+A 선택 영역을 해제한다."""
+        # Ctrl+A의 선택 영역은 '전체 아이템 선택'일 때만 유효하다. Qt는 이미 선택된
+        # 아이템을 클릭하면 놓을 때 그것만 남기므로 press/release 양쪽에서 확인한다.
+        if self.tool == "move" and self.has_selection() and any(
+                it.flags() & QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable and not it.isSelected()
+                for it in self._scene.items()):
+            self.clear_selection()
 
     def _select_press(self, view_pos: QPoint) -> None:
         """선택 도구: 드래그 시작, 핸들 잡기, 이동 시작을 처리한다."""
@@ -2955,6 +2991,7 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        self._drop_stale_select_all()
         self._commit_pending_move()
 
     def _commit_pending_move(self) -> None:

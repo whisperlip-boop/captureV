@@ -274,15 +274,21 @@ class MainWindow(QMainWindow):
     def _build_new_button(self) -> None:
         """'신규' 버튼(캔버스 크기 설정 하위 메뉴)을 구성한다.
 
-        본체를 클릭하면 설정된 크기의 흰색 캔버스로 새 탭이 바로 생성되고,
-        화살표를 누르면 캔버스 크기를 설정하는 팝업을 여는 메뉴가 열린다.
+        본체를 클릭하면 클립보드 이미지 크기(없으면 설정된 크기)의 새 캔버스
+        탭이 바로 생성되고, 화살표를 누르면 설정 크기로 바로 만드는 '신규
+        캔버스'와 크기/배경을 설정하는 팝업을 여는 메뉴가 열린다.
         도구가 아니라 즉시 실행되는 동작이라 _tool_group에는 넣지 않는다.
         """
         self._new_action = QAction(QIcon(str(get_resource_path("img/new.png"))), "신규", self)
-        self._new_action.setToolTip("신규 (설정된 크기의 새 캔버스 탭 생성)")
+        self._new_action.setToolTip("신규 (클립보드 이미지가 있으면 그 크기, 없으면 설정된 크기의 새 캔버스 탭 생성)")
         self._new_action.triggered.connect(self._create_new_canvas)
 
         self._new_menu = QMenu(self)
+        # 본체 클릭은 클립보드 이미지가 있으면 그 크기를 따르므로, 클립보드와
+        # 무관하게 설정 크기로 바로 만드는 항목을 따로 둔다.
+        new_from_settings_action = QAction("신규 캔버스", self)
+        new_from_settings_action.triggered.connect(self._create_new_canvas_from_settings)
+        self._new_menu.addAction(new_from_settings_action)
         new_settings_action = QAction("새로 만들기 설정...", self)
         new_settings_action.triggered.connect(self._open_new_canvas_settings_dialog)
         self._new_menu.addAction(new_settings_action)
@@ -402,9 +408,16 @@ class MainWindow(QMainWindow):
         """
         clipboard_image = QGuiApplication.clipboard().image()
         if not clipboard_image.isNull():
-            width, height = clipboard_image.width(), clipboard_image.height()
+            self._add_blank_canvas(clipboard_image.width(), clipboard_image.height())
         else:
-            width, height = self._new_canvas_width, self._new_canvas_height
+            self._add_blank_canvas(self._new_canvas_width, self._new_canvas_height)
+
+    def _create_new_canvas_from_settings(self) -> None:
+        """클립보드와 무관하게 '새로 만들기 설정'의 크기로 새 캔버스 탭을 생성한다."""
+        self._add_blank_canvas(self._new_canvas_width, self._new_canvas_height)
+
+    def _add_blank_canvas(self, width: int, height: int) -> None:
+        """설정된 배경(사용자 지정색/투명)으로 채운 width x height 캔버스를 새 탭으로 추가한다."""
         if self._new_canvas_bg_transparent:
             image = QImage(width, height, QImage.Format.Format_ARGB32)
             image.fill(Qt.GlobalColor.transparent)
