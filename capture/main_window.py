@@ -15,9 +15,9 @@ from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopS
                             QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QDialogButtonBox, QFileDialog,
                                 QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
-                                QMainWindow, QMenu, QMessageBox, QRadioButton, QSizePolicy, QSpinBox,
-                                QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget,
-                                QWidgetAction)
+                                QMainWindow, QMenu, QMessageBox, QProxyStyle, QRadioButton, QSizePolicy,
+                                QSpinBox, QStyle, QStyleOption, QTabBar, QTabWidget, QToolBar,
+                                QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 from capture import screen_capture
 from capture.avif_io import is_avif_path, read_avif, write_avif
@@ -35,7 +35,8 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                             HUE_SATURATION_MIN, ICO_MAX_EDGE, MINI_TOOL_DIVIDER_COLOR, MINI_TOOL_ICON_PX,
                             MOSAIC_PERCENT_MAX, MOSAIC_PERCENT_MIN, NEW_CANVAS_PRESETS, NEW_CANVAS_SIZE_MAX,
                             NEW_CANVAS_SIZE_MIN,
-                            OPEN_FILTERS, OVERWRITE_SAFE_EXTENSIONS, PILLOW_FORMATS, SAVE_EXT_TO_FORMAT,
+                            OPEN_FILTERS, OVERWRITE_SAFE_EXTENSIONS, PILLOW_FORMATS, PRESET_MENU_GAP_SHRINK_PX,
+                            SAVE_EXT_TO_FORMAT,
                             SAVE_FILTERS, SAVE_QUALITY, SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN,
                             SVG_EXTENSIONS, SVG_IMPORT_SCALE_MAX, SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_STEP,
                             SVG_MAX_LONG_EDGE, TAB_SAVED_COLOR, TAB_UNSAVED_COLOR, THICKNESS_MAX,
@@ -60,6 +61,20 @@ from capture.text_settings import TextSettingsPanel
 logger = logging.getLogger(__name__)
 
 _MAGIC_ARROW_PX = 12   # 매직툴 버튼 오른쪽 ▼(허용범위 메뉴) 영역 폭
+
+
+class _PresetMenuStyle(QProxyStyle):
+    """프리셋 메뉴에서 이름과 "(해상도)" 열 사이 간격만 좁히는 스타일."""
+
+    def sizeFromContents(self, ct: QStyle.ContentsType, option: QStyleOption, size: QSize,
+                         widget: QWidget | None = None) -> QSize:
+        """탭이 든 메뉴 항목의 폭을 줄여 오른쪽 기준인 해상도 열을 왼쪽으로 당긴다."""
+        result = super().sizeFromContents(ct, option, size, widget)
+        # 간격 값은 windows11 스타일 기준이라, 다른 스타일에서는 글자가 겹치지 않게 그대로 둔다.
+        if (ct == QStyle.ContentsType.CT_MenuItem and "\t" in option.text
+                and self.baseStyle().name() == "windows11"):
+            result.setWidth(result.width() - PRESET_MENU_GAP_SHRINK_PX)
+        return result
 
 
 class _ClickableLabel(QLabel):
@@ -293,6 +308,8 @@ class MainWindow(QMainWindow):
         # addMenu("제목")이 반환한 QMenu는 PySide6에서 파이썬 지역 변수가 사라질 때
         # 함께 삭제되므로, 부모를 지정해 직접 만들고 참조를 보관한다.
         self._preset_menu = QMenu("프리셋", self)
+        self._preset_menu_style = _PresetMenuStyle()   # setStyle은 소유권을 갖지 않아 참조 보관
+        self._preset_menu.setStyle(self._preset_menu_style)
         self._new_menu.addMenu(self._preset_menu)
         for name, width, height in NEW_CANVAS_PRESETS:
             # QMenu는 탭 뒤 텍스트를 단축키 열로 따로 정렬해 그리므로, 이름 길이와
