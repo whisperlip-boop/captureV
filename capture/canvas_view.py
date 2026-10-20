@@ -738,6 +738,7 @@ class CanvasView(QGraphicsView):
         self._push_undo()
         self._resize_draw_layer(r, old)
         self._scene.setSceneRect(r)
+        self._clip_selection_to_canvas()
         self.changed.emit()
 
     def fit_to_content(self) -> None:
@@ -763,6 +764,7 @@ class CanvasView(QGraphicsView):
         self._push_undo()
         self._resize_draw_layer(br, old)
         self._scene.setSceneRect(br)
+        self._clip_selection_to_canvas()
         self.changed.emit()
 
     # ---------- 회전/대칭 이동 ---------- #
@@ -784,7 +786,23 @@ class CanvasView(QGraphicsView):
         self.base_item = self._add_pixmap(QPixmap.fromImage(image), QPoint(0, 0), movable=False)
         self.draw_item = self._add_draw_layer()
         self._transparent_background = self._has_transparency(image)
+        self._clip_selection_to_canvas()
         self.changed.emit()
+
+    def _clip_selection_to_canvas(self) -> None:
+        """캔버스 크기가 바뀐 뒤 선택 영역을 새 캔버스와 겹치는 부분으로 줄인다(안 겹치면 해제).
+
+        선택 영역은 씬 아이템이 아니라 별도 사각형이라 sceneRect를 바꿔도 따라
+        줄지 않아, 예전 크기의 점선이 남고 효과·복사 대상도 캔버스 밖을 가리키게 된다.
+        """
+        if not self.has_selection():
+            return
+        clipped = self._select_rect.intersected(self._scene.sceneRect())
+        if clipped.width() > 0 and clipped.height() > 0:
+            self._select_rect = clipped
+            self.viewport().update()
+        else:
+            self.clear_selection()
 
     def _target_pixel_rect(self, image: QImage) -> tuple[int, int, int, int]:
         """효과를 적용할 대상 사각형을 정수 픽셀 좌표 (x, y, w, h)로 반환한다.
@@ -1683,6 +1701,20 @@ class CanvasView(QGraphicsView):
         return None
 
     @staticmethod
+    def _snap_to_pixel(p: QPointF) -> QPointF:
+        """씬 좌표를 정수 픽셀 격자로 맞춘다 (Qt 래스터와 같은 .5 올림)."""
+        return QPointF(math.floor(p.x() + 0.5), math.floor(p.y() + 0.5))
+
+    @classmethod
+    def _snap_rect_to_pixel(cls, r: QRectF) -> QRectF:
+        """사각형의 네 변을 정수 픽셀 격자로 맞춘다.
+
+        선택 영역이 소수점이면 render_selection()이 잘라낸 이미지를 리샘플링해
+        1px 직선이 2px로 번지고, 다시 붙여도 원래 선과 정확히 맞지 않는다.
+        """
+        return QRectF(cls._snap_to_pixel(r.topLeft()), cls._snap_to_pixel(r.bottomRight()))
+
+    @staticmethod
     def _item_pixmap_rect(item: QGraphicsPixmapItem) -> QRectF:
         """item의 실제 픽스맵 사각형(씬 좌표)을 반환한다.
 
@@ -1740,7 +1772,7 @@ class CanvasView(QGraphicsView):
         h = max(int(round(new_rect.height())), 1)
         item.setPixmap(pixmap.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
                                       Qt.TransformationMode.SmoothTransformation))
-        item.setPos(new_rect.topLeft())
+        item.setPos(self._snap_to_pixel(new_rect.topLeft()))
         self.viewport().update()
 
     def _item_resize_release(self) -> None:
@@ -1790,7 +1822,7 @@ class CanvasView(QGraphicsView):
         pixmap = self._render_bbox_pixmap(meta["subtool"], new_size, pad, pen,
                                           meta.get("radius_ratio", DEFAULT_ROUNDED_RADIUS_RATIO))
         item.setPixmap(pixmap)
-        item.setPos(content_top_left - QPointF(pad, pad))
+        item.setPos(self._snap_to_pixel(content_top_left - QPointF(pad, pad)))
         meta["geometry"] = QSizeF(pixmap.width() - 2 * pad, pixmap.height() - 2 * pad)
 
     # ---------- 둥근 사각형 반지름 조절점 ---------- #
@@ -2182,7 +2214,7 @@ class CanvasView(QGraphicsView):
         if self._text_state == "moving" and self._text_drag_item is not None:
             sp = self.mapToScene(view_pos)
             delta = sp - self._text_drag_start_scene
-            self._text_drag_item.setPos(self._text_drag_item_start_pos + delta)
+            self._text_drag_item.setPos(self._snap_to_pixel(self._text_drag_item_start_pos + delta))
             self.viewport().update()
             return
         if self._text_state == "dragging" and self._text_origin is not None:
@@ -2605,7 +2637,7 @@ class CanvasView(QGraphicsView):
                 painter.end()
 
             item.setPixmap(pixmap)
-            item.setPos(content_top_left - QPointF(pad, pad))
+            item.setPos(self._snap_to_pixel(content_top_left - QPointF(pad, pad)))
             meta["color"] = QColor(self.draw_color)
             meta["thickness"] = self.draw_thickness
             meta["pad"] = pad
@@ -2717,8 +2749,9 @@ class CanvasView(QGraphicsView):
         stride = img.bytesPerLine()
         buf = np.frombuffer(img.constBits(), dtype=np.uint8, count=stride * ih)
         alpha = buf.reshape(ih, stride)[:, :iw * 4].reshape(ih, iw, 4)[:, :, 3] > 0
-        ox = int(round(item.pos().x() - scene_rect.left()))
-        oy = int(round(item.pos().y() - scene_rect.top()))
+        # Python round()는 .5에서 짝수 쪽으로 반올림해 Qt 렌더 위치와 1px 어긋날 수 있다.
+        ox = math.floor(item.pos().x() - scene_rect.left() + 0.5)
+        oy = math.floor(item.pos().y() - scene_rect.top() + 0.5)
         x0, y0 = max(ox, 0), max(oy, 0)
         x1, y1 = min(ox + iw, w), min(oy + ih, h)
         if x0 >= x1 or y0 >= y1:
@@ -2730,9 +2763,8 @@ class CanvasView(QGraphicsView):
         """클릭 지점과 연결된, 허용 범위 내의 인접 색상 영역을 draw_color로 채운다.
 
         영역 판정은 화면에 실제로 보이는 색(원본 이미지 + 그리기 레이어 +
-        붙여넣은 이미지가 합쳐진 결과)을 기준으로 하되, 채우는 범위와 대상은
-        '클릭 지점에서 보이는 최상단 아이템' 하나로 한정한다. 그 아이템이
-        가려지지 않은 부분만 채우고, 결과도 그 아이템의 픽스맵에 직접 그린다.
+        붙여넣은 이미지가 합쳐진 결과)을 기준으로 하고, 각 픽셀은 그 위치에서
+        보이는 최상단 아이템의 픽스맵에 직접 그린다 (가려진 아이템은 건드리지 않음).
 
         예전에는 결과를 항상 그리기 레이어에 그린 뒤 그 레이어를 최상단으로
         올렸는데, 허용 범위 안의 색이 캔버스 배경까지 이어지는 경우(밝은 UI
@@ -2758,54 +2790,34 @@ class CanvasView(QGraphicsView):
 
         region = self._similar_region(composed, x, y, self.fill_tolerance)
 
-        # 클릭 지점에서 보이는 최상단 아이템을 찾고, 그 아이템이 위 아이템에
-        # 가려지지 않은 부분으로 채울 영역을 제한한다. 아무 아이템도 없는 빈
-        # 캔버스 배경을 클릭했으면 그리기 레이어에 그리되, 아이템이 덮은 곳은
-        # 건드리지 않는다.
+        # 잘라내기/붙여넣기를 반복하면 눈에 보이는 한 영역이 배경·붙여넣은
+        # 조각 여러 아이템에 걸쳐 있다. 클릭 지점의 최상단 아이템 하나만 칠하면
+        # 그 아이템 몫만 채워지므로, 픽셀마다 '실제로 보이는(가려지지 않은)
+        # 아이템'에 나눠 칠한다. 각 아이템은 자기가 보이는 부분만 칠해지므로
+        # 붙여넣은 이미지가 다른 아이템에 덮여 사라지지 않는다. 아무 아이템도
+        # 없는 빈 캔버스 배경은 그리기 레이어에 칠한다.
         items = sorted((it for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)),
                        key=lambda it: it.zValue(), reverse=True)
-        masks = {id(it): self._item_cover_mask(it, w, h, scene_rect) for it in items}
-        target_item: Optional[QGraphicsPixmapItem] = None
-        above = np.zeros((h, w), dtype=bool)
+        covered = np.zeros((h, w), dtype=bool)
+        targets: list[tuple[QGraphicsPixmapItem, np.ndarray]] = []
         for it in items:
-            if masks[id(it)][y, x]:
-                target_item = it
-                break
-            above |= masks[id(it)]
-        if target_item is None:
-            target_item = self.draw_item
-            allowed = np.ones((h, w), dtype=bool)
-            for it in items:
-                if it is not self.draw_item:
-                    allowed &= ~masks[id(it)]
-        else:
-            allowed = masks[id(target_item)] & ~above
-        region &= allowed
-        pixel_count = int(region.sum())
+            mask = self._item_cover_mask(it, w, h, scene_rect)
+            part = region & mask & ~covered
+            covered |= mask
+            if part.any():
+                targets.append((it, part))
+        uncovered = region & ~covered
+        if uncovered.any() and self.draw_item is not None:
+            targets.append((self.draw_item, uncovered))
+        pixel_count = sum(int(part.sum()) for _, part in targets)
         if pixel_count == 0:
             return False
 
-        fill_img = QImage(w, h, QImage.Format.Format_ARGB32)
-        fill_img.fill(Qt.GlobalColor.transparent)
-        fill_stride = fill_img.bytesPerLine()
-        fill_buf = np.frombuffer(fill_img.bits(), dtype=np.uint8, count=fill_stride * h)
-        fill_arr = fill_buf.reshape(h, fill_stride)[:, :w * 4].reshape(h, w, 4)
-        c = QColor(self.draw_color)
-        fill_arr[region] = [c.blue(), c.green(), c.red(), 255]
-
-        self._push_undo()
-        pm = QPixmap(target_item.pixmap())
-        painter = QPainter(pm)
-        # 씬 크기 이미지를 아이템 로컬 좌표로 옮겨 그린다. 아이템 픽스맵
-        # 경계에서 자동으로 잘리므로 다른 아이템으로 번지지 않는다.
-        painter.drawImage(scene_rect.topLeft() - target_item.pos(), fill_img)
-        painter.end()
-        target_item.setPixmap(pm)
-        self.changed.emit()
-        kind = ("배경" if target_item is self.base_item
-                else "그리기 레이어" if target_item is self.draw_item else "이미지")
-        logger.info("채우기: (%d, %d) %s 대상, %d픽셀, 허용범위=%d%%",
-                    x, y, kind, pixel_count, self.fill_tolerance)
+        color = QColor(self.draw_color)
+        color.setAlpha(255)
+        self._paint_mask_on_items(targets, color)
+        logger.info("채우기: (%d, %d) 아이템 %d개 대상, %d픽셀, 허용범위=%d%%",
+                    x, y, len(targets), pixel_count, self.fill_tolerance)
         return True
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -2830,7 +2842,10 @@ class CanvasView(QGraphicsView):
                 top = min(top + dy, bottom - MIN_CANVAS)
             elif hy > 0:
                 bottom = max(bottom + dy, top + MIN_CANVAS)
-            self._canvas_resize_preview = QRectF(left, top, right - left, bottom - top)
+            # 캔버스 경계가 소수점이면 render_image()가 미세하게 확대/축소되어
+            # 아이템 경계 색이 섞이므로 정수 픽셀로 맞춘다.
+            self._canvas_resize_preview = QRectF(self._snap_to_pixel(QPointF(left, top)),
+                                                 self._snap_to_pixel(QPointF(right, bottom)))
             self.viewport().update()
             self.viewChanged.emit()     # 상태바의 캔버스 크기 표시만 실시간 갱신 (dirty 표시 없음)
             event.accept()
@@ -2913,7 +2928,7 @@ class CanvasView(QGraphicsView):
             start, rect0 = self._select_drag_ref
             r = QRectF(rect0)
             r.translate(sp - start)
-            self._select_rect = self._clamp_to_scene(r)
+            self._select_rect = self._snap_rect_to_pixel(self._clamp_to_scene(r))
             self.viewport().update()
             return
 
@@ -2932,13 +2947,14 @@ class CanvasView(QGraphicsView):
                 top = min(top + d.y(), bottom - MIN_SELECTION)
             elif hy > 0:
                 bottom = max(bottom + d.y(), top + MIN_SELECTION)
-            self._select_rect = self._clamp_to_scene(QRectF(left, top, right - left, bottom - top))
+            self._select_rect = self._snap_rect_to_pixel(
+                self._clamp_to_scene(QRectF(left, top, right - left, bottom - top)))
             self.viewport().update()
             return
 
         if self._select_state == "dragging":
             if self._select_origin is not None:
-                self._select_rect = QRectF(self._select_origin, sp).normalized()
+                self._select_rect = self._snap_rect_to_pixel(QRectF(self._select_origin, sp).normalized())
         elif self._select_state == "adjust":
             h = self._select_handle_at(view_pos)
             if h is None:
@@ -2957,6 +2973,7 @@ class CanvasView(QGraphicsView):
                 # 예전 그대로면 그 영역에 그린 내용이 화면 밖처럼 잘려 사라진다).
                 self._resize_draw_layer(new_rect, old_rect)
                 self._scene.setSceneRect(new_rect)
+                self._clip_selection_to_canvas()
                 self.changed.emit()
             self._drag_handle = None
             self._canvas_resize_preview = None
@@ -3001,6 +3018,11 @@ class CanvasView(QGraphicsView):
         self._pending_move_positions = None
         if snapshot is None or before is None:
             return
+        # 확대/축소 상태에서 끌면 위치가 소수점이 되는데, 그러면 렌더 결과와
+        # 채우기·매직툴 마스크의 반올림이 1px 어긋나 가장자리가 안 칠해진다.
+        for it in self._scene.items():
+            if isinstance(it, QGraphicsPixmapItem) and before.get(id(it)) != it.pos():
+                it.setPos(self._snap_to_pixel(it.pos()))
         after = {id(it): it.pos() for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)}
         if before != after:
             self._undo_stack.append(snapshot)

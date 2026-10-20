@@ -11,10 +11,11 @@
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QSettings, QSize, Qt, Signal
+from PySide6.QtCore import QRect, QSettings, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon
-from PySide6.QtWidgets import (QColorDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                                QMenu, QPushButton, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
+from PySide6.QtWidgets import (QApplication, QColorDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+                                QLineEdit, QMenu, QProxyStyle, QPushButton, QSpinBox, QStyle,
+                                QStyleOptionComplex, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 from capture.config import (COLOR_BOX_PX, MAX_CUSTOM_COLORS, PALETTE_COLORS, STANDARD_COLORS,
                              THEME_COLORS, THEME_COLORS_NATIVE_8COL, get_resource_path)
@@ -34,6 +35,36 @@ _ARROW_STYLE = (
     "QToolButton#drawArrow:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
     "QToolButton#drawArrow:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
     "QToolButton#drawArrow::menu-indicator { subcontrol-origin: padding; subcontrol-position: center; }")
+
+# 색상 다이얼로그 H/S/V/R/G/B 스핀박스: 최대 3자리 숫자 + 좁힌 ▲▼ 버튼 폭.
+_COMPACT_SPIN_STYLE = "windows11"
+_COMPACT_SPIN_BUTTON_W = 18
+_COMPACT_SPIN_W = 70
+_PICK_SCREEN_ICON_PX = 20   # 'Pick Screen Color' 버튼 아이콘 (버튼 높이가 26→30px로 커짐)
+
+
+class _CompactSpinBoxStyle(QProxyStyle):
+    """Windows 11 스핀박스의 가로 ▲▼ 버튼 폭만 좁히는 프록시 스타일.
+
+    기본 버튼 폭으로는 스핀박스를 줄이면 숫자칸이 먼저 잘리므로, 그리기는
+    원래 스타일에 맡기고 버튼·숫자칸 영역 계산(그리기·클릭 판정 공용)만 바꾼다.
+    """
+
+    def subControlRect(self, cc: QStyle.ComplexControl, opt: QStyleOptionComplex,
+                       sc: QStyle.SubControl, widget: Optional[QWidget] = None) -> QRect:
+        """스핀박스의 ▲/▼/숫자칸 영역을 좁힌 버튼 폭 기준으로 다시 계산한다."""
+        r = super().subControlRect(cc, opt, sc, widget)
+        if cc != QStyle.ComplexControl.CC_SpinBox:
+            return r
+        right = opt.rect.right() - 2
+        bw = _COMPACT_SPIN_BUTTON_W
+        if sc == QStyle.SubControl.SC_SpinBoxDown:
+            return QRect(right - bw + 1, r.top(), bw, r.height())
+        if sc == QStyle.SubControl.SC_SpinBoxUp:
+            return QRect(right - 2 * bw + 1, r.top(), bw, r.height())
+        if sc == QStyle.SubControl.SC_SpinBoxEditField:
+            return QRect(r.left(), r.top(), right - 2 * bw - r.left() + 1, r.height())
+        return r
 
 
 class ColorDropdownButton(QWidget):
@@ -264,10 +295,10 @@ class ColorDropdownButton(QWidget):
         """Qt 기본 색상 다이얼로그를 우리 테마 색으로 채우고 라벨을 정리한다.
 
         QColorDialog은 내부 구조가 공개 API가 아니라 findChildren()으로 위젯을
-        찾아 텍스트/너비 같은 표시 속성만 조정한다. 라벨 텍스트·너비, HTML 입력칸
-        너비 조정, setStandardColor()는 안전하게 동작하지만, 숫자 입력용
-        QSpinBox는 너비를 강제로 줄이면 표시가 깨지는 PySide6 렌더링 문제가
-        있어 건드리지 않는다.
+        찾아 텍스트/너비 같은 표시 속성만 조정한다. 숫자 입력용 QSpinBox는
+        Windows 11 스타일의 가로 ▲▼ 버튼이 폭 대부분을 차지해 너비만 줄이면
+        숫자가 잘리므로, _CompactSpinBoxStyle로 버튼 폭을 함께 좁힌다 (다른
+        스타일에서는 버튼 배치가 달라 건드리지 않는다).
         """
         # "Basic colors"(8열 x 6행 = 48개로 고정) 라벨을 "Theme color"로 바꾸고
         # THEME_COLORS_NATIVE_8COL로 채운다. setStandardColor(index, ...)는
@@ -287,8 +318,23 @@ class ColorDropdownButton(QWidget):
                 label.setText(short_labels[key])
                 label.setFixedWidth(16)
 
-        # H/S/V 스핀박스와 비슷한 너비로 맞춘다 (스핀박스 자체는 너비를 강제로
-        # 줄이면 표시가 깨지므로, HTML 입력칸만 그 너비를 참고해 조정한다).
+        # 툴바 '색상 추출'과 같은 아이콘을 달아 같은 기능임을 바로 알아보게 한다.
+        for button in dlg.findChildren(QPushButton):
+            if button.text().replace("&", "").strip().lower() == "pick screen color":
+                button.setIcon(QIcon(str(get_resource_path("img/pipette.png"))))
+                button.setIconSize(QSize(_PICK_SCREEN_ICON_PX, _PICK_SCREEN_ICON_PX))
+
+        app_style = QApplication.style()
+        if app_style is not None and app_style.name().lower() == _COMPACT_SPIN_STYLE:
+            # 위젯에 지정한 스타일은 소유권이 넘어가지 않으므로 다이얼로그를
+            # 부모로 둬서 함께 정리되게 한다.
+            spin_style = _CompactSpinBoxStyle(_COMPACT_SPIN_STYLE)
+            spin_style.setParent(dlg)
+            for spin in dlg.findChildren(QSpinBox):
+                spin.setStyle(spin_style)
+                spin.setFixedWidth(_COMPACT_SPIN_W)
+
+        # H/S/V 스핀박스와 비슷한 너비로 맞춘다.
         html_edit = dlg.findChild(QLineEdit, "qt_colorname_lineedit")
         if html_edit is not None:
             html_edit.setFixedWidth(90)
