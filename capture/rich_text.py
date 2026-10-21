@@ -61,6 +61,33 @@ def char_format_changes(old_font: QFont, new_font: QFont, old_color: QColor,
     return fmt
 
 
+def merge_font_changes(font: QFont, fmt: QTextCharFormat) -> QFont:
+    """char_format_changes()가 만든 차이 서식을 박스 기본 폰트에 반영한 사본을 반환한다.
+
+    문서 전체에 서식을 병합한 뒤에도 박스 기본 폰트(meta)를 그대로 두면, 다음
+    편집·서식 변경 때 예전 기본값이 다시 쓰여 방금 바꾼 서식이 일부 되돌아간다.
+
+    Args:
+        font: 박스의 현재 기본 폰트.
+        fmt: 바뀐 속성만 담은 글자 서식.
+
+    Returns:
+        바뀐 속성(글꼴/크기/굵게/기울임)만 반영된 새 폰트.
+    """
+    merged = QFont(font)
+    if fmt.hasProperty(QTextCharFormat.Property.FontFamilies):
+        families = fmt.fontFamilies()
+        if families:
+            merged.setFamilies([str(f) for f in families])
+    if fmt.hasProperty(QTextCharFormat.Property.FontPointSize):
+        merged.setPointSizeF(fmt.fontPointSize())
+    if fmt.hasProperty(QTextCharFormat.Property.FontWeight):
+        merged.setBold(fmt.fontWeight() >= QFont.Weight.Bold)
+    if fmt.hasProperty(QTextCharFormat.Property.FontItalic):
+        merged.setItalic(fmt.fontItalic())
+    return merged
+
+
 def scaled_char_format(fmt: QTextCharFormat, factor: float) -> QTextCharFormat:
     """fmt에 글자 크기가 있으면 표시용으로 factor배 하고 원래 크기를 함께 기록한 사본을 반환한다."""
     scaled = QTextCharFormat(fmt)

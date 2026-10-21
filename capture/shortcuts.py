@@ -71,6 +71,7 @@ CAPTURE_ACTIONS: list[CaptureAction] = [
     CaptureAction("region", "영역 지정 캡처", "Ctrl+Shift+A"),
     CaptureAction("fullscreen", "전체화면 캡처", "Print"),
     CaptureAction("active_window", "활성 윈도우 캡처", "Alt+Print"),
+    CaptureAction("repeat", "마지막 영역 반복", "Ctrl+Shift+R"),
 ]
 
 _SETTINGS_GROUP = "shortcuts"
@@ -156,10 +157,14 @@ def load_shortcut(settings: QSettings, action: CaptureAction) -> QKeySequence:
     """설정에 저장된 단축키를 불러온다.
 
     설정에 값이 전혀 없으면 기본값을, 사용자가 명시적으로 "없음"(빈 문자열)을
-    저장했으면 빈 시퀀스를 반환한다.
+    저장했으면 빈 시퀀스를 반환한다. INI를 손으로 고쳐 문자열이 아닌 값(목록 등)이
+    들어 있으면 앱 시작이 막히지 않도록 기본값으로 되돌린다.
     """
     text = settings.value(f"{_SETTINGS_GROUP}/{action.action_id}", _MISSING)
     if text is _MISSING:
+        return QKeySequence(action.default)
+    if not isinstance(text, str):
+        logger.warning("단축키 설정값이 올바르지 않아 기본값 사용: %s = %r", action.action_id, text)
         return QKeySequence(action.default)
     return QKeySequence(text)
 

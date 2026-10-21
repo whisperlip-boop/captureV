@@ -3,7 +3,7 @@
 """사각 영역 캡처를 위한 전체화면 오버레이."""
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QKeyEvent, QMouseEvent,
@@ -24,20 +24,33 @@ class RegionOverlay(QWidget):
     fixed_size 가 주어지면 커서를 따라다니는 고정 크기 사각형 모드로 동작한다.
     """
 
-    captured = Signal(QImage, QRect)   # 잘라낸 이미지, 사용한 논리 좌표 사각형
+    captured = Signal(QImage, QRect)   # 잘라낸 이미지, 사용한 물리 픽셀 사각형(pixmap 좌표)
 
     def __init__(self, shot: Optional[DesktopShot] = None,
-                 fixed_size: Optional[Tuple[int, int]] = None) -> None:
+                 fixed_size: Optional[tuple[int, int]] = None) -> None:
         """오버레이를 생성하고 전체 가상 데스크톱 위에 배치한다.
 
         Args:
             shot: 재사용할 화면 그랩. None이면 새로 생성한다.
-            fixed_size: (width, height). 지정 시 고정 크기 캡처 모드로 동작한다.
+            fixed_size: (width, height) 실제(물리) 픽셀. 지정 시 고정 크기 캡처 모드로
+                동작하며, 결과 이미지는 화면보다 크지 않은 한 정확히 이 크기다.
+
+        Raises:
+            RuntimeError: 화면을 그랩할 수 없는 경우 (DesktopShot 참조).
         """
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.shot: DesktopShot = shot or DesktopShot()
-        self.fixed_size: Optional[Tuple[int, int]] = fixed_size
+        self.fixed_size: Optional[tuple[int, int]] = fixed_size
+        # 고정 크기는 물리 픽셀이라, 화면(논리 좌표)에 표시할 사각형은 배율로 나눈 크기다.
+        self._fixed_logical: Optional[tuple[int, int]] = None
+        if fixed_size is not None:
+            s = self.shot.scale
+            self._fixed_logical = (max(int(round(fixed_size[0] / s)), 1),
+                                   max(int(round(fixed_size[1] / s)), 1))
+        self._whole_screen: bool = False     # 더블클릭/Ctrl+A로 전체 화면을 고른 경우
+        # 고정 크기가 화면보다 커서 결과가 요청 크기보다 작게 잘렸는지 (확정 후 MainWindow가 확인)
+        self.fixed_clipped: bool = False
         self.setGeometry(self.shot.logical_geo)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setMouseTracking(True)
@@ -107,8 +120,9 @@ class RegionOverlay(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(sel.adjusted(0, 0, -1, -1))
 
-        # 크기/좌표 라벨
-        label = f"{sel.width()} x {sel.height()}   ({sel.left()}, {sel.top()})"
+        # 크기/좌표 라벨. 크기는 결과 이미지와 같은 물리 픽셀로 보여준다(배율 100%면 논리와 같다).
+        size = self._capture_rect().size()
+        label = f"{size.width()} x {size.height()}   ({sel.left()}, {sel.top()})"
         f = QFont(); f.setPointSize(9); p.setFont(f)
         fm = p.fontMetrics()
         tw, th = fm.horizontalAdvance(label) + 10, fm.height() + 6
@@ -194,8 +208,8 @@ class RegionOverlay(QWidget):
         pos = e.position().toPoint()
         self._cursor = pos
 
-        if self.fixed_size:
-            w, h = self.fixed_size
+        if self._fixed_logical:
+            w, h = self._fixed_logical
             self._sel = self._clamp(QRect(pos.x() - w // 2, pos.y() - h // 2, w, h))
             self.update()
             return
@@ -221,6 +235,7 @@ class RegionOverlay(QWidget):
         """idle 상태에서 좌클릭 더블클릭하면 전체화면을 확정한다."""
         if e.button() == Qt.MouseButton.LeftButton and self._state == "idle":
             self._sel = QRect(self.rect())
+            self._whole_screen = True
             self._confirm()
 
     def _cancel_drag(self) -> None:
@@ -246,15 +261,46 @@ class RegionOverlay(QWidget):
             return
         if key == Qt.Key.Key_A and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self._sel = QRect(self.rect())
+            self._whole_screen = True
             self._confirm()
 
     # ---------- 확정 ---------- #
+    def _capture_rect(self) -> QRect:
+        """현재 선택을 잘라낼 물리 픽셀 사각형(pixmap 좌표)으로 바꾼다.
+
+        고정 크기 모드는 표시 사각형(논리)을 다시 배율로 곱하면 반올림 때문에 1px씩
+        어긋날 수 있어, 좌상단만 변환하고 크기는 입력한 물리 픽셀 그대로 쓴다.
+        """
+        bounds = self.shot.pixel_rect()
+        if self._whole_screen:
+            return bounds
+        if self.fixed_size is None:
+            return self.shot.physical_rect(self._sel).intersected(bounds)
+        w, h = self.fixed_size
+        s = self.shot.scale
+        x = min(max(int(round(self._sel.left() * s)), 0), max(bounds.width() - w, 0))
+        y = min(max(int(round(self._sel.top() * s)), 0), max(bounds.height() - h, 0))
+        return QRect(x, y, w, h).intersected(bounds)
+
     def _confirm(self) -> None:
         """현재 선택 영역을 잘라내어 captured 신호로 방출하고 오버레이를 닫는다."""
         sel = self._sel
-        if sel.isNull() or sel.width() < MIN_SELECTION or sel.height() < MIN_SELECTION:
+        if sel.isNull():
             return
-        img = self.shot.crop(sel)
-        logger.info("영역 캡처 확정: %dx%d at (%d, %d)", sel.width(), sel.height(), sel.left(), sel.top())
+        # 고정 크기는 입력값(물리 픽셀)이 기준이라, 배율로 줄인 표시 크기가 작아도 막지 않는다.
+        if self.fixed_size is None and (sel.width() < MIN_SELECTION or sel.height() < MIN_SELECTION):
+            return
+        rect = self._capture_rect()
+        if rect.isEmpty():
+            return
+        img = self.shot.crop_pixels(rect)
+        clipped = (self.fixed_size is not None and not self._whole_screen
+                   and (rect.width(), rect.height()) != self.fixed_size)
+        self.fixed_clipped = clipped
+        if clipped:
+            logger.warning("고정 크기 캡처가 화면보다 커서 잘림: 요청 %dx%d -> %dx%d",
+                           self.fixed_size[0], self.fixed_size[1], rect.width(), rect.height())
+        logger.info("영역 캡처 확정: 물리 %dx%d at (%d, %d), 배율 %.2f",
+                    rect.width(), rect.height(), rect.left(), rect.top(), self.shot.scale)
         self.close()
-        self.captured.emit(img, QRect(sel))
+        self.captured.emit(img, QRect(rect))

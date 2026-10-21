@@ -5,10 +5,12 @@
 import logging
 import os
 import re
+import uuid
 from datetime import datetime
 from typing import Callable, Optional, cast
 
-from PySide6.QtCore import QPoint, QRect, QSettings, QSize, QStandardPaths, QUrl, Qt, Signal
+from PySide6.QtCore import (QByteArray, QPoint, QRect, QSettings, QSize, QStandardPaths, QTimer, QUrl, Qt,
+                            Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices,
                             QDragEnterEvent, QDropEvent, QFont, QGuiApplication, QIcon, QImage,
                             QImageReader, QKeySequence, QMouseEvent, QPixmap,
@@ -25,13 +27,15 @@ from capture.canvas_size_dialog import CanvasSizeDialog
 from capture.canvas_view import CanvasView
 from capture.color_pick_overlay import ColorPickOverlay
 from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHTNESS_CONTRAST_MAX,
-                            BRIGHTNESS_CONTRAST_MIN, CANVAS_SURROUND_COLOR, DEFAULT_BLUR_PERCENT,
+                            BRIGHTNESS_CONTRAST_MIN, CANVAS_SURROUND_COLOR, CAPTURE_HIDE_DELAY_MS,
+                            DEFAULT_BLUR_PERCENT,
                             DEFAULT_CANVAS_SIZE_BG_COLOR, DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE,
                             DEFAULT_FIXED_CAPTURE_HEIGHT, DEFAULT_FIXED_CAPTURE_WIDTH, DEFAULT_MOSAIC_PERCENT,
                             DEFAULT_NEW_CANVAS_BG_COLOR, DEFAULT_NEW_CANVAS_HEIGHT, DEFAULT_NEW_CANVAS_WIDTH,
                             DEFAULT_SAVE_FORMAT, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT,
                             DEFAULT_SVG_IMPORT_SCALE, DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS,
-                            EFFECT_MENU_ICON_PX, FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, HUE_SATURATION_MAX,
+                            EFFECT_MENU_ICON_PX, FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, FIXED_CAPTURE_SIZE_MAX,
+                            FIXED_CAPTURE_SIZE_MIN, HUE_SATURATION_MAX,
                             HUE_SATURATION_MIN, ICO_MAX_EDGE, MINI_TOOL_DIVIDER_COLOR, MINI_TOOL_ICON_PX,
                             MOSAIC_PERCENT_MAX, MOSAIC_PERCENT_MIN, NEW_CANVAS_PRESETS, NEW_CANVAS_SIZE_MAX,
                             NEW_CANVAS_SIZE_MIN,
@@ -41,13 +45,12 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                             SVG_EXTENSIONS, SVG_IMPORT_SCALE_MAX, SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_STEP,
                             SVG_MAX_LONG_EDGE, TAB_SAVED_COLOR, TAB_UNSAVED_COLOR, THICKNESS_MAX,
                             THICKNESS_MIN, TOOLBAR_ICON_PX, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN,
-                            get_resource_path, get_settings_path)
-from capture.desktop_shot import DesktopShot
+                            get_log_dir, get_resource_path, get_settings_path)
+from capture.desktop_shot import DesktopShot, has_mixed_screen_scales
 from capture.dialog_utils import strip_minmax_buttons
 from capture.dual_slider_dialog import DualSliderDialog
 from capture.hotkeys import HotkeyFilter, HotkeySpec, register_global_hotkeys, unregister_global_hotkeys
 from capture.image_resize_dialog import ImageResizeDialog
-from capture.logging_setup import get_log_dir
 from capture.palette import ColorDropdownButton, PaletteWidget
 from capture.percent_dialog import PercentSettingsDialog
 from capture.region_overlay import RegionOverlay
@@ -61,6 +64,13 @@ from capture.text_settings import TextSettingsPanel
 logger = logging.getLogger(__name__)
 
 _MAGIC_ARROW_PX = 12   # 매직툴 버튼 오른쪽 ▼(허용범위 메뉴) 영역 폭
+_NO_CANVAS_MSG = "적용할 캔버스가 없습니다."
+
+# 툴바·소형 버튼 공통 상태 스타일: 평상시엔 배경 없이, hover는 옅은 회색, 선택(체크)은
+# 눌린 느낌의 배경과 은은한 테두리.
+_BTN_HOVER_QSS = "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
+_BTN_CHECKED_QSS = ("QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
+                    "QToolButton:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }")
 
 
 class _PresetMenuStyle(QProxyStyle):
@@ -83,6 +93,7 @@ class _ClickableLabel(QLabel):
     clicked = Signal()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        """좌클릭이면 clicked 신호를 보낸다."""
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
@@ -92,6 +103,10 @@ class _ZoomPopup(QWidget):
     """확대/축소 배율(%)을 직접 입력하는 작은 팝업."""
 
     def __init__(self, current_percent: int, parent: QWidget) -> None:
+        """Args:
+            current_percent: 처음 표시할 배율(%).
+            parent: 팝업을 띄울 부모 위젯.
+        """
         super().__init__(parent, Qt.WindowType.Popup)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         layout = QHBoxLayout(self)
@@ -119,13 +134,24 @@ class MainWindow(QMainWindow):
         default_dir = os.path.join(
             QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation) or
             os.path.expanduser("~"), APP_NAME)
-        self.save_dir: str = cast(str, self.settings.value("save_dir", default_dir))
-        self.last_region: Optional[QRect] = None      # 마지막 캡처 영역(논리 좌표)
+        self.save_dir: str = self._read_str("save_dir", default_dir)
+        # 마지막 캡처 영역: 그때의 가상 데스크톱 좌상단 기준 물리 픽셀(DesktopShot.pixmap 좌표)과
+        # 그 좌상단의 절대 물리 좌표(physical_origin). 물리 픽셀로 기억해야 반복 캡처 결과가
+        # 처음 캡처와 정확히 같은 크기가 되고, 원점을 함께 기억해야 왼쪽/위에 모니터가 추가돼
+        # 가상 화면 원점이 바뀌어도 같은 화면 위치를 가리킨다.
+        self.last_region: Optional[QRect] = None
+        self._last_region_origin: QPoint = QPoint(0, 0)
         self._active_view: Optional[CanvasView] = None    # 탭 전환 시 이전 탭의 텍스트 편집 반영용
+        self._capture_pending: bool = False   # 창을 숨기고 화면 그랩을 기다리는 중(중복 실행 방지)
+        self._mixed_scale_warned: bool = False    # 모니터별 배율 차이 경고는 실행 중 한 번만
 
         geometry = self.settings.value("window_geometry")
-        if geometry is not None:
-            self.restoreGeometry(geometry)
+        # INI를 손으로 고치면 문자열 등이 들어와 restoreGeometry가 TypeError를 낸다.
+        if isinstance(geometry, (QByteArray, bytes, bytearray)):
+            if not self.restoreGeometry(geometry):
+                logger.warning("저장된 창 위치/크기를 복원하지 못함")
+        elif geometry is not None:
+            logger.warning("창 위치/크기 설정값이 올바르지 않아 무시: %s", type(geometry).__name__)
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
@@ -174,7 +200,76 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_shortcuts()
         self._update_status()
-        self._register_hotkeys()
+        failed_hotkeys = self._register_hotkeys()
+        if failed_hotkeys:
+            self.statusBar().showMessage(
+                "전역 단축키를 등록하지 못했습니다: " + ", ".join(failed_hotkeys), 8000)
+
+    # ---------- 설정 읽기 ---------- #
+    def _read_int(self, key: str, default: int, lo: int, hi: int) -> int:
+        """설정의 정수 값을 lo~hi 범위로 읽는다.
+
+        INI를 손으로 고쳐 숫자가 아니거나 범위를 벗어난 값이 들어 있어도 앱 시작이
+        막히지 않도록, 읽을 수 없으면 기본값을, 범위 밖이면 경계값을 쓰고 기록한다.
+
+        Args:
+            key: 설정 키.
+            default: 값이 없거나 읽을 수 없을 때 쓸 값.
+            lo: 허용 최솟값.
+            hi: 허용 최댓값.
+
+        Returns:
+            범위로 제한한 정수.
+        """
+        raw = self.settings.value(key, default)
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            logger.warning("설정값을 정수로 읽을 수 없어 기본값 사용: %s = %r", key, raw)
+            return min(max(default, lo), hi)
+        clamped = min(max(value, lo), hi)
+        if clamped != value:
+            logger.warning("설정값이 범위(%d~%d)를 벗어나 보정: %s = %d -> %d", lo, hi, key, value, clamped)
+        return clamped
+
+    def _read_color(self, key: str, default: str) -> QColor:
+        """설정의 색(hex 문자열)을 읽는다. 색으로 읽을 수 없으면 기본색을 쓰고 기록한다."""
+        raw = self.settings.value(key, default)
+        color = QColor(raw) if isinstance(raw, str) else QColor()
+        if not color.isValid():
+            logger.warning("설정값을 색으로 읽을 수 없어 기본값 사용: %s = %r", key, raw)
+            return QColor(default)
+        return color
+
+    def _read_bool(self, key: str, default: bool) -> bool:
+        """설정의 참/거짓 값을 읽는다 (INI에는 "true"/"false" 문자열로 저장된다)."""
+        raw = self.settings.value(key, default)
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if text in ("true", "1"):
+            return True
+        if text in ("false", "0"):
+            return False
+        logger.warning("설정값을 참/거짓으로 읽을 수 없어 기본값 사용: %s = %r", key, raw)
+        return default
+
+    def _read_str(self, key: str, default: str) -> str:
+        """설정의 문자열 값을 읽는다. 문자열이 아니거나 비어 있으면 기본값을 쓴다."""
+        raw = self.settings.value(key, default)
+        if isinstance(raw, str) and raw:
+            return raw
+        if raw != default:
+            logger.warning("설정값이 올바르지 않아 기본값 사용: %s = %r", key, raw)
+        return default
+
+    def _read_choice(self, key: str, default: str, choices: tuple[str, ...] | set[str]) -> str:
+        """설정의 문자열 값이 choices 중 하나면 그대로, 아니면 기본값을 쓰고 기록한다."""
+        value = self._read_str(key, default)
+        if value in choices:
+            return value
+        logger.warning("설정값이 허용 목록에 없어 기본값 사용: %s = %r", key, value)
+        return default
 
     # ---------- UI ---------- #
     @staticmethod
@@ -190,31 +285,27 @@ class MainWindow(QMainWindow):
         """도구 툴바를 구성한다. 도구는 상호 배타적으로 선택되며, 추후 다른 도구를 추가한다."""
         self._current_tool = "move"
 
-        saved_subtool = str(self.settings.value("draw_subtool", "brush"))
-        self._draw_subtool = saved_subtool if saved_subtool in ("brush", "eraser", "highlighter") else "brush"
+        self._draw_subtool = self._read_choice("draw_subtool", "brush", ("brush", "eraser", "highlighter"))
 
-        saved_shape_subtool = str(self.settings.value("shape_subtool", DEFAULT_SHAPE_SUBTOOL))
         valid_shape_subtools = {k for k, _ in SHAPE_KINDS} | {k for k, _ in LINE_KINDS}
-        self._shape_subtool = (saved_shape_subtool if saved_shape_subtool in valid_shape_subtools
-                                else DEFAULT_SHAPE_SUBTOOL)
+        self._shape_subtool = self._read_choice("shape_subtool", DEFAULT_SHAPE_SUBTOOL, valid_shape_subtools)
 
-        saved_thickness = int(str(self.settings.value("draw_thickness", DEFAULT_THICKNESS)))
-        self._draw_thickness = min(max(saved_thickness, THICKNESS_MIN), THICKNESS_MAX)
+        self._draw_thickness = self._read_int("draw_thickness", DEFAULT_THICKNESS, THICKNESS_MIN, THICKNESS_MAX)
 
-        self._draw_color = QColor(self.settings.value("draw_color", DEFAULT_DRAW_COLOR))
-        self._fill_tolerance = int(str(self.settings.value("fill_tolerance", DEFAULT_FILL_TOLERANCE)))
-        saved_magic_tolerance = int(str(self.settings.value("magic_tolerance", DEFAULT_FILL_TOLERANCE)))
-        self._magic_tolerance = min(max(saved_magic_tolerance, FILL_TOLERANCE_MIN), FILL_TOLERANCE_MAX)
-        self._new_canvas_width = int(str(self.settings.value("new_canvas_width", DEFAULT_NEW_CANVAS_WIDTH)))
-        self._new_canvas_height = int(str(self.settings.value("new_canvas_height", DEFAULT_NEW_CANVAS_HEIGHT)))
-        self._new_canvas_bg_color = QColor(
-            self.settings.value("new_canvas_bg_color", DEFAULT_NEW_CANVAS_BG_COLOR))
-        self._new_canvas_bg_transparent = bool(
-            self.settings.value("new_canvas_bg_transparent", False, type=bool))
-        self._canvas_size_bg_color = QColor(
-            self.settings.value("canvas_size_bg_color", DEFAULT_CANVAS_SIZE_BG_COLOR))
-        saved_svg_scale = int(str(self.settings.value("svg_import_scale", DEFAULT_SVG_IMPORT_SCALE)))
-        self._svg_import_scale = min(max(saved_svg_scale, SVG_IMPORT_SCALE_MIN), SVG_IMPORT_SCALE_MAX)
+        self._draw_color = self._read_color("draw_color", DEFAULT_DRAW_COLOR)
+        self._fill_tolerance = self._read_int("fill_tolerance", DEFAULT_FILL_TOLERANCE,
+                                              FILL_TOLERANCE_MIN, FILL_TOLERANCE_MAX)
+        self._magic_tolerance = self._read_int("magic_tolerance", DEFAULT_FILL_TOLERANCE,
+                                               FILL_TOLERANCE_MIN, FILL_TOLERANCE_MAX)
+        self._new_canvas_width = self._read_int("new_canvas_width", DEFAULT_NEW_CANVAS_WIDTH,
+                                                NEW_CANVAS_SIZE_MIN, NEW_CANVAS_SIZE_MAX)
+        self._new_canvas_height = self._read_int("new_canvas_height", DEFAULT_NEW_CANVAS_HEIGHT,
+                                                 NEW_CANVAS_SIZE_MIN, NEW_CANVAS_SIZE_MAX)
+        self._new_canvas_bg_color = self._read_color("new_canvas_bg_color", DEFAULT_NEW_CANVAS_BG_COLOR)
+        self._new_canvas_bg_transparent = self._read_bool("new_canvas_bg_transparent", False)
+        self._canvas_size_bg_color = self._read_color("canvas_size_bg_color", DEFAULT_CANVAS_SIZE_BG_COLOR)
+        self._svg_import_scale = self._read_int("svg_import_scale", DEFAULT_SVG_IMPORT_SCALE,
+                                                SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_MAX)
         self._color_pick_target: str = "draw"      # 색상 추출이 그리기 색/텍스트 색 중 어디로 갈지
 
         self._toolbar = QToolBar("main")
@@ -230,9 +321,7 @@ class MainWindow(QMainWindow):
         # 자리만큼의 빈 공간까지 포함해 네 버튼의 전체 높이·아이콘/텍스트 위치를 맞춘다.
         self._toolbar.setStyleSheet(
             "QToolButton { background: transparent; border: 1px solid transparent; border-radius: 4px; }"
-            "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
-            "QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
-            "QToolButton:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
+            + _BTN_HOVER_QSS + _BTN_CHECKED_QSS +
             "QToolButton#plainToolBtn { padding-bottom: 14px; }"
             "QToolButton#thicknessBtn { padding-bottom: 14px; }"
             "QToolButton#thicknessBtn::menu-indicator { subcontrol-origin: padding; subcontrol-position: bottom center; }"
@@ -320,26 +409,52 @@ class MainWindow(QMainWindow):
         new_settings_action.triggered.connect(self._open_new_canvas_settings_dialog)
         self._new_menu.addAction(new_settings_action)
 
+        self._make_split_tool_button(self._new_action, self._new_menu, arrow_checkable=False)
+
+    def _make_split_tool_button(self, action: QAction, menu: QMenu, arrow_checkable: bool = True) -> QToolButton:
+        """아이콘+텍스트 본체 아래에 하위 메뉴 화살표를 붙인 합성 버튼을 툴바에 추가한다.
+
+        QToolButton의 기본 MenuButtonPopup은 화살표가 오른쪽에 붙어 '두께'
+        버튼(화살표가 텍스트 하단 중앙)과 모양이 달라지므로, 본체 버튼과
+        화살표 버튼을 세로로 쌓은 합성 위젯으로 직접 구성해 모양을 통일한다.
+
+        Args:
+            action: 본체 버튼이 실행할 액션.
+            menu: 화살표를 누르면 열 하위 메뉴.
+            arrow_checkable: True면 화살표도 action의 선택 상태를 따라 눌린 모양이 된다
+                (도구 버튼). 즉시 실행되는 버튼('신규')은 False.
+
+        Returns:
+            화살표 버튼 (호출 측이 추가 신호를 연결할 때 사용).
+        """
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        new_body = QToolButton()
-        new_body.setDefaultAction(self._new_action)
-        new_body.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        new_body.setIconSize(QSize(TOOLBAR_ICON_PX, TOOLBAR_ICON_PX))
+        body = QToolButton()
+        body.setDefaultAction(action)
+        body.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        # 툴바의 addWidget()으로 들어가는 버튼은 QToolBar의 iconSize를 자동으로
+        # 물려받지 않아 명시적으로 지정해야 다른 도구 버튼과 아이콘 크기가 같아진다.
+        body.setIconSize(QSize(TOOLBAR_ICON_PX, TOOLBAR_ICON_PX))
 
-        new_arrow = QToolButton()
-        new_arrow.setObjectName("drawArrow")
-        new_arrow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        new_arrow.setMenu(self._new_menu)
-        new_arrow.setFixedHeight(14)
-        new_arrow.setFixedWidth(new_body.sizeHint().width())
+        arrow = QToolButton()
+        arrow.setObjectName("drawArrow")
+        arrow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        arrow.setMenu(menu)
+        arrow.setFixedHeight(14)
+        # 화살표 버튼 너비를 본체 버튼과 맞춰야 화살표가 '두께'처럼 버튼 중앙에 온다
+        # (QVBoxLayout은 자식 위젯을 컨테이너 너비만큼 자동으로 늘려주지 않는다).
+        arrow.setFixedWidth(body.sizeHint().width())
+        if arrow_checkable:
+            arrow.setCheckable(True)
+            action.toggled.connect(arrow.setChecked)
 
-        layout.addWidget(new_body)
-        layout.addWidget(new_arrow, alignment=Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(body)
+        layout.addWidget(arrow, alignment=Qt.AlignmentFlag.AlignHCenter)
         self._toolbar.addWidget(container)
+        return arrow
 
     def _open_new_canvas_settings_dialog(self) -> None:
         """'신규' 버튼 클릭 시 생성할 캔버스의 크기(Width/Height)와 배경을 설정한다."""
@@ -406,8 +521,16 @@ class MainWindow(QMainWindow):
         받을 수 없으므로, 추출하는 동안만 다이얼로그를 잠시 숨기고 오버레이가
         닫히면(추출 완료/취소 모두) 다시 보여준다.
         """
+        self._warn_mixed_scale_once()
         dialog.hide()
-        overlay = ColorPickOverlay()
+        try:
+            overlay = ColorPickOverlay()
+        except Exception:
+            # 숨긴 모달 다이얼로그가 그대로 남으면 앱이 멈춘 것처럼 보이므로 반드시 되돌린다.
+            logger.exception("색상 추출용 화면 그랩 실패")
+            dialog.show()
+            self._warn("화면을 캡처하지 못해 색상 추출을 시작할 수 없습니다.")
+            return
         dialog._pick_overlay = overlay     # GC로 창이 사라지지 않도록 붙잡아 둔다
 
         def on_picked(color: QColor) -> None:
@@ -445,12 +568,13 @@ class MainWindow(QMainWindow):
 
     def _add_blank_canvas(self, width: int, height: int) -> None:
         """설정된 배경(사용자 지정색/투명)으로 채운 width x height 캔버스를 새 탭으로 추가한다."""
-        if self._new_canvas_bg_transparent:
-            image = QImage(width, height, QImage.Format.Format_ARGB32)
-            image.fill(Qt.GlobalColor.transparent)
-        else:
-            image = QImage(width, height, QImage.Format.Format_RGB32)
-            image.fill(self._new_canvas_bg_color)
+        fmt = QImage.Format.Format_ARGB32 if self._new_canvas_bg_transparent else QImage.Format.Format_RGB32
+        image = QImage(width, height, fmt)
+        if image.isNull():
+            logger.warning("신규 캔버스 생성 실패(메모리 부족 추정): %dx%d", width, height)
+            self._warn(f"{width}x{height} 캔버스를 만들지 못했습니다.\n메모리가 부족할 수 있습니다.")
+            return
+        image.fill(Qt.GlobalColor.transparent if self._new_canvas_bg_transparent else self._new_canvas_bg_color)
         self.add_tab(image, datetime.now().strftime("%Y-%m-%d_%H%M%S"))
         logger.info("신규 캔버스 생성: %dx%d", width, height)
 
@@ -485,32 +609,7 @@ class MainWindow(QMainWindow):
         self._draw_action.triggered.connect(lambda: self._set_tool("draw"))
         self._tool_group.addAction(self._draw_action)
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        draw_body = QToolButton()
-        draw_body.setDefaultAction(self._draw_action)
-        draw_body.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        # 툴바의 addWidget()으로 들어가는 버튼은 QToolBar의 iconSize를 자동으로
-        # 물려받지 않아 명시적으로 지정해야 다른 도구 버튼과 아이콘 크기가 같아진다.
-        draw_body.setIconSize(QSize(TOOLBAR_ICON_PX, TOOLBAR_ICON_PX))
-
-        draw_arrow = QToolButton()
-        draw_arrow.setObjectName("drawArrow")
-        draw_arrow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        draw_arrow.setMenu(self._draw_menu)
-        draw_arrow.setCheckable(True)
-        draw_arrow.setFixedHeight(14)
-        # 화살표 버튼 너비를 본체 버튼과 맞춰야 화살표가 '두께'처럼 버튼 중앙에 온다
-        # (QVBoxLayout은 자식 위젯을 컨테이너 너비만큼 자동으로 늘려주지 않는다).
-        draw_arrow.setFixedWidth(draw_body.sizeHint().width())
-        self._draw_action.toggled.connect(draw_arrow.setChecked)
-
-        layout.addWidget(draw_body)
-        layout.addWidget(draw_arrow, alignment=Qt.AlignmentFlag.AlignHCenter)
-        self._toolbar.addWidget(container)
+        self._make_split_tool_button(self._draw_action, self._draw_menu)
 
     def _build_fill_button(self) -> None:
         """'채우기' 버튼(허용범위 하위 메뉴)을 구성한다.
@@ -530,28 +629,7 @@ class MainWindow(QMainWindow):
         tolerance_action.triggered.connect(self._open_fill_tolerance_dialog)
         self._fill_menu.addAction(tolerance_action)
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        fill_body = QToolButton()
-        fill_body.setDefaultAction(self._fill_action)
-        fill_body.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        fill_body.setIconSize(QSize(TOOLBAR_ICON_PX, TOOLBAR_ICON_PX))
-
-        fill_arrow = QToolButton()
-        fill_arrow.setObjectName("drawArrow")
-        fill_arrow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        fill_arrow.setMenu(self._fill_menu)
-        fill_arrow.setCheckable(True)
-        fill_arrow.setFixedHeight(14)
-        fill_arrow.setFixedWidth(fill_body.sizeHint().width())
-        self._fill_action.toggled.connect(fill_arrow.setChecked)
-
-        layout.addWidget(fill_body)
-        layout.addWidget(fill_arrow, alignment=Qt.AlignmentFlag.AlignHCenter)
-        self._toolbar.addWidget(container)
+        self._make_split_tool_button(self._fill_action, self._fill_menu)
 
     def _get_int(self, title: str, label: str, value: int, min_: int, max_: int) -> tuple[int, bool]:
         """제목줄에 닫기 버튼만 남은 정수 입력 다이얼로그를 열어 (값, 확인 여부)를 반환한다."""
@@ -639,20 +717,22 @@ class MainWindow(QMainWindow):
         self._text_action.triggered.connect(lambda: self._set_tool("text"))
         self._tool_group.addAction(self._text_action)
 
-        saved_text_color = QColor(self.settings.value("text_color", DEFAULT_TEXT_COLOR))
+        saved_text_color = self._read_color("text_color", DEFAULT_TEXT_COLOR)
         self._text_settings = TextSettingsPanel(saved_text_color, self.settings)
 
         # optionsChanged 연결 전에 모든 값을 먼저 복원한다. 먼저 연결해두면
         # set_font()/set_align() 각각이 optionsChanged를 즉시 발생시켜, 아직
         # 복원되지 않은 나머지 값(예: set_font 시점의 정렬)을 그 순간의
         # 기본값으로 다시 저장해버려 방금 불러온 값을 덮어쓰게 된다.
-        saved_font_str = str(self.settings.value("text_font", ""))
+        saved_font_str = self._read_str("text_font", "")
         if saved_font_str:
             saved_font = QFont()
-            saved_font.fromString(saved_font_str)
-            self._text_settings.set_font(saved_font)
-        self._text_settings.set_align(str(self.settings.value("text_align_h", "left")),
-                                       str(self.settings.value("text_align_v", "top")))
+            if saved_font.fromString(saved_font_str):
+                self._text_settings.set_font(saved_font)
+            else:
+                logger.warning("텍스트 글꼴 설정값을 읽을 수 없어 기본 글꼴 사용: %r", saved_font_str)
+        self._text_settings.set_align(self._read_choice("text_align_h", "left", ("left", "center", "right")),
+                                       self._read_choice("text_align_v", "top", ("top", "middle", "bottom")))
 
         self._text_settings.optionsChanged.connect(self._on_text_options_changed)
         self._text_settings.startColorPicking.connect(self._start_text_color_picking)
@@ -662,28 +742,7 @@ class MainWindow(QMainWindow):
         action.setDefaultWidget(self._text_settings)
         text_menu.addAction(action)
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        text_body = QToolButton()
-        text_body.setDefaultAction(self._text_action)
-        text_body.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        text_body.setIconSize(QSize(TOOLBAR_ICON_PX, TOOLBAR_ICON_PX))
-
-        text_arrow = QToolButton()
-        text_arrow.setObjectName("drawArrow")
-        text_arrow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        text_arrow.setMenu(text_menu)
-        text_arrow.setCheckable(True)
-        text_arrow.setFixedHeight(14)
-        text_arrow.setFixedWidth(text_body.sizeHint().width())
-        self._text_action.toggled.connect(text_arrow.setChecked)
-
-        layout.addWidget(text_body)
-        layout.addWidget(text_arrow, alignment=Qt.AlignmentFlag.AlignHCenter)
-        self._toolbar.addWidget(container)
+        self._make_split_tool_button(self._text_action, text_menu)
 
     def _build_shape_button(self) -> None:
         """'도형' 버튼(도형/선 갤러리 하위 메뉴)을 구성한다.
@@ -711,29 +770,8 @@ class MainWindow(QMainWindow):
         action.setDefaultWidget(self._shape_panel)
         self._shape_menu.addAction(action)
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        shape_body = QToolButton()
-        shape_body.setDefaultAction(self._shape_action)
-        shape_body.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        shape_body.setIconSize(QSize(TOOLBAR_ICON_PX, TOOLBAR_ICON_PX))
-
-        shape_arrow = QToolButton()
-        shape_arrow.setObjectName("drawArrow")
-        shape_arrow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        shape_arrow.setMenu(self._shape_menu)
-        shape_arrow.setCheckable(True)
-        shape_arrow.setFixedHeight(14)
-        shape_arrow.setFixedWidth(shape_body.sizeHint().width())
-        self._shape_action.toggled.connect(shape_arrow.setChecked)
+        shape_arrow = self._make_split_tool_button(self._shape_action, self._shape_menu)
         self._shape_action.triggered.connect(shape_arrow.showMenu)
-
-        layout.addWidget(shape_body)
-        layout.addWidget(shape_arrow, alignment=Qt.AlignmentFlag.AlignHCenter)
-        self._toolbar.addWidget(container)
 
     def _build_mini_tools_group(self) -> None:
         """색 박스 왼쪽에 '효과'/'회전'/'크기 조절'/'색상 추출' 2x2 소형 버튼 그룹을 구성한다.
@@ -755,10 +793,7 @@ class MainWindow(QMainWindow):
         resize_btn = self._make_mini_tool_button("크기 조절", "size.png", self._resize_menu)
         self._pick_btn = self._make_mini_tool_button("색상 추출", "pipette.png", None)
         self._pick_btn.setCheckable(True)
-        self._pick_btn.setStyleSheet(
-            "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
-            "QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
-            "QToolButton:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }")
+        self._pick_btn.setStyleSheet(_BTN_HOVER_QSS + _BTN_CHECKED_QSS)
         self._pick_btn.clicked.connect(self._start_color_picking)
         pick_btn = self._pick_btn
 
@@ -769,8 +804,7 @@ class MainWindow(QMainWindow):
         self._close_all_btn.setIcon(QIcon(str(get_resource_path("img/allclose.png"))))
         self._close_all_btn.setIconSize(QSize(MINI_TOOL_ICON_PX, MINI_TOOL_ICON_PX))
         self._close_all_btn.setToolTip("모든 탭 닫기")
-        self._close_all_btn.setStyleSheet(
-            "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }")
+        self._close_all_btn.setStyleSheet(_BTN_HOVER_QSS)
         self._close_all_btn.clicked.connect(self._close_all_tabs)
 
         # 매직툴은 '모든 탭 닫기' 아래 빈 칸에 아이콘만 둔다. 다른 도구와 같은
@@ -797,9 +831,7 @@ class MainWindow(QMainWindow):
         self._magic_btn.setStyleSheet(
             f"QToolButton {{ padding-right: {_MAGIC_ARROW_PX}px; }}"
             f"QToolButton::menu-button {{ width: {_MAGIC_ARROW_PX}px; border: none; }}"
-            "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
-            "QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
-            "QToolButton:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }")
+            + _BTN_HOVER_QSS + _BTN_CHECKED_QSS)
 
         # 네 버튼 너비를 통일해 화살표(v)가 텍스트 길이와 무관하게 항상
         # 같은 위치(오른쪽 끝)에 오도록 한다. 폭을 맞추지 않으면 짧은 글자의
@@ -861,10 +893,7 @@ class MainWindow(QMainWindow):
             btn.setMenu(menu)
             btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             btn.setCheckable(True)
-            btn.setStyleSheet(
-                "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
-                "QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
-                "QToolButton:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }")
+            btn.setStyleSheet(_BTN_HOVER_QSS + _BTN_CHECKED_QSS)
             menu.aboutToShow.connect(lambda b=btn: b.setChecked(True))
             menu.aboutToHide.connect(lambda b=btn: b.setChecked(False))
         return btn
@@ -915,76 +944,90 @@ class MainWindow(QMainWindow):
                                 Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         return QIcon(scaled)
 
-    def _open_mosaic_dialog(self) -> None:
-        """'모자이크' 팝업을 열어 선택 영역(없으면 캔버스 전체)에 모자이크를 적용한다."""
+    def _require_view(self, message: str = _NO_CANVAS_MSG) -> Optional[CanvasView]:
+        """현재 캔버스를 반환한다. 없으면 상태바에 message를 잠깐 띄우고 None을 반환한다."""
         v = self.current_view()
         if v is None:
-            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
+            self.statusBar().showMessage(message, 2500)
+        return v
+
+    def _run_percent_effect(self, title: str, label: str, current: int, lo: int, hi: int,
+                            apply: Callable[[CanvasView, int], None]) -> Optional[int]:
+        """%값 하나를 묻는 효과 팝업을 열고, 확인하면 현재 캔버스에 적용한다.
+
+        Args:
+            title: 팝업 제목.
+            label: 값 라벨.
+            current: 팝업에 처음 보여줄 값.
+            lo: 최솟값.
+            hi: 최댓값.
+            apply: (캔버스, 값)을 받아 효과를 적용하는 함수.
+
+        Returns:
+            적용한 값(다음에 기본값으로 기억할 값). 캔버스가 없거나 취소하면 None.
+        """
+        v = self._require_view()
+        if v is None:
+            return None
+        dialog = PercentSettingsDialog(title, label, current, lo, hi, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        percent = dialog.percent()
+        apply(v, percent)
+        return percent
+
+    def _run_dual_effect(self, title: str, label1: str, label2: str, lo: int, hi: int,
+                         apply: Callable[[CanvasView, int, int], None]) -> None:
+        """값 두 개(슬라이더 2개)를 묻는 효과 팝업을 열고, 확인하면 현재 캔버스에 적용한다.
+
+        모자이크/흐리게/선명하게와 달리 마지막 값을 기억하지 않고 열 때마다 항상 0/0에서 시작한다.
+
+        Args:
+            title: 팝업 제목.
+            label1: 첫 번째 값 라벨.
+            label2: 두 번째 값 라벨.
+            lo: 최솟값(두 값 공통).
+            hi: 최댓값(두 값 공통).
+            apply: (캔버스, 값1, 값2)를 받아 효과를 적용하는 함수.
+        """
+        v = self._require_view()
+        if v is None:
             return
-        dialog = PercentSettingsDialog("모자이크 설정", "모자이크 %", self._mosaic_percent,
-                                        MOSAIC_PERCENT_MIN, MOSAIC_PERCENT_MAX, self)
+        dialog = DualSliderDialog(title, label1, label2, lo, hi, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self._mosaic_percent = dialog.percent()
-        v.apply_mosaic(self._mosaic_percent)
+        apply(v, dialog.value1(), dialog.value2())
+
+    def _open_mosaic_dialog(self) -> None:
+        """'모자이크' 팝업을 열어 선택 영역(없으면 캔버스 전체)에 모자이크를 적용한다."""
+        percent = self._run_percent_effect("모자이크 설정", "모자이크 %", self._mosaic_percent,
+                                           MOSAIC_PERCENT_MIN, MOSAIC_PERCENT_MAX, CanvasView.apply_mosaic)
+        if percent is not None:
+            self._mosaic_percent = percent
 
     def _open_blur_dialog(self) -> None:
         """'흐리게' 팝업을 열어 선택 영역(없으면 캔버스 전체)에 가우시안 블러를 적용한다."""
-        v = self.current_view()
-        if v is None:
-            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
-            return
-        dialog = PercentSettingsDialog("흐리게 설정", "흐림 정도 %", self._blur_percent,
-                                        BLUR_PERCENT_MIN, BLUR_PERCENT_MAX, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self._blur_percent = dialog.percent()
-        v.apply_blur(self._blur_percent)
+        percent = self._run_percent_effect("흐리게 설정", "흐림 정도 %", self._blur_percent,
+                                           BLUR_PERCENT_MIN, BLUR_PERCENT_MAX, CanvasView.apply_blur)
+        if percent is not None:
+            self._blur_percent = percent
 
     def _open_sharpen_dialog(self) -> None:
         """'선명하게' 팝업을 열어 선택 영역(없으면 캔버스 전체)에 언샵 마스킹을 적용한다."""
-        v = self.current_view()
-        if v is None:
-            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
-            return
-        dialog = PercentSettingsDialog("선명하게 설정", "선명하게 %", self._sharpen_percent,
-                                        SHARPEN_PERCENT_MIN, SHARPEN_PERCENT_MAX, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self._sharpen_percent = dialog.percent()
-        v.apply_sharpen(self._sharpen_percent)
+        percent = self._run_percent_effect("선명하게 설정", "선명하게 %", self._sharpen_percent,
+                                           SHARPEN_PERCENT_MIN, SHARPEN_PERCENT_MAX, CanvasView.apply_sharpen)
+        if percent is not None:
+            self._sharpen_percent = percent
 
     def _open_brightness_contrast_dialog(self) -> None:
-        """'밝기/대비' 팝업을 열어 선택 영역(없으면 캔버스 전체)의 명도/대비를 조절한다.
-
-        모자이크/흐리게/선명하게와 달리 마지막 값을 기억하지 않고 열 때마다
-        항상 0/0에서 시작한다.
-        """
-        v = self.current_view()
-        if v is None:
-            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
-            return
-        dialog = DualSliderDialog("밝기/대비 설정", "명도(Brightness)", "대비(Contrast)",
-                                   BRIGHTNESS_CONTRAST_MIN, BRIGHTNESS_CONTRAST_MAX, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        v.apply_brightness_contrast(dialog.value1(), dialog.value2())
+        """'밝기/대비' 팝업을 열어 선택 영역(없으면 캔버스 전체)의 명도/대비를 조절한다."""
+        self._run_dual_effect("밝기/대비 설정", "명도(Brightness)", "대비(Contrast)",
+                              BRIGHTNESS_CONTRAST_MIN, BRIGHTNESS_CONTRAST_MAX, CanvasView.apply_brightness_contrast)
 
     def _open_hue_saturation_dialog(self) -> None:
-        """'색조/채도' 팝업을 열어 선택 영역(없으면 캔버스 전체)의 색조/채도를 조절한다.
-
-        밝기/대비와 마찬가지로 마지막 값을 기억하지 않고 열 때마다 항상
-        0/0에서 시작한다.
-        """
-        v = self.current_view()
-        if v is None:
-            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
-            return
-        dialog = DualSliderDialog("색조/채도 설정", "색조(Hue)", "채도(Saturation)",
-                                   HUE_SATURATION_MIN, HUE_SATURATION_MAX, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        v.apply_hue_saturation(dialog.value1(), dialog.value2())
+        """'색조/채도' 팝업을 열어 선택 영역(없으면 캔버스 전체)의 색조/채도를 조절한다."""
+        self._run_dual_effect("색조/채도 설정", "색조(Hue)", "채도(Saturation)",
+                              HUE_SATURATION_MIN, HUE_SATURATION_MAX, CanvasView.apply_hue_saturation)
 
     def _populate_rotate_menu(self) -> None:
         """'회전' 하위 메뉴(오른쪽/180도/왼쪽 회전, 자유 각도 회전, 상하/좌우 대칭 이동)를 구성한다."""
@@ -1016,9 +1059,8 @@ class MainWindow(QMainWindow):
 
     def _open_rotate_angle_dialog(self) -> None:
         """'자유로운 각도로 회전' 팝업을 열어 선택 영역(없으면 캔버스 전체)을 지정한 방향/각도로 회전한다."""
-        v = self.current_view()
+        v = self._require_view()
         if v is None:
-            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
             return
         dialog = RotateAngleDialog(self._rotate_angle, self._rotate_clockwise, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1039,23 +1081,23 @@ class MainWindow(QMainWindow):
 
     def _open_image_resize_dialog(self) -> None:
         """'이미지 크기 변경' 팝업을 열어 현재 캔버스의 실제 픽셀 크기를 리샘플링한다."""
-        v = self.current_view()
+        v = self._require_view("크기를 변경할 캔버스가 없습니다.")
         if v is None:
-            self.statusBar().showMessage("크기를 변경할 캔버스가 없습니다.", 2500)
             return
         r = v.canvas_rect()
         dialog = ImageResizeDialog(int(round(r.width())), int(round(r.height())), self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         width, height = dialog.target_size()
-        v.resize_image(width, height)
+        if not v.resize_image(width, height):
+            self._warn(f"이미지 크기를 {width}x{height}로 변경하지 못했습니다.\n메모리가 부족할 수 있습니다.")
+            return
         logger.info("이미지 크기 변경: %dx%d -> %dx%d", int(round(r.width())), int(round(r.height())), width, height)
 
     def _open_canvas_size_dialog(self) -> None:
         """'캔버스 크기 변경' 팝업을 열어 캔버스 경계(+확장 시 배경색)를 바꾼다."""
-        v = self.current_view()
+        v = self._require_view("크기를 변경할 캔버스가 없습니다.")
         if v is None:
-            self.statusBar().showMessage("크기를 변경할 캔버스가 없습니다.", 2500)
             return
         r = v.canvas_rect()
         dialog = CanvasSizeDialog(int(round(r.width())), int(round(r.height())), self._canvas_size_bg_color, self)
@@ -1064,7 +1106,9 @@ class MainWindow(QMainWindow):
         width, height = dialog.target_size()
         self._canvas_size_bg_color = dialog.background_color()
         self.settings.setValue("canvas_size_bg_color", self._canvas_size_bg_color.name())
-        v.resize_canvas(width, height, self._canvas_size_bg_color)
+        if not v.resize_canvas(width, height, self._canvas_size_bg_color):
+            self._warn(f"캔버스 크기를 {width}x{height}로 변경하지 못했습니다.\n메모리가 부족할 수 있습니다.")
+            return
         logger.info("캔버스 크기 변경: %dx%d -> %dx%d", int(round(r.width())), int(round(r.height())), width, height)
 
     def _add_canvas_op_action(self, menu: QMenu, text: str, icon_file: str, method_name: str) -> None:
@@ -1075,9 +1119,8 @@ class MainWindow(QMainWindow):
 
     def _run_canvas_op(self, method_name: str) -> None:
         """현재 활성 캔버스에서 지정한 이름의 메서드(회전/대칭 이동 등)를 실행한다."""
-        v = self.current_view()
+        v = self._require_view()
         if v is None:
-            self.statusBar().showMessage("적용할 캔버스가 없습니다.", 2500)
             return
         getattr(v, method_name)()
 
@@ -1094,17 +1137,27 @@ class MainWindow(QMainWindow):
             v.set_text_options(self._text_settings.current_font(), self._text_settings.color(),
                                self._text_settings.align_h(), self._text_settings.align_v())
 
-    def _sync_view(self, v: Optional[CanvasView]) -> None:
-        """현재 도구·그리기/텍스트 옵션·채우기 허용범위를 지정한 캔버스에 반영한다."""
+    def _sync_view(self, v: Optional[CanvasView], apply_draw_style: bool = False) -> None:
+        """현재 도구·그리기/텍스트 옵션·채우기 허용범위를 지정한 캔버스의 기본값으로 반영한다.
+
+        기본값만 맞추므로, 탭 전환 등으로 호출돼도 선택된 도형·텍스트를 다시 그리지 않는다.
+
+        Args:
+            v: 대상 캔버스. None이면 아무것도 하지 않는다.
+            apply_draw_style: True면 선택된 도형/선에도 현재 두께·색을 적용한다
+                (사용자가 두께·색을 직접 바꾼 경우에만).
+        """
         if v is None:
             return
         v.set_tool(self._current_tool)
-        v.set_draw_options(self._draw_subtool, self._draw_thickness, self._draw_color)
+        v.set_draw_options(self._draw_subtool, self._draw_thickness, self._draw_color,
+                           apply_to_selection=apply_draw_style)
         v.set_shape_subtool(self._shape_subtool)
         v.set_fill_tolerance(self._fill_tolerance)
         v.set_magic_tolerance(self._magic_tolerance)
         v.set_text_options(self._text_settings.current_font(), self._text_settings.color(),
-                            self._text_settings.align_h(), self._text_settings.align_v())
+                            self._text_settings.align_h(), self._text_settings.align_v(),
+                            apply_to_targets=False)
 
     def _set_tool(self, tool: str) -> None:
         """현재 활성 도구를 전환하고, 활성 탭의 캔버스에 반영한다."""
@@ -1131,13 +1184,13 @@ class MainWindow(QMainWindow):
         """선 두께를 설정하고 활성 캔버스에 반영한다."""
         self._draw_thickness = px
         self.settings.setValue("draw_thickness", px)
-        self._sync_view(self.current_view())
+        self._sync_view(self.current_view(), apply_draw_style=True)
 
     def _on_color_changed(self, color: QColor) -> None:
         """팔레트에서 색을 선택하면 그리기 색상을 갱신한다."""
         self._draw_color = QColor(color)
         self.settings.setValue("draw_color", self._draw_color.name())
-        self._sync_view(self.current_view())
+        self._sync_view(self.current_view(), apply_draw_style=True)
 
     def _start_color_picking(self) -> None:
         """색상 추출 도구(그리기 색): 화면 어디서든 다음 클릭 지점의 색을 추출하는 모드로 전환한다."""
@@ -1159,7 +1212,14 @@ class MainWindow(QMainWindow):
         """
         if self._color_pick_overlay is not None:
             return
-        self._color_pick_overlay = ColorPickOverlay()
+        self._warn_mixed_scale_once()
+        try:
+            self._color_pick_overlay = ColorPickOverlay()
+        except Exception:
+            logger.exception("색상 추출용 화면 그랩 실패")
+            self._pick_btn.setChecked(False)
+            self._warn("화면을 캡처하지 못해 색상 추출을 시작할 수 없습니다.")
+            return
         self._color_pick_overlay.picked.connect(self._on_color_picked)
         self._color_pick_overlay.destroyed.connect(self._on_color_pick_overlay_closed)
         self._pick_btn.setChecked(True)
@@ -1208,7 +1268,8 @@ class MainWindow(QMainWindow):
         self._options_menu.addAction(self._log_folder_action)
         self._options_menu.addSeparator()
 
-        def add(menu: QMenu, text: str, slot, shortcut: Optional[str] = None) -> QAction:
+        def add(menu: QMenu, text: str, slot: Callable[[], None], shortcut: Optional[str] = None) -> QAction:
+            """menu에 slot을 실행하는 액션을 추가한다(shortcut이 있으면 창 단축키도 지정)."""
             a = QAction(text, self)
             a.triggered.connect(slot)
             if shortcut:
@@ -1218,11 +1279,13 @@ class MainWindow(QMainWindow):
 
         self._capture_menu = self._options_menu.addMenu("캡처")
         # 라벨의 단축키 표기는 설정에서 바뀔 수 있으므로 하드코딩하지 않고
-        # _sync_region_capture_label()로 현재 설정값을 반영한다.
-        self._region_capture_action = add(self._capture_menu, "", self.start_capture)
-        self._sync_region_capture_label()
+        # _sync_capture_labels()로 현재 설정값을 반영한다.
+        self._capture_menu_actions: dict[str, QAction] = {
+            "region": add(self._capture_menu, "", self.start_capture),
+        }
         add(self._capture_menu, "고정 크기 캡처...", self.start_fixed_capture)
-        add(self._capture_menu, "마지막 영역 반복 (Ctrl+Shift+R)", self.repeat_capture)
+        self._capture_menu_actions["repeat"] = add(self._capture_menu, "", self.repeat_capture)
+        self._sync_capture_labels()
 
         self._edit_menu = self._options_menu.addMenu("편집")
         add(self._edit_menu, "붙여넣기", self.paste_into_current, "Ctrl+V")
@@ -1265,8 +1328,8 @@ class MainWindow(QMainWindow):
 
         # Ctrl+화살표: 한 번 누를 때마다 정확히 1px. 연속 이동 판정을 아예 거치지
         # 않으므로 아무리 빨리 연타해도 가속이 붙지 않는다. 자동 반복도 끄는데,
-        # 켜두면 키를 누르고 있는 동안 1px 이동이 되돌리기 스택(MAX_UNDO=20)을
-        # 가득 채워 그 전 편집 기록이 밀려나기 때문이다.
+        # 켜두면 키를 누르고 있는 동안 1px 이동이 되돌리기 기록(메모리 예산
+        # UNDO_MEMORY_BUDGET_BYTES)을 채워 그 전 편집 기록이 밀려나기 때문이다.
         for keys, (dx, dy) in nudges:
             shortcut = QShortcut(QKeySequence(f"Ctrl+{keys}"), self)
             shortcut.setAutoRepeat(False)
@@ -1457,7 +1520,7 @@ class MainWindow(QMainWindow):
             return "discard"
         return "cancel"
 
-    def _on_tab_changed(self, *_args) -> None:
+    def _on_tab_changed(self, *_args: object) -> None:
         """탭을 벗어나기 전 편집 중인 텍스트/자유곡선을 반영하고, 새 탭에 도구/옵션을 반영한다."""
         if self._active_view is not None:
             self._active_view.commit_pending_edit()
@@ -1465,7 +1528,7 @@ class MainWindow(QMainWindow):
         self._sync_view(self._active_view)
         self._update_status()
 
-    def _update_status(self, *_args) -> None:
+    def _update_status(self, *_args: object) -> None:
         """상태바에 캔버스 크기·배율, 마지막 캡처 영역, 저장 폴더를 표시한다."""
         v = self.current_view()
         has_view = v is not None
@@ -1505,30 +1568,95 @@ class MainWindow(QMainWindow):
         popup.spin.selectAll()
 
     # ---------- 캡처 ---------- #
-    def _open_overlay(self, fixed_size: Optional[tuple[int, int]] = None) -> None:
-        """메인 윈도우를 숨기고 영역 캡처 오버레이를 띄운다."""
+    def _capture_busy(self) -> bool:
+        """영역 오버레이가 떠 있거나, 창을 숨기고 화면 그랩을 기다리는 중인지 여부."""
+        return self._overlay is not None or self._capture_pending
+
+    def _restore_window(self) -> None:
+        """캡처 뒤 메인 윈도우를 다시 보이고 앞으로 가져온다 (최소화 상태였어도 복원)."""
+        if self.isMinimized():
+            # show()/raise_()만으로는 최소화가 풀리지 않는다. 최대화 여부는 그대로 둔다.
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _warn_mixed_scale_once(self) -> None:
+        """모니터별 배율이 다르면, 영역 지정 위치가 어긋날 수 있음을 실행 중 한 번만 알린다."""
+        if self._mixed_scale_warned or not has_mixed_screen_scales():
+            return
+        self._mixed_scale_warned = True
+        logger.warning("모니터별 배율이 서로 달라 사용자에게 경고함")
+        self._warn("모니터마다 배율(디스플레이 배율)이 달라, 일부 모니터에서는 지정한 영역과 "
+                   "실제로 캡처되는 위치가 조금 어긋날 수 있습니다.\n"
+                   "정확하게 캡처하려면 모든 모니터의 배율을 같게 맞추세요.")
+
+    def _hide_and_run(self, action: Callable[[], None]) -> None:
+        """메인 윈도우를 숨기고, 화면에서 완전히 사라질 시간을 준 뒤 action(화면 그랩)을 실행한다.
+
+        숨기자마자 그랩하면 창이 사라지기 전 프레임이 찍혀 잔상이 남을 수 있다.
+        action이 예외를 내면 숨긴 창을 되돌리고 경고한다.
+        """
+        self._capture_pending = True
         self.hide()
         QApplication.processEvents()
-        self._overlay = RegionOverlay(fixed_size=fixed_size)
-        self._overlay.captured.connect(self._on_captured)
-        self._overlay.destroyed.connect(self.show)
-        self._overlay.show()
-        self._overlay.activateWindow()
-        self._overlay.raise_()
-        self._overlay.setFocus()
+        QTimer.singleShot(CAPTURE_HIDE_DELAY_MS, lambda: self._run_hidden_capture(action))
+
+    def _run_hidden_capture(self, action: Callable[[], None]) -> None:
+        """_hide_and_run의 지연 실행부: action을 실행하고, 실패하면 창을 복원한 뒤 경고한다."""
+        try:
+            action()
+        except Exception:
+            logger.exception("화면 캡처 실패")
+            self._restore_window()
+            self._warn("화면을 캡처하지 못했습니다.\n자세한 내용은 옵션 > Log의 로그 파일을 확인하세요.")
+        finally:
+            self._capture_pending = False
+
+    def _open_overlay(self, fixed_size: Optional[tuple[int, int]] = None) -> None:
+        """메인 윈도우를 숨기고 영역 캡처 오버레이를 띄운다 (이미 캡처 중이면 무시).
+
+        Args:
+            fixed_size: 고정 크기 캡처의 (너비, 높이) 실제(물리) 픽셀. None이면 드래그 캡처.
+        """
+        if self._capture_busy():
+            logger.info("캡처가 이미 진행 중이라 영역 캡처 요청을 무시함")
+            return
+        self._warn_mixed_scale_once()
+        self._hide_and_run(lambda: self._show_region_overlay(fixed_size))
+
+    def _show_region_overlay(self, fixed_size: Optional[tuple[int, int]]) -> None:
+        """화면을 그랩해 영역 캡처 오버레이를 띄운다 (창을 숨긴 뒤 _hide_and_run이 호출)."""
+        overlay = RegionOverlay(fixed_size=fixed_size)
+        self._overlay = overlay
+        overlay.captured.connect(self._on_captured)
+        overlay.destroyed.connect(self._on_region_overlay_closed)
+        overlay.show()
+        overlay.activateWindow()
+        overlay.raise_()
+        overlay.setFocus()
+
+    def _on_region_overlay_closed(self) -> None:
+        """영역 캡처 오버레이가 닫히면(캡처/취소 모두) 참조를 지우고 메인 윈도우를 되돌린다."""
+        self._overlay = None
+        self._restore_window()
 
     def start_capture(self) -> None:
         """드래그 영역 캡처를 시작한다."""
         self._open_overlay()
 
     def start_fixed_capture(self) -> None:
-        """너비/높이를 입력받아 고정 크기 캡처를 시작한다 (마지막 입력값을 다음에도 기본값으로 제안)."""
-        default_w = int(str(self.settings.value("fixed_capture_width", DEFAULT_FIXED_CAPTURE_WIDTH)))
-        default_h = int(str(self.settings.value("fixed_capture_height", DEFAULT_FIXED_CAPTURE_HEIGHT)))
-        w, ok = self._get_int("고정 크기 캡처", "너비(px):", default_w, 8, 20000)
+        """너비/높이(실제 픽셀)를 입력받아 고정 크기 캡처를 시작한다 (마지막 입력값을 다음에도 기본값으로 제안)."""
+        if self._capture_busy():
+            return
+        default_w = self._read_int("fixed_capture_width", DEFAULT_FIXED_CAPTURE_WIDTH,
+                                   FIXED_CAPTURE_SIZE_MIN, FIXED_CAPTURE_SIZE_MAX)
+        default_h = self._read_int("fixed_capture_height", DEFAULT_FIXED_CAPTURE_HEIGHT,
+                                   FIXED_CAPTURE_SIZE_MIN, FIXED_CAPTURE_SIZE_MAX)
+        w, ok = self._get_int("고정 크기 캡처", "너비(px):", default_w, FIXED_CAPTURE_SIZE_MIN, FIXED_CAPTURE_SIZE_MAX)
         if not ok:
             return
-        h, ok = self._get_int("고정 크기 캡처", "높이(px):", default_h, 8, 20000)
+        h, ok = self._get_int("고정 크기 캡처", "높이(px):", default_h, FIXED_CAPTURE_SIZE_MIN, FIXED_CAPTURE_SIZE_MAX)
         if not ok:
             return
         self.settings.setValue("fixed_capture_width", w)
@@ -1537,70 +1665,123 @@ class MainWindow(QMainWindow):
 
     def repeat_capture(self) -> None:
         """직전 영역을 오버레이 없이 그대로 다시 캡처한다."""
-        if not self.last_region:
+        if self.last_region is None:
             self.statusBar().showMessage("반복할 영역이 없습니다. 먼저 영역 캡처를 하세요.", 3000)
             return
-        self.hide()
-        QApplication.processEvents()
+        if self._capture_busy():
+            return
+        self._warn_mixed_scale_once()
+        region = QRect(self.last_region)
+        origin = QPoint(self._last_region_origin)
+        self._hide_and_run(lambda: self._repeat_capture_now(region, origin))
+
+    def _repeat_capture_now(self, saved_region: QRect, saved_origin: QPoint) -> None:
+        """화면을 그랩해 지난번과 같은 화면 위치(물리 픽셀)를 잘라 새 탭으로 연다.
+
+        지난 캡처의 pixmap 좌표를 그때의 원점(saved_origin) 기준 절대 좌표로 되돌린 뒤
+        지금 원점 기준으로 다시 옮겨 비교한다. 모니터 배치·해상도가 바뀌어 영역이 지금
+        화면 범위를 벗어나면 말없이 잘린 이미지를 만들지 않고 경고한다.
+
+        Args:
+            saved_region: 지난 캡처 영역(그때의 pixmap 좌표, 물리 픽셀).
+            saved_origin: 그때 pixmap (0, 0)의 가상 데스크톱 절대 물리 좌표.
+        """
         shot = DesktopShot()
-        img = shot.crop(self.last_region)
-        self.show()
-        self.raise_()
+        region = saved_region.translated(saved_origin - shot.physical_origin)
+        bounds = shot.pixel_rect()
+        self._restore_window()
+        if not bounds.contains(region):
+            logger.warning("마지막 영역이 현재 화면 범위를 벗어나 반복 캡처 중단: 영역 %s, 화면 %dx%d",
+                           (region.x(), region.y(), region.width(), region.height()),
+                           bounds.width(), bounds.height())
+            self._warn("마지막 영역이 현재 화면 범위를 벗어났습니다.\n"
+                       "모니터 배치나 해상도가 바뀌었을 수 있으니 영역 캡처를 다시 하세요.")
+            return
+        img = shot.crop_pixels(region)
+        logger.info("마지막 영역 반복 캡처: %dx%d at (%d, %d)", img.width(), img.height(), region.x(), region.y())
         self.add_tab(img, datetime.now().strftime("반복 %H:%M:%S"))
 
     def _on_captured(self, image: QImage, region: QRect) -> None:
-        """오버레이에서 캡처가 확정되면 윈도우를 복원하고 새 탭을 추가한다."""
-        self.last_region = region
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        """오버레이에서 캡처가 확정되면 윈도우를 복원하고 새 탭을 추가한다.
+
+        Args:
+            image: 잘라낸 이미지.
+            region: 사용한 영역(물리 픽셀, DesktopShot.pixmap 좌표). 반복 캡처에 쓴다.
+        """
+        self.last_region = QRect(region)
+        overlay = self._overlay
+        self._last_region_origin = QPoint(overlay.shot.physical_origin) if overlay is not None else QPoint(0, 0)
+        self._restore_window()
         self.add_tab(image)
+        if overlay is not None and overlay.fixed_clipped and overlay.fixed_size is not None:
+            req_w, req_h = overlay.fixed_size
+            self._warn(f"요청한 크기({req_w}x{req_h})가 화면보다 커서 "
+                       f"{image.width()}x{image.height()}로 캡처했습니다.")
 
     def _capture_fullscreen(self) -> None:
         """전역 단축키로 전체화면을 캡처해 새 탭에 추가한다."""
-        img = screen_capture.capture_fullscreen()
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        if self._capture_busy():     # 영역 캡처 중이면 오버레이가 함께 찍히므로 무시
+            return
+        try:
+            img = screen_capture.capture_fullscreen()
+        except Exception:
+            logger.exception("전체화면 캡처 실패")
+            self._restore_window()
+            self._warn("화면을 캡처하지 못했습니다.\n자세한 내용은 옵션 > Log의 로그 파일을 확인하세요.")
+            return
+        self._restore_window()
         self.add_tab(img, datetime.now().strftime("전체화면 %H:%M:%S"))
 
     def _capture_active_window(self) -> None:
         """전역 단축키로 현재 활성 창을 캡처해 새 탭에 추가한다."""
-        img = screen_capture.capture_active_window()
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        if self._capture_busy():
+            return
+        try:
+            img = screen_capture.capture_active_window()
+        except Exception:
+            logger.exception("활성 윈도우 캡처 실패")
+            img = None
+        self._restore_window()
         if img is None:
             self.statusBar().showMessage("활성 윈도우를 캡처할 수 없습니다.", 4000)
             return
         self.add_tab(img, datetime.now().strftime("윈도우 %H:%M:%S"))
 
     # ---------- 단축키 ---------- #
-    def _register_hotkeys(self) -> None:
-        """설정에 저장된 단축키로 전역 캡처 단축키를 (재)등록한다."""
+    def _register_hotkeys(self) -> list[str]:
+        """설정에 저장된 단축키로 전역 캡처 단축키를 (재)등록한다.
+
+        Returns:
+            등록하지 못한 단축키 표시 문구 목록(예: "전체화면 캡처 (Print)"). 모두 성공하면 빈 목록.
+        """
         callbacks: dict[str, Callable[[], None]] = {
             "region": self.start_capture,
             "fullscreen": self._capture_fullscreen,
             "active_window": self._capture_active_window,
+            "repeat": self.repeat_capture,
         }
         specs = [
             HotkeySpec(action.action_id, load_shortcut(self.settings, action), callbacks[action.action_id])
             for action in CAPTURE_ACTIONS
         ]
-        specs.append(HotkeySpec("repeat", QKeySequence("Ctrl+Shift+R"), self.repeat_capture))
 
         app = cast(QApplication, QApplication.instance())
-        self.hotkey_filter = register_global_hotkeys(app, specs)
+        self.hotkey_filter, failed_ids = register_global_hotkeys(app, specs)
+        labels = {action.action_id: action.label for action in CAPTURE_ACTIONS}
+        return [f"{labels[spec.action_id]} ({spec.key_sequence.toString(QKeySequence.SequenceFormat.NativeText)})"
+                for spec in specs if spec.action_id in failed_ids]
 
-    def _sync_region_capture_label(self) -> None:
-        """'영역 지정 캡처' 메뉴 라벨에 현재 설정된 전역 단축키를 함께 표시한다.
+    def _sync_capture_labels(self) -> None:
+        """캡처 메뉴 라벨('영역 지정 캡처'/'마지막 영역 반복')에 현재 설정된 전역 단축키를 함께 표시한다.
 
         단축키를 "없음"으로 둔 경우에는 괄호 없이 이름만 표시한다.
         """
-        action = next(a for a in CAPTURE_ACTIONS if a.action_id == "region")
-        seq = load_shortcut(self.settings, action)
-        text = seq.toString(QKeySequence.SequenceFormat.NativeText)
-        self._region_capture_action.setText(f"{action.label} ({text})" if text else action.label)
+        for action in CAPTURE_ACTIONS:
+            menu_action = self._capture_menu_actions.get(action.action_id)
+            if menu_action is None:
+                continue
+            text = load_shortcut(self.settings, action).toString(QKeySequence.SequenceFormat.NativeText)
+            menu_action.setText(f"{action.label} ({text})" if text else action.label)
 
     def _open_svg_scale_dialog(self) -> None:
         """SVG 가져오기 배율(%)을 입력받아 설정에 저장한다.
@@ -1624,16 +1805,28 @@ class MainWindow(QMainWindow):
     def _open_shortcut_settings(self) -> None:
         """캡처 단축키 설정 다이얼로그를 열고, 저장되면 전역 단축키를 다시 등록한다."""
         dialog = ShortcutSettingsDialog(self.settings, self)
-        if dialog.exec() == ShortcutSettingsDialog.DialogCode.Accepted:
-            unregister_global_hotkeys(self.hotkey_filter)
-            self._register_hotkeys()
-            self._sync_region_capture_label()
-            self.statusBar().showMessage("캡처 단축키를 저장했습니다.", 3000)
+        if dialog.exec() != ShortcutSettingsDialog.DialogCode.Accepted:
+            return
+        unregister_global_hotkeys(self.hotkey_filter)
+        self.hotkey_filter = None
+        failed = self._register_hotkeys()
+        self._sync_capture_labels()
+        if failed:
+            self._warn("단축키 설정은 저장했지만, 다음 단축키를 전역 단축키로 등록하지 못했습니다.\n"
+                       "다른 프로그램이 이미 쓰고 있거나 지원하지 않는 키일 수 있습니다.\n\n"
+                       + "\n".join(failed))
+            return
+        self.statusBar().showMessage("캡처 단축키를 저장했습니다.", 3000)
 
     def _open_log_folder(self) -> None:
         """로그 파일이 저장되는 폴더를 파일 탐색기로 연다."""
         log_dir = get_log_dir()
-        log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception("로그 폴더 생성 실패: %s", log_dir)
+            self._warn(f"로그 폴더를 열 수 없습니다:\n{log_dir}")
+            return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir)))
 
     # ---------- 편집/저장 ---------- #
@@ -1800,9 +1993,11 @@ class MainWindow(QMainWindow):
         path = self._ensure_save_extension(path, selected_filter)
         fmt = self._format_for_path(path)
         if fmt is None:
+            # 안내 목록은 실제 허용 목록(SAVE_EXT_TO_FORMAT)에서 만들어 형식을 추가해도 어긋나지 않게 한다.
+            supported = ", ".join(dict.fromkeys(SAVE_EXT_TO_FORMAT.values()))
             self._warn("지원하지 않는 저장 형식입니다:\n"
                        f"{os.path.basename(path)}\n\n"
-                       "PNG, JPEG, WebP, AVIF, BMP 중 하나의 확장자를 사용하세요.\n"
+                       f"{supported} 중 하나의 확장자를 사용하세요.\n"
                        "(SVG는 벡터 형식이라 편집 결과를 되돌려 저장할 수 없습니다.)")
             return
         self._write_image(v, path, fmt)
@@ -1900,25 +2095,45 @@ class MainWindow(QMainWindow):
             return
         if fmt == "ICO" and not self._confirm_ico_downscale(image):
             return
+        # 원본 파일에 바로 쓰다가 실패하면(디스크 부족·인코딩 오류 등) 원본이 반쯤 쓰인 채
+        # 망가진다. 같은 폴더의 임시 파일에 끝까지 쓴 뒤 os.replace로 한 번에 바꿔치기한다
+        # (같은 볼륨 안의 교체라 중간 상태가 남지 않는다).
+        tmp_path: Optional[str] = None
+        saved = False
         try:
             directory = os.path.dirname(path)
             if directory:
                 os.makedirs(directory, exist_ok=True)
+            # tempfile.mkstemp는 Windows에서 쓰기 금지 폴더(Program Files 등)를 만나면
+            # PermissionError를 '이름 충돌'로 보고 수십억 번 재시도해 UI가 멈춘다. 충돌할 일
+            # 없는 이름으로 한 번만 만들고, 실패하면 곧바로 아래 OSError 경로로 보낸다.
+            # 폴더를 생략하면 시스템 temp(다른 볼륨일 수 있어 os.replace 실패)가 아니라
+            # 대상과 같은 현재 폴더를 쓴다.
+            candidate = os.path.join(directory or ".", f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp")
+            os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+            tmp_path = candidate     # 만든 뒤에만 기록해야 실패 시 없는 파일을 지우려 하지 않는다
             quality = SAVE_QUALITY.get(fmt, -1)
             if fmt in PILLOW_FORMATS:
                 # Qt에 AVIF 플러그인이 없어 QImage.save()로는 저장할 수 없다.
-                write_avif(image, path, quality)
+                write_avif(image, tmp_path, quality)
                 saved = True
             else:
                 # PySide6 QImage.save()의 타입 스텁은 format 인자를 bytes로 표기하지만
                 # 실제로는 bytes를 넘기면 런타임 오류가 나고 str만 정상 동작한다(스텁 오류).
-                saved = image.save(path, fmt, quality)  # type: ignore[call-overload]
+                # 임시 파일 확장자(.tmp)로 형식을 추측하지 않도록 형식을 명시한다.
+                saved = image.save(tmp_path, fmt, quality)  # type: ignore[call-overload]
+            if saved:
+                os.replace(tmp_path, path)
+                tmp_path = None
         except (OSError, MemoryError):
             # MemoryError는 OSError가 아니라, 큰 캔버스를 저장할 때 이걸 빼면
             # 저장 실패가 예외로 앱까지 올라간다.
             logger.exception("저장 실패: %s", path)
             self._warn(f"저장 실패:\n{path}")
             return
+        finally:
+            if tmp_path is not None:
+                self._remove_temp_file(tmp_path)
         if saved:
             v.file_path = path
             self._mark_saved(v, path)
@@ -1928,6 +2143,16 @@ class MainWindow(QMainWindow):
             logger.warning("이미지 저장 실패(포맷/경로 문제): %s", path)
             self._warn(f"저장 실패:\n{path}")
 
+    @staticmethod
+    def _remove_temp_file(path: str) -> None:
+        """저장에 실패해 남은 임시 파일을 지운다 (지우지 못해도 저장 실패 처리는 계속한다)."""
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("임시 파일 삭제 실패: %s", path, exc_info=True)
+
     # ---------- 파일 로딩 ---------- #
     def open_files(self) -> None:
         """파일 대화상자로 고른 이미지들을 각각 새 탭으로 연다.
@@ -1936,31 +2161,40 @@ class MainWindow(QMainWindow):
         나머지를 모두 연 뒤 실패 목록을 한 번에 알려준다(파일 하나마다 경고를
         띄우면 여러 개를 고른 경우 대화상자가 연달아 떠 방해가 된다).
         """
-        start = str(self.settings.value("open_dir", self.save_dir))
+        start = self._read_str("open_dir", self.save_dir)
         paths, _ = QFileDialog.getOpenFileNames(self, "열기", start, OPEN_FILTERS)
         if not paths:
             return
         self.settings.setValue("open_dir", os.path.dirname(paths[0]))
 
-        failed: list[str] = []
-        for path in paths:
-            image = self._load_image_file(path)
-            if image.isNull():
-                failed.append(os.path.basename(path))
-                logger.warning("열기 실패(이미지로 읽을 수 없음): %s", path)
-                continue
-            view = self.add_tab(image, os.path.basename(path))
-            # 원본을 그대로 덮어써도 잃을 것이 없는 포맷만 경로를 기억해 Ctrl+S가
-            # 곧바로 덮어쓰게 한다. "저장할 수 있는가"(_format_for_path)로 판단하면
-            # 안 된다 - ICO/TIFF는 저장은 되지만 멀티사이즈/멀티페이지가 단일
-            # 이미지로 납작해져, Ctrl+S 한 번에 원본이 파괴된다.
-            if os.path.splitext(path)[1].lstrip(".").lower() in OVERWRITE_SAFE_EXTENSIONS:
-                view.file_path = path
-                self._mark_saved(view, path)
-            logger.info("열기: %s (%dx%d)", path, image.width(), image.height())
-
+        failed = [os.path.basename(path) for path in paths if not self._open_path(path)]
         if failed:
             self._warn("이미지로 열 수 없어 건너뛴 파일:\n" + "\n".join(failed))
+
+    def _open_path(self, path: str) -> bool:
+        """이미지 파일 하나를 새 탭으로 연다 (열기 대화상자·드래그&드롭 공용).
+
+        Args:
+            path: 열 파일의 로컬 경로.
+
+        Returns:
+            열었으면 True, 이미지로 읽을 수 없으면 False.
+        """
+        image = self._load_image_file(path)
+        if image.isNull():
+            logger.warning("열기 실패(이미지로 읽을 수 없음): %s", path)
+            return False
+        view = self.add_tab(image, os.path.basename(path))
+        # 원본을 그대로 덮어써도 잃을 것이 없는 포맷만 경로를 기억해 Ctrl+S가
+        # 곧바로 덮어쓰게 한다. "저장할 수 있는가"(_format_for_path)로 판단하면
+        # 안 된다 - ICO/TIFF는 저장은 되지만 멀티사이즈/멀티페이지가 단일
+        # 이미지로 납작해져, Ctrl+S 한 번에 원본이 파괴된다. 열기와 드롭이 같은
+        # 기준을 써야 같은 PNG의 Ctrl+S 동작이 여는 방법에 따라 달라지지 않는다.
+        if os.path.splitext(path)[1].lstrip(".").lower() in OVERWRITE_SAFE_EXTENSIONS:
+            view.file_path = path
+            self._mark_saved(view, path)
+        logger.info("열기: %s (%dx%d)", path, image.width(), image.height())
+        return True
 
     def _load_image_file(self, path: str) -> QImage:
         """이미지 파일을 QImage로 읽는다.
@@ -2024,28 +2258,50 @@ class MainWindow(QMainWindow):
             e.acceptProposedAction()
 
     def dropEvent(self, e: QDropEvent) -> None:
-        """드롭된 이미지나 이미지 파일을 새 탭으로 추가한다."""
+        """드롭된 이미지나 이미지 파일을 새 탭으로 추가하고, 열지 못한 항목은 모아서 알린다."""
         md = e.mimeData()
+        e.acceptProposedAction()
+        failed: list[str] = []
         if md.hasImage():
-            self.add_tab(QImage(md.imageData()))
-            return
-        for url in md.urls():
-            local_path = url.toLocalFile()
-            img = self._load_image_file(local_path)
-            if img.isNull():
-                logger.warning("드롭된 파일을 이미지로 열 수 없음: %s", local_path)
-                continue
-            view = self.add_tab(img, os.path.basename(local_path))
-            # 드롭도 '파일 열기'이므로 Ctrl+O(open_files)와 같은 기준으로 원본
-            # 경로를 기억한다. 한쪽만 기억하면 같은 PNG인데도 드롭했을 때는
-            # Ctrl+S가 '다른 이름으로 저장'으로, Ctrl+O로 열었을 때는 덮어쓰기로
-            # 갈려 동작을 예측할 수 없다.
-            if os.path.splitext(local_path)[1].lstrip(".").lower() in OVERWRITE_SAFE_EXTENSIONS:
-                view.file_path = local_path
-                self._mark_saved(view, local_path)
+            data = md.imageData()
+            # QImage(QPixmap)은 TypeError라 QPixmap은 toImage()로 바꾼다.
+            if isinstance(data, QPixmap):
+                image = data.toImage()
+            elif isinstance(data, QImage):
+                image = QImage(data)
+            else:
+                image = QImage()
+            if image.isNull():
+                logger.warning("드롭된 이미지 데이터를 읽을 수 없음: %s", type(data).__name__)
+                failed.append("(드롭한 이미지 데이터)")
+            else:
+                self.add_tab(image)
+        else:
+            for url in md.urls():
+                local_path = url.toLocalFile()
+                if not local_path:
+                    logger.warning("로컬 파일이 아닌 드롭 항목은 열 수 없음: %s", url.toString())
+                    failed.append(url.toString())
+                elif not self._open_path(local_path):
+                    failed.append(os.path.basename(local_path))
+        if failed:
+            # 드롭 처리 중에 모달 창을 띄우면 끌어온 프로그램(탐색기 등)이 창을 닫을 때까지
+            # 멈춰 있으므로, 드롭이 끝난 뒤 알린다.
+            message = "이미지로 열 수 없어 건너뛴 항목:\n" + "\n".join(failed)
+            QTimer.singleShot(0, lambda: self._warn(message))
 
     # ---------- 종료 ---------- #
     def closeEvent(self, event: QCloseEvent) -> None:
-        """창을 닫을 때 다음 실행에 복원할 창 크기/위치를 저장한다."""
+        """창을 닫기 전에 미저장 탭 처리 방법을 묻고, 다음 실행에 복원할 창 크기/위치를 저장한다.
+
+        '모든 탭 닫기'와 같은 흐름으로 미저장 탭마다 저장 여부를 묻는다. 사용자가
+        취소하거나 저장이 취소·실패해 탭이 남으면 종료하지 않는다(그 앞까지 처리된
+        탭은 닫힌 채로 둔다).
+        """
         self.settings.setValue("window_geometry", self.saveGeometry())
+        self._close_all_tabs()
+        if self.tabs.count() > 0:
+            logger.info("종료 취소: 닫히지 않은 탭 %d개", self.tabs.count())
+            event.ignore()
+            return
         super().closeEvent(event)

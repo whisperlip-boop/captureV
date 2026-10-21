@@ -6,7 +6,7 @@ import ctypes
 import logging
 from typing import Callable, NamedTuple, Optional
 
-from PySide6.QtCore import QAbstractNativeEventFilter
+from PySide6.QtCore import QAbstractNativeEventFilter, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QApplication
 
@@ -50,14 +50,17 @@ class HotkeyFilter(QAbstractNativeEventFilter):
                 if msg.message == self.WM_HOTKEY:
                     cb = self.callbacks.get(int(msg.wParam))
                     if cb:
-                        cb()
+                        # 네이티브 메시지 처리 도중에 모달 대화상자·오버레이를 띄우면
+                        # 재진입 문제가 생길 수 있어, 이벤트 루프로 돌아간 뒤 실행한다.
+                        QTimer.singleShot(0, cb)
                         return True, 0
             except Exception:
                 logger.exception("전역 단축키 처리 중 오류 (message=%r)", message)
         return False, 0
 
 
-def register_global_hotkeys(app: QApplication, specs: list[HotkeySpec]) -> Optional[HotkeyFilter]:
+def register_global_hotkeys(app: QApplication,
+                           specs: list[HotkeySpec]) -> tuple[Optional[HotkeyFilter], list[str]]:
     """전역 단축키 목록을 등록한다.
 
     Args:
@@ -65,14 +68,16 @@ def register_global_hotkeys(app: QApplication, specs: list[HotkeySpec]) -> Optio
         specs: 등록할 (액션 ID, 키 시퀀스, 콜백) 목록.
 
     Returns:
-        설치된 HotkeyFilter. Windows가 아니면 None.
+        (설치된 HotkeyFilter, 등록하지 못한 액션 ID 목록). Windows가 아니면 (None, []).
+        "없음"(빈 시퀀스)으로 둔 액션은 실패 목록에 넣지 않는다.
     """
     if not IS_WIN:
         logger.info("Windows가 아니므로 전역 단축키를 등록하지 않음")
-        return None
+        return None, []
     user32 = ctypes.windll.user32
     filt = HotkeyFilter({})
     app.installNativeEventFilter(filt)
+    failed: list[str] = []
 
     for hotkey_id, spec in enumerate(specs, start=1):
         if spec.key_sequence.isEmpty():
@@ -82,6 +87,7 @@ def register_global_hotkeys(app: QApplication, specs: list[HotkeySpec]) -> Optio
         if conv is None:
             logger.warning("전역 단축키 등록 건너뜀(지원하지 않는 키): %s = %s",
                             spec.action_id, spec.key_sequence.toString())
+            failed.append(spec.action_id)
             continue
         mods, vk = conv
         ok = user32.RegisterHotKey(None, hotkey_id, mods, vk)
@@ -92,11 +98,15 @@ def register_global_hotkeys(app: QApplication, specs: list[HotkeySpec]) -> Optio
         else:
             logger.warning("전역 단축키 등록 실패(다른 프로그램이 선점했을 수 있음): %s = %s",
                             spec.action_id, spec.key_sequence.toString())
-    return filt
+            failed.append(spec.action_id)
+    return filt, failed
 
 
 def unregister_global_hotkeys(filt: Optional[HotkeyFilter]) -> None:
-    """register_global_hotkeys()로 등록한 전역 단축키를 모두 해제한다.
+    """register_global_hotkeys()로 등록한 전역 단축키를 모두 해제하고 이벤트 필터를 제거한다.
+
+    필터 제거를 GC에 맡기면 재등록 직후 이전 필터가 잠시 남아 같은 메시지를 두 번
+    처리할 수 있어, QApplication에서 직접 떼어낸다.
 
     Args:
         filt: register_global_hotkeys()가 반환한 필터. None이면 아무 것도 하지 않는다.
@@ -106,4 +116,8 @@ def unregister_global_hotkeys(filt: Optional[HotkeyFilter]) -> None:
     user32 = ctypes.windll.user32
     for hotkey_id in filt.callbacks:
         user32.UnregisterHotKey(None, hotkey_id)
+    filt.callbacks.clear()
+    app = QApplication.instance()
+    if app is not None:
+        app.removeNativeEventFilter(filt)
     logger.info("전역 단축키 해제 완료")

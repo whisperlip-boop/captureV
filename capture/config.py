@@ -75,6 +75,16 @@ def get_settings_path() -> Path:
     base = Path(os.environ.get("APPDATA", str(Path.home())))
     return base / APP_NAME / f"{APP_NAME}.ini"
 
+
+def get_log_dir() -> Path:
+    """로그 파일 폴더 경로를 반환한다 (%APPDATA%\\CaptureV\\logs, 설정 파일과 같은 폴더 아래).
+
+    QApplication 생성 전(로깅 초기화 시점)과 후(Log 메뉴)에 항상 같은 경로가
+    나와야 하므로, 앱 이름 설정 여부에 따라 결과가 달라지는 QStandardPaths 대신
+    설정 파일 경로와 같은 규칙으로 계산한다.
+    """
+    return get_settings_path().parent / "logs"
+
 # 8방향 핸들: (dx, dy) ∈ {-1, 0, 1}
 HANDLES: list[tuple[int, int]] = [(-1, -1), (0, -1), (1, -1),
                                    (-1, 0), (1, 0),
@@ -169,6 +179,8 @@ TAB_SAVED_COLOR: str = "#7DCD28"
 # ---------- 텍스트 도구 ---------- #
 DEFAULT_TEXT_COLOR: str = "#000000"
 DEFAULT_TEXT_FONT_SIZE: int = 12
+TEXT_FONT_SIZE_MIN: int = 1
+TEXT_FONT_SIZE_MAX: int = 400
 TEXT_FONT_SIZES: list[int] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72]
 TEXT_ICON_PX: int = 20     # 텍스트 설정 팝업의 정렬/볼드/이탤릭 아이콘 크기
 
@@ -178,8 +190,21 @@ MINI_TOOL_DIVIDER_COLOR: str = "#8A8A8A"   # 좌우 구분선 색(약간 짙은 
 EFFECT_MENU_ICON_PX: int = 16  # '효과' 하위 메뉴 항목 아이콘 크기(기존 메뉴 높이를 유지하는 크기)
 
 # ---------- 고정 크기 캡처 ---------- #
+# 입력값은 실제(물리) 픽셀이다. 고DPI 화면에서도 결과 이미지가 입력 크기와 정확히 같다.
 DEFAULT_FIXED_CAPTURE_WIDTH: int = 800
 DEFAULT_FIXED_CAPTURE_HEIGHT: int = 600
+FIXED_CAPTURE_SIZE_MIN: int = 8
+FIXED_CAPTURE_SIZE_MAX: int = 20000
+
+# ---------- 캡처 공통 ---------- #
+# 메인 윈도우를 숨긴 뒤 화면에서 완전히 사라질 때까지 기다리는 시간. 숨기자마자
+# 그랩하면 DWM 합성이 끝나기 전 프레임이 찍혀 메인 윈도우 잔상이 남을 수 있다.
+CAPTURE_HIDE_DELAY_MS: int = 120
+
+# ---------- 실행 취소 ---------- #
+# 되돌리기 스냅샷이 차지할 수 있는 픽스맵 메모리 상한(추정치, 바이트). 개수 제한은
+# 캔버스 크기에 따라 메모리 사용량이 수십 배 달라져 예산으로 제한한다.
+UNDO_MEMORY_BUDGET_BYTES: int = 512 * 1024 * 1024
 
 # ---------- 캔버스 크기 변경 팝업 ---------- #
 DEFAULT_CANVAS_SIZE_BG_COLOR: str = "#F2F2F2"

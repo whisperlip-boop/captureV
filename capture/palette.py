@@ -76,9 +76,10 @@ class ColorDropdownButton(QWidget):
 
     colorChanged = Signal(QColor)
     startColorPicking = Signal()   # 색상 추출 도구 클릭 시 발생 (사용하는 쪽이 처리)
+    customColorsChanged = Signal()  # 사용자 지정 색 목록이 바뀌면 발생 ("다른 색..."/색상 추출 등)
 
     def __init__(self, initial_color: QColor, settings: Optional[QSettings] = None,
-                 label: Optional[str] = None, vertical: bool = True, parent=None,
+                 label: Optional[str] = None, vertical: bool = True, parent: QWidget | None = None,
                  settings_key: str = _SETTINGS_KEY) -> None:
         """Args:
             initial_color: 시작 시 표시할 색상.
@@ -150,13 +151,20 @@ class ColorDropdownButton(QWidget):
 
     # ---------- 사용자 지정 색 ---------- #
     def _load_custom_colors(self) -> list[str]:
-        """설정에서 사용자 지정 색 목록을 불러온다."""
+        """설정에서 사용자 지정 색 목록을 불러온다 (색으로 읽을 수 없는 항목은 버린다)."""
         if self._settings is None:
             return []
         value = self._settings.value(self._settings_key, [])
         if isinstance(value, str):     # 항목이 1개면 QSettings가 문자열로 반환할 수 있음
             value = [value]
-        return list(value)[:MAX_CUSTOM_COLORS]
+        if not isinstance(value, (list, tuple)):
+            logger.warning("사용자 지정 색 설정값이 올바르지 않아 무시: %s = %r", self._settings_key, value)
+            return []
+        colors = [c for c in value if isinstance(c, str) and QColor(c).isValid()]
+        if len(colors) != len(value):
+            logger.warning("사용자 지정 색 중 읽을 수 없는 항목 %d개 무시: %s",
+                           len(value) - len(colors), self._settings_key)
+        return colors[:MAX_CUSTOM_COLORS]
 
     def _save_custom_colors(self) -> None:
         """사용자 지정 색 목록을 설정에 저장한다."""
@@ -187,10 +195,12 @@ class ColorDropdownButton(QWidget):
             self._custom_colors.pop(0)
         self._save_custom_colors()
         self._rebuild_menu()
+        self.customColorsChanged.emit()
 
     # ---------- 드롭다운 메뉴 ---------- #
     @staticmethod
     def _separator() -> QFrame:
+        """드롭다운 구획 사이에 넣는 가로 구분선을 만든다."""
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
@@ -364,7 +374,8 @@ class PaletteWidget(QWidget):
     colorChanged = Signal(QColor)
     startColorPicking = Signal()   # 색상 추출 도구 클릭 시 발생 (MainWindow가 처리)
 
-    def __init__(self, initial_color: QColor, settings: Optional[QSettings] = None, parent=None) -> None:
+    def __init__(self, initial_color: QColor, settings: Optional[QSettings] = None,
+                 parent: QWidget | None = None) -> None:
         """Args:
             initial_color: 시작 시 표시할 색상.
             settings: 사용자 지정 색을 저장/불러올 QSettings. None이면 저장하지 않는다.
@@ -375,6 +386,8 @@ class PaletteWidget(QWidget):
                                                 settings_key="draw_custom_colors")
         self._color_ctrl.colorChanged.connect(self.colorChanged.emit)
         self._color_ctrl.startColorPicking.connect(self.startColorPicking.emit)
+        # "다른 색..."처럼 드롭다운 안에서 추가된 색도 항상 보이는 줄에 바로 반영한다.
+        self._color_ctrl.customColorsChanged.connect(self._populate_custom_row)
 
         grid = QGridLayout()
         grid.setSpacing(2)
@@ -399,9 +412,8 @@ class PaletteWidget(QWidget):
         self._color_ctrl.set_color(color)
 
     def add_custom_color(self, color: QColor) -> None:
-        """테마/표준 색에 없는 색이면 사용자 지정 색에 추가한다."""
+        """테마/표준 색에 없는 색이면 사용자 지정 색에 추가한다 (customColorsChanged로 줄 갱신)."""
         self._color_ctrl.add_custom_color(color)
-        self._populate_custom_row()
 
     def _populate_custom_row(self) -> None:
         """항상 보이는 팔레트의 사용자 지정 색 줄을 현재 목록으로 다시 그린다."""

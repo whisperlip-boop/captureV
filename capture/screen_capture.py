@@ -6,7 +6,7 @@ import ctypes
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QRect
+from PySide6.QtCore import QRect
 from PySide6.QtGui import QImage
 
 from capture.config import IS_WIN
@@ -68,6 +68,10 @@ def capture_active_window() -> Optional[QImage]:
         return None
     shot = DesktopShot()
     img = shot.crop_physical(rect)
+    if img.isNull():
+        logger.warning("활성 윈도우가 화면 범위 밖에 있어 캡처할 수 없음: %s",
+                       (rect.x(), rect.y(), rect.width(), rect.height()))
+        return None
     logger.info("활성 윈도우 캡처: %dx%d", img.width(), img.height())
     return img
 
@@ -75,10 +79,13 @@ def capture_active_window() -> Optional[QImage]:
 def capture_fullscreen() -> QImage:
     """전체 가상 데스크톱을 물리 해상도로 캡처한다.
 
+    논리 좌표로 왕복 변환하면 배율에 따라 반올림이 두 번 일어나 1px 어긋날 수
+    있어, 그랩한 원본을 그대로 반환한다.
+
     Returns:
         캡처된 이미지.
     """
     shot = DesktopShot()
-    img = shot.crop(QRect(QPoint(0, 0), shot.logical_geo.size()))
+    img = shot.full_image()
     logger.info("전체화면 캡처: %dx%d", img.width(), img.height())
     return img

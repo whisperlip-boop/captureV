@@ -37,6 +37,7 @@ class _AngleSpinBox(QDoubleSpinBox):
     """
 
     def stepBy(self, steps: int) -> None:
+        """화살표 단계만큼 각도를 바꾸되 360도를 기준으로 순환시킨다."""
         self.setValue((self.value() + steps * self.singleStep()) % 360.0)
 
 

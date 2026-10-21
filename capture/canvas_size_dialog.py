@@ -21,18 +21,22 @@ from capture.palette import ColorDropdownButton
 
 _BG_SWATCH_SIZE = (72, 64)
 
-# (표시 이름, (가로, 세로)). 크기가 None인 두 항목("현재 이미지 크기"/"클립보드")은
-# 다이얼로그를 열 때/클립보드 상태에 따라 동적으로 계산한다.
-_PRESETS: list[tuple[str, Optional[tuple[int, int]]]] = [
-    ("현재 이미지 크기", None),
-    ("클립보드", None),
-    ("1920x1080 (FHD)", (1920, 1080)),
-    ("1366x768 (HD)", (1366, 768)),
-    ("1600x900 (HD+)", (1600, 900)),
-    ("1280x800 (WXGA)", (1280, 800)),
-    ("1024x768 (XGA)", (1024, 768)),
-    ("800x600 (SVGA)", (800, 600)),
-    ("640x480 (VGA)", (640, 480)),
+_PRESET_CURRENT = "current"       # 현재 이미지 크기 (다이얼로그를 열 때의 값)
+_PRESET_CLIPBOARD = "clipboard"   # 클립보드 이미지 크기 (선택 시점에 계산)
+_PRESET_FIXED = "fixed"           # 고정 해상도
+
+# (종류, 표시 이름, (가로, 세로)). 분기는 표시 이름이 아니라 종류 키로 한다
+# (문구를 바꿔도 동작이 달라지지 않도록).
+_PRESETS: list[tuple[str, str, Optional[tuple[int, int]]]] = [
+    (_PRESET_CURRENT, "현재 이미지 크기", None),
+    (_PRESET_CLIPBOARD, "클립보드", None),
+    (_PRESET_FIXED, "1920x1080 (FHD)", (1920, 1080)),
+    (_PRESET_FIXED, "1366x768 (HD)", (1366, 768)),
+    (_PRESET_FIXED, "1600x900 (HD+)", (1600, 900)),
+    (_PRESET_FIXED, "1280x800 (WXGA)", (1280, 800)),
+    (_PRESET_FIXED, "1024x768 (XGA)", (1024, 768)),
+    (_PRESET_FIXED, "800x600 (SVGA)", (800, 600)),
+    (_PRESET_FIXED, "640x480 (VGA)", (640, 480)),
 ]
 
 
@@ -70,7 +74,7 @@ class CanvasSizeDialog(QDialog):
 
         panel_layout.addWidget(QLabel("프리셋"))
         self.preset_combo = QComboBox(panel)
-        for name, _size in _PRESETS:
+        for _kind, name, _size in _PRESETS:
             self.preset_combo.addItem(name)
         panel_layout.addWidget(self.preset_combo)
 
@@ -133,13 +137,14 @@ class CanvasSizeDialog(QDialog):
 
     def _on_preset_changed(self, index: int) -> None:
         """프리셋 선택에 따라 가로/세로 값을 갱신한다."""
-        name, size = _PRESETS[index]
-        if size is not None:
-            self._set_size(*size)
+        if not 0 <= index < len(_PRESETS):
             return
-        if name == "현재 이미지 크기":
+        kind, _name, size = _PRESETS[index]
+        if kind == _PRESET_FIXED and size is not None:
+            self._set_size(*size)
+        elif kind == _PRESET_CURRENT:
             self._set_size(self._image_width, self._image_height)
-        else:   # 클립보드: 이미지가 없으면 값을 바꾸지 않는다.
+        elif kind == _PRESET_CLIPBOARD:   # 이미지가 없으면 값을 바꾸지 않는다.
             image = QGuiApplication.clipboard().image()
             if not image.isNull():
                 self._set_size(image.width(), image.height())

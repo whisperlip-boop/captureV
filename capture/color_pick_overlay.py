@@ -11,7 +11,7 @@
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QLineF, QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (QColor, QCursor, QFont, QKeyEvent, QMouseEvent, QPainter, QPainterPath,
                             QPaintEvent, QPen, QPixmap)
 from PySide6.QtWidgets import QWidget
@@ -81,19 +81,24 @@ class ColorPickOverlay(QWidget):
 
         # 매 마우스 이동마다 전체 화면 픽스맵을 변환하지 않도록 한 번만 QImage로
         # 바꿔 픽셀 조회에 쓴다(devicePixelRatio를 1.0으로 되돌려 물리 픽셀
-        # 좌표 그대로 인덱싱한다).
-        pm = self.shot.pixmap
+        # 좌표 그대로 인덱싱한다). 넘겨받은 shot을 다른 곳에서도 쓸 수 있으므로
+        # 원본 pixmap의 배율은 건드리지 않고 사본에만 적용한다.
+        pm = QPixmap(self.shot.pixmap)
         pm.setDevicePixelRatio(1.0)
         self._image = pm.toImage()
 
         self._cursor: QPoint = QPoint(0, 0)
 
-    def _color_at(self, logical_pos: QPoint) -> QColor:
-        """논리 좌표 지점의 화면 색을 반환한다(경계 밖이면 가장 가까운 픽셀로 고정)."""
+    def _pixel_at(self, logical_pos: QPoint) -> QPoint:
+        """논리 좌표 지점에 해당하는 물리 픽셀 좌표를 반환한다(경계 밖이면 가장 가까운 픽셀로 고정)."""
         phys = self.shot.physical_rect(QRect(logical_pos, logical_pos))
         x = min(max(phys.left(), 0), self._image.width() - 1)
         y = min(max(phys.top(), 0), self._image.height() - 1)
-        return self._image.pixelColor(x, y)
+        return QPoint(x, y)
+
+    def _color_at(self, logical_pos: QPoint) -> QColor:
+        """논리 좌표 지점의 화면 색을 반환한다(경계 밖이면 가장 가까운 픽셀로 고정)."""
+        return self._image.pixelColor(self._pixel_at(logical_pos))
 
     # ---------- 그리기 ---------- #
     def paintEvent(self, _event: QPaintEvent) -> None:
@@ -128,15 +133,16 @@ class ColorPickOverlay(QWidget):
         """
         diameter, zoom = _MAGNIFIER_DIAMETER, _MAGNIFIER_ZOOM
         radius = diameter / 2
-        src_logical = diameter / zoom
-        src = QRectF(self._cursor.x() - src_logical / 2, self._cursor.y() - src_logical / 2,
-                     src_logical, src_logical)
-        s = self.shot.scale
-        src_phys = QRectF(src.left() * s, src.top() * s, src.width() * s, src.height() * s)
-
         pos = self._magnifier_pos(diameter)
-        target = QRect(pos, QPoint(pos.x() + diameter, pos.y() + diameter))
-        cx, cy = target.center().x(), target.center().y()
+        target = QRect(pos.x(), pos.y(), diameter, diameter)
+        cx, cy = pos.x() + radius, pos.y() + radius
+
+        # 원본 영역은 물리 픽셀 단위로 잡는다. 논리 좌표로 잡고 배율을 곱하면 배율이
+        # 1이 아닐 때 물리 픽셀 한 칸이 zoom이 아닌 zoom/배율 크기로 그려져 격자와
+        # 어긋난다. 추출 대상 물리 픽셀의 중심이 돋보기 중심에 오도록 정렬한다.
+        n = diameter / zoom
+        center_px = self._pixel_at(self._cursor)
+        src_phys = QRectF(center_px.x() + 0.5 - n / 2, center_px.y() + 0.5 - n / 2, n, n)
 
         p.save()
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
@@ -148,17 +154,18 @@ class ColorPickOverlay(QWidget):
         p.drawPixmap(QRectF(target), self.shot.pixmap, src_phys)
 
         # 확대 배율(zoom)만큼 간격을 둔 격자선을 그려, 원본 픽셀 하나하나의
-        # 경계를 눈으로 확인할 수 있게 한다.
+        # 경계를 눈으로 확인할 수 있게 한다. 격자는 중심 픽셀 칸 경계(cx - zoom/2)에서
+        # 시작해 zoom 간격으로 이어져야 물리 픽셀 경계와 정확히 겹친다.
         grid_pen = QPen(_MAGNIFIER_GRID_COLOR)
         grid_pen.setWidth(1)
         p.setPen(grid_pen)
-        x = target.left()
-        while x <= target.right():
-            p.drawLine(x, target.top(), x, target.bottom())
+        x = target.left() + (cx - zoom / 2 - target.left()) % zoom
+        while x <= target.left() + diameter:
+            p.drawLine(QLineF(x, target.top(), x, target.top() + diameter))
             x += zoom
-        y = target.top()
-        while y <= target.bottom():
-            p.drawLine(target.left(), y, target.right(), y)
+        y = target.top() + (cy - zoom / 2 - target.top()) % zoom
+        while y <= target.top() + diameter:
+            p.drawLine(QLineF(target.left(), y, target.left() + diameter, y))
             y += zoom
         p.setClipping(False)
 

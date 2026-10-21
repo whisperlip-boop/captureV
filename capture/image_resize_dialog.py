@@ -126,8 +126,16 @@ class ImageResizeDialog(QDialog):
         self._updating = False
 
     def target_size(self) -> tuple[int, int]:
-        """확인(OK) 시 적용할 목표 (width, height)를 반환한다."""
+        """확인(OK) 시 적용할 목표 (width, height)를 반환한다.
+
+        비율 모드에서 결과가 NEW_CANVAS_SIZE_MAX를 넘으면 가로세로 비율을 유지한 채
+        긴 쪽이 상한에 맞도록 줄인다 (크기 지정 모드와 같은 상한, 과도한 메모리 할당 방지).
+        """
         if self.size_radio.isChecked():
             return self.width_spin.value(), self.height_spin.value()
         pct = self.percent_spin.value() / 100.0
-        return max(1, round(self._image_width * pct)), max(1, round(self._image_height * pct))
+        longest = max(self._image_width, self._image_height, 1)
+        pct = min(pct, NEW_CANVAS_SIZE_MAX / longest)
+        width = min(max(1, round(self._image_width * pct)), NEW_CANVAS_SIZE_MAX)
+        height = min(max(1, round(self._image_height * pct)), NEW_CANVAS_SIZE_MAX)
+        return width, height

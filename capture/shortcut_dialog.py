@@ -58,7 +58,7 @@ class _ShortcutRow:
 
 
 class ShortcutSettingsDialog(QDialog):
-    """영역/전체화면/활성 윈도우 캡처의 전역 단축키를 지정하는 다이얼로그."""
+    """영역/전체화면/활성 윈도우 캡처와 마지막 영역 반복의 전역 단축키를 지정하는 다이얼로그."""
 
     def __init__(self, settings: QSettings, parent: Optional[QWidget] = None) -> None:
         """Args:
