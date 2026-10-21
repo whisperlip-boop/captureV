@@ -8,22 +8,23 @@ import time
 from typing import Callable, Optional
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QGuiApplication, QImage, QKeyEvent,
                             QMouseEvent, QPainter, QPainterPath, QPen, QPixmap,
                             QResizeEvent, QScreen, QShowEvent, QTextCharFormat, QTextDocument, QTransform,
                             QWheelEvent, QWindow)
-from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QStyle,
-                                QStyleOptionGraphicsItem, QTextEdit, QToolButton, QWidget)
+from PySide6.QtWidgets import (QApplication, QGraphicsItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView,
+                                QStyle, QStyleOptionGraphicsItem, QTextEdit, QToolButton, QWidget)
 from scipy import ndimage
 
 from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHECKER_DARK_COLOR,
                              CHECKER_LIGHT_COLOR, CHECKER_SQUARE_PX, CURSORS, DEFAULT_DRAW_COLOR,
-                             DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL, DEFAULT_TEXT_COLOR,
+                             DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL, DEFAULT_STAMP_KEY, DEFAULT_TEXT_COLOR,
                              DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS, HANDLE_PX, HANDLES,
                              HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION, SHARPEN_AMOUNT_SCALE,
-                             SHARPEN_SIGMA, UNDO_MEMORY_BUDGET_BYTES, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN,
-                             get_key_repeat_delay_ms)
+                             SHARPEN_SIGMA, STAMP_DEFAULT_PX, STAMP_MIN_PX, STAMP_NUMBER_MAX, STAMP_NUMBER_MIN,
+                             STAMP_PREVIEW_OPACITY, UNDO_MEMORY_BUDGET_BYTES, ZOOM_PERCENT_MAX,
+                             ZOOM_PERCENT_MIN, get_key_repeat_delay_ms)
 from capture.rich_text import (apply_to_whole_document, build_document, char_format_changes,
                                h_align_flag, merge_font_changes, rasterize_document, restore_point_sizes,
                                scale_for_display, scaled_char_format)
@@ -31,6 +32,7 @@ from capture.shapes import (ARROW_KINDS, DEFAULT_ROUNDED_RADIUS_RATIO, FREEHAND_
                              arrowhead_length, clamp_radius_ratio, draw_bbox_shape, draw_bezier_kind,
                              draw_line_kind, is_line_kind, lock_square, rounded_radius,
                              snap_line_angle)
+from capture.stamps import STAMP_KEYS, draw_stamp, is_number_stamp, make_stamp_pixmap, stamp_default_color
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,7 @@ class CanvasView(QGraphicsView):
 
     changed = Signal()
     viewChanged = Signal()      # 확대/축소 등 문서 내용과 무관한 뷰 상태 변경 (상태바 갱신용, dirty 표시 없음)
+    stampNumberChanged = Signal(int)    # 번호 스탬프 '다음 번호'가 배치·되돌리기로 바뀜 (패널 표시 갱신용)
 
     _NUDGE_TICK_MS = 15             # 화살표 키를 계속 누르고 있을 때 일정한 속도로 이동시키는 간격
     _NUDGE_RELEASE_TIMEOUT_MS = 120  # 계속 이동 중 이만큼 입력이 없으면 키를 뗀 것으로 간주
@@ -240,9 +243,22 @@ class CanvasView(QGraphicsView):
         self._curve_drag_index: Optional[int] = None
         # id(item) -> {kind, subtool, color, thickness, pad, geometry}. kind별 geometry:
         # bbox -> QSizeF(content w,h) / line -> (p1, p2) 콘텐츠-상대 좌표(원점 0,0 기준) /
-        # curve -> 4개 콘텐츠-상대 제어점. pad는 마지막으로 래스터화했을 때의 여백으로,
-        # item.pos()가 이동해도 pos() + pad가 콘텐츠 좌상단(씬 좌표)이 되도록 유지한다.
+        # curve -> 4개 콘텐츠-상대 제어점 / stamp -> QSizeF(한 변, 한 변).
+        # pad는 마지막으로 래스터화했을 때의 여백으로, item.pos()가 이동해도 pos() + pad가
+        # 콘텐츠 좌상단(씬 좌표)이 되도록 유지한다. stamp는 두께가 없어 thickness 대신
+        # number(번호 스탬프의 숫자, 아니면 None)를 두고 pad는 항상 0이다.
         self._shape_meta: dict[int, dict] = {}
+
+        # 스탬프 도구. stamp_next_number는 탭(캔버스)마다 따로 세는 번호 스탬프 다음 번호로,
+        # 되돌리기 스냅샷에 함께 담아 되돌리면 그 시점 값으로 돌아간다.
+        self.stamp_key: str = DEFAULT_STAMP_KEY
+        self.stamp_next_number: int = STAMP_NUMBER_MIN
+        self._stamp_state: str = "idle"           # idle | pressed(아직 클릭) | dragging
+        self._stamp_press_view: Optional[QPoint] = None
+        self._stamp_origin: Optional[QPointF] = None
+        self._stamp_rect: QRectF = QRectF()
+        self._stamp_hover: Optional[QPointF] = None   # 커서 미리보기 중심(씬 좌표), 숨김이면 None
+        self._stamp_preview_shown: Optional[QRectF] = None   # 마지막으로 다시 그리게 한 미리보기 영역
 
         self.text_font: QFont = QFont()
         self.text_font.setPointSize(DEFAULT_TEXT_FONT_SIZE)
@@ -524,6 +540,7 @@ class CanvasView(QGraphicsView):
         return {"items": items, "scene_rect": QRectF(self._scene.sceneRect()),
                 "select_rect": QRectF(self._select_rect),
                 "transparent_background": self._transparent_background,
+                "stamp_next_number": self.stamp_next_number,
                 "bytes": total_bytes}
 
     def _push_snapshot(self, snapshot: dict) -> None:
@@ -592,6 +609,10 @@ class CanvasView(QGraphicsView):
         self.clear_magic_selection()
         self._select_rect = QRectF(snapshot.get("select_rect", QRectF()))
         self._transparent_background = snapshot.get("transparent_background", self._transparent_background)
+        next_number = snapshot.get("stamp_next_number", self.stamp_next_number)
+        if next_number != self.stamp_next_number:
+            self.stamp_next_number = next_number
+            self.stampNumberChanged.emit(next_number)
         self.changed.emit()
         self.viewport().update()
 
@@ -1372,7 +1393,7 @@ class CanvasView(QGraphicsView):
 
     # ---------- 도구 ---------- #
     def set_tool(self, tool: str) -> None:
-        """활성 도구를 전환한다 ('move', 'select', 'magic', 'draw', 'fill', 'text', 'shape').
+        """활성 도구를 전환한다 ('move', 'select', 'magic', 'draw', 'fill', 'text', 'shape', 'stamp').
 
         '선택' 도구를 벗어나면 진행 중이던 선택 영역을 지우고, 편집 중인
         텍스트 박스가 있으면 먼저 반영하고 닫는다.
@@ -1401,6 +1422,11 @@ class CanvasView(QGraphicsView):
             self._shape_origin = None
             self._shape_rect = QRectF()
             self._curve_drag_index = None
+        if tool != "stamp":
+            # self.tool이 이미 바뀌어 있어 _update_stamp_preview는 직전 미리보기 영역만 지운다.
+            self._reset_stamp_drag()
+            self._stamp_hover = None
+            self._update_stamp_preview()
         if tool != "move":
             self._item_resize_item = None
             self._item_resize_handle = None
@@ -1413,7 +1439,7 @@ class CanvasView(QGraphicsView):
         self.viewport().update()
 
     def set_draw_options(self, subtool: str, thickness: int, color: QColor,
-                         apply_to_selection: bool = False) -> None:
+                         apply_to_selection: bool = False, restyle_stamps: bool = False) -> None:
         """그리기 도구의 하위 도구('brush'/'eraser'/'highlighter'), 두께, 색상 기본값을 설정한다.
 
         Args:
@@ -1423,12 +1449,15 @@ class CanvasView(QGraphicsView):
             apply_to_selection: True면 선택된 도형/선에도 새 두께/색을 적용해 다시 그린다.
                 사용자가 두께·색을 직접 바꿨을 때만 True로 준다. 탭 전환처럼 기본값만
                 맞추는 호출에서 선택 아이템이 다시 그려지거나 실행 취소에 쌓이면 안 된다.
+            restyle_stamps: True면 선택된 스탬프도 새 색으로 재채색한다. 스탬프는 두께가
+                없으므로 사용자가 '색'을 바꾼 경로에서만 True로 준다(두께 변경으로 스탬프가
+                팔레트 색으로 바뀌지 않도록).
         """
         self.draw_subtool = subtool
         self.draw_thickness = thickness
         self.draw_color = QColor(color)
         if apply_to_selection:
-            self._restyle_selected_shape_items()
+            self._restyle_selected_shape_items(restyle_stamps)
 
     def set_shape_subtool(self, subtool: str) -> None:
         """도형 도구의 하위 종류(사각형/타원/.../직선/자유곡선 등)를 설정한다.
@@ -1441,6 +1470,24 @@ class CanvasView(QGraphicsView):
         if self._curve_points:
             self._commit_curve()
         self.shape_subtool = subtool
+
+    def set_stamp(self, key: str) -> None:
+        """스탬프 도구로 놓을 스탬프 종류를 설정한다 (모르는 키는 무시하고 기록)."""
+        if key not in STAMP_KEYS:
+            logger.warning("알 수 없는 스탬프 키라 무시: %r", key)
+            return
+        if key == self.stamp_key:
+            return
+        self.stamp_key = key
+        self._update_stamp_preview()
+
+    def set_stamp_next_number(self, number: int) -> None:
+        """번호 스탬프의 다음 번호를 직접 지정한다 (사용자 입력용, 되돌리기 대상 아님)."""
+        number = min(max(number, STAMP_NUMBER_MIN), STAMP_NUMBER_MAX)
+        if number == self.stamp_next_number:
+            return
+        self.stamp_next_number = number
+        self._update_stamp_preview()
 
     def set_fill_tolerance(self, tolerance_pct: int) -> None:
         """채우기 도구의 색상 허용 범위(0~100%)를 설정한다."""
@@ -1976,10 +2023,16 @@ class CanvasView(QGraphicsView):
         elif hy > 0:
             bottom = max(bottom + d.y(), top + MIN_SELECTION)
         new_rect = QRectF(left, top, right - left, bottom - top)
+        stamp_meta = self._stamp_meta(item)
+        if stamp_meta is not None:
+            new_rect = self._square_resize_rect(rect0, handle, new_rect)
         w = max(int(round(new_rect.width())), 1)
         h = max(int(round(new_rect.height())), 1)
         text_meta = self._text_meta.get(id(item))
-        if text_meta is not None:
+        if stamp_meta is not None:
+            # 스탬프는 벡터라 드래그 중에도 늘린 픽스맵 대신 새 크기로 바로 다시 그린다.
+            item.setPixmap(self._render_stamp_pixmap(stamp_meta, w))
+        elif text_meta is not None:
             # 텍스트 상자는 글자를 늘리지 않고, 글자 크기는 그대로 둔 채 새 상자 크기로 다시
             # 줄바꿈해 그린다(상자 크기는 픽스맵 크기 자체라 이후 편집·서식 변경도 이 크기를 따른다).
             item.setPixmap(rasterize_document(self._text_document(text_meta),
@@ -2024,6 +2077,11 @@ class CanvasView(QGraphicsView):
         if meta is None:
             return
         if original_rect.width() <= 0 or original_rect.height() <= 0:
+            return
+        if meta["kind"] == "stamp":
+            side = item.pixmap().width()
+            item.setPixmap(self._render_stamp_pixmap(meta, side))
+            meta["geometry"] = QSizeF(side, side)
             return
         pad: int = meta["pad"]
         new_rect = self._item_pixmap_rect(item)
@@ -2271,6 +2329,14 @@ class CanvasView(QGraphicsView):
                 draw_bbox_shape(painter, self.shape_subtool, self._shape_rect)
             painter.restore()
 
+        preview_rect = self._stamp_preview_rect()
+        if preview_rect is not None:
+            painter.save()
+            painter.setOpacity(STAMP_PREVIEW_OPACITY)
+            draw_stamp(painter, self.stamp_key, preview_rect, self._stamp_place_color(self.stamp_key),
+                       self.stamp_next_number)
+            painter.restore()
+
         if self.tool == "shape" and self._curve_points:
             painter.save()
             painter.setPen(self._shape_pen())
@@ -2368,6 +2434,10 @@ class CanvasView(QGraphicsView):
                 return
             if self.tool == "shape":
                 self._shape_press(event.position().toPoint())
+                event.accept()
+                return
+            if self.tool == "stamp":
+                self._stamp_press(event.position().toPoint())
                 event.accept()
                 return
             # '이동' 도구: 선택된 아이템이 하나뿐이고 그 크기 조절 핸들 위를
@@ -2845,18 +2915,26 @@ class CanvasView(QGraphicsView):
             "thickness": self.draw_thickness, "pad": pad, "geometry": (p1_local, p2_local),
         }
 
-    def _restyle_selected_shape_items(self) -> None:
+    def _restyle_selected_shape_items(self, restyle_stamps: bool = False) -> None:
         """이미 확정된 도형/선/자유곡선이 선택되어 있으면, 방금 바뀐 두께/색으로
         다시 래스터화해 즉시 반영한다 (화면상 위치는 그대로 유지).
+
+        스탬프는 restyle_stamps가 True(색 변경)일 때만 재채색하고, 아니면 건너뛴다.
 
         item.pos()가 마지막 래스터화 시점의 pad만큼 콘텐츠 좌상단에서
         안쪽으로 들어가 있다는 불변식을 이용해, 도형이 그 뒤 이동됐어도
         content_top_left(씬 좌표)를 정확히 복원한 뒤 새 pad로 다시 배치한다.
         """
+        def needs_restyle(meta: dict) -> bool:
+            """다시 그릴 대상인지 (스탬프는 색 변경 경로에서 색이 다를 때만)."""
+            color_changed = QColor(meta["color"]) != self.draw_color
+            if meta["kind"] == "stamp":
+                return restyle_stamps and color_changed
+            return color_changed or meta["thickness"] != self.draw_thickness
+
         # 이미 같은 두께/색인 아이템은 다시 그리지 않는다(같은 값을 다시 골라도 실행 취소가 쌓이지 않도록).
         targets = [it for it in self._scene.selectedItems() if id(it) in self._shape_meta
-                   and (self._shape_meta[id(it)]["thickness"] != self.draw_thickness
-                        or QColor(self._shape_meta[id(it)]["color"]) != self.draw_color)]
+                   and needs_restyle(self._shape_meta[id(it)])]
         if not targets:
             return
         self._push_undo()
@@ -2865,6 +2943,11 @@ class CanvasView(QGraphicsView):
             meta = self._shape_meta[id(item)]
             kind = meta["kind"]
             subtool = meta["subtool"]
+            if kind == "stamp":
+                # 크기·위치는 그대로 두고 색만 바꿔 다시 그린다 (흰 기호 등 고정 색 부분은 유지).
+                meta["color"] = QColor(self.draw_color)
+                item.setPixmap(self._render_stamp_pixmap(meta, item.pixmap().width()))
+                continue
             content_top_left = item.pos() + QPointF(meta["pad"], meta["pad"])
 
             if kind == "bbox":
@@ -2885,6 +2968,194 @@ class CanvasView(QGraphicsView):
             meta["thickness"] = self.draw_thickness
             meta["pad"] = pad
         self.changed.emit()
+
+    # ---------- 스탬프 ---------- #
+    def _stamp_meta(self, item: QGraphicsPixmapItem) -> Optional[dict]:
+        """item이 스탬프면 그 meta를, 아니면 None을 반환한다."""
+        meta = self._shape_meta.get(id(item))
+        if meta is None or meta["kind"] != "stamp":
+            return None
+        return meta
+
+    @staticmethod
+    def _render_stamp_pixmap(meta: dict, side: int) -> QPixmap:
+        """스탬프 meta(종류·색·번호)를 side x side 픽스맵으로 벡터 래스터화한다."""
+        return make_stamp_pixmap(meta["subtool"], max(side, 1), QColor(meta["color"]), meta.get("number"))
+
+    @staticmethod
+    def _square_resize_rect(rect0: QRectF, handle: tuple[int, int], dragged: QRectF) -> QRectF:
+        """스탬프 크기 조절 결과를 1:1 정사각형으로 맞춘다.
+
+        모서리 핸들은 더 크게 움직인 변을, 변 핸들은 그 변 방향 길이를 한 변으로
+        삼는다. 잡은 핸들 반대쪽 변(모서리)은 고정하고, 변 핸들이면 다른 축은
+        원래 중심을 유지해 한쪽으로 쏠리지 않게 한다.
+
+        Args:
+            rect0: 드래그 시작 시점의 아이템 사각형.
+            handle: 잡은 핸들 (dx, dy) ∈ {-1, 0, 1}.
+            dragged: 핸들 드래그로 계산된(비율 고정 전) 사각형.
+
+        Returns:
+            정수 길이 한 변을 가진 정사각형.
+        """
+        hx, hy = handle
+        if hx and hy:
+            # 확대·축소 모두 변화량(절댓값)이 큰 축을 따른다. max(w, h)면 축소할 때
+            # 덜 줄어든 축이 이겨 모서리를 안쪽으로 끌어도 잘 줄어들지 않는다.
+            dw = dragged.width() - rect0.width()
+            dh = dragged.height() - rect0.height()
+            side = dragged.width() if abs(dw) >= abs(dh) else dragged.height()
+        elif hx:
+            side = dragged.width()
+        else:
+            side = dragged.height()
+        side = float(max(int(round(side)), STAMP_MIN_PX))
+        if hx < 0:
+            left = rect0.right() - side
+        elif hx > 0:
+            left = rect0.left()
+        else:
+            left = rect0.center().x() - side / 2
+        if hy < 0:
+            top = rect0.bottom() - side
+        elif hy > 0:
+            top = rect0.top()
+        else:
+            top = rect0.center().y() - side / 2
+        return QRectF(left, top, side, side)
+
+    def _reset_stamp_drag(self) -> None:
+        """진행 중인 스탬프 클릭/드래그 상태를 버린다."""
+        self._stamp_state = "idle"
+        self._stamp_press_view = None
+        self._stamp_origin = None
+        self._stamp_rect = QRectF()
+
+    def _stamp_preview_rect(self) -> Optional[QRectF]:
+        """지금 그려야 할 스탬프 미리보기 사각형(씬 좌표). 없으면 None.
+
+        드래그 중이면 드래그 사각형, 아니면 커서를 중심으로 한 기본 크기 사각형이다.
+        """
+        if self.tool != "stamp":
+            return None
+        if self._stamp_state == "dragging":
+            return QRectF(self._stamp_rect)
+        if self._stamp_hover is None:
+            return None
+        return self._stamp_click_rect(self._stamp_hover)
+
+    def _update_stamp_preview(self) -> None:
+        """이전·현재 미리보기 영역만 다시 그리게 한다 (커서 이동마다 전체를 다시 그리지 않도록)."""
+        rect = self._stamp_preview_rect()
+        for r in (self._stamp_preview_shown, rect):
+            if r is not None:
+                self.viewport().update(self.mapFromScene(r).boundingRect().adjusted(-2, -2, 2, 2))
+        self._stamp_preview_shown = rect
+
+    def _stamp_press(self, view_pos: QPoint) -> None:
+        """스탬프 도구: 클릭/드래그 판정을 시작한다 (실제 배치는 놓을 때)."""
+        self._scene.clearSelection()
+        self._stamp_state = "pressed"
+        self._stamp_press_view = QPoint(view_pos)
+        self._stamp_origin = self.mapToScene(view_pos)
+        self._stamp_rect = QRectF()
+
+    @staticmethod
+    def _stamp_click_rect(origin: QPointF) -> QRectF:
+        """클릭 배치용: origin을 중심으로 한 기본 크기 사각형."""
+        half = STAMP_DEFAULT_PX / 2
+        return QRectF(origin.x() - half, origin.y() - half, STAMP_DEFAULT_PX, STAMP_DEFAULT_PX)
+
+    def _stamp_drag_rect(self, current: QPointF) -> QRectF:
+        """시작점에서 current까지의 드래그를 놓일 사각형으로 만든다 (시작점 모서리 고정).
+
+        드래그 결과 한 변이 STAMP_MIN_PX보다 작으면(예: 끌었다가 시작점 근처로 되돌아옴)
+        클릭과 같이 시작점 중심의 기본 크기로 본다.
+        """
+        origin = self._stamp_origin if self._stamp_origin is not None else current
+        side = int(round(lock_square(origin, current).width()))
+        if side < STAMP_MIN_PX:
+            return self._stamp_click_rect(origin)
+        sx = side if current.x() >= origin.x() else -side
+        sy = side if current.y() >= origin.y() else -side
+        return QRectF(origin, QPointF(origin.x() + sx, origin.y() + sy)).normalized()
+
+    def _stamp_move(self, view_pos: QPoint) -> None:
+        """스탬프 도구: 드래그 크기를 갱신하거나, 버튼을 누르지 않았으면 커서 미리보기를 옮긴다.
+
+        캔버스 밖이나 캔버스 경계 핸들 위에서는 미리보기를 숨긴다(핸들 위에서
+        누르면 스탬프가 아니라 캔버스 크기 조절이 시작되므로).
+        """
+        if self._stamp_state == "idle":
+            sp = self.mapToScene(view_pos)
+            on_canvas = self._scene.sceneRect().contains(sp) and self._canvas_handle_at(view_pos) is None
+            self._stamp_hover = sp if on_canvas else None
+            self._update_stamp_preview()
+            return
+        if self._stamp_press_view is None:
+            return
+        if (self._stamp_state == "pressed"
+                and (view_pos - self._stamp_press_view).manhattanLength() < QApplication.startDragDistance()):
+            return
+        self._stamp_state = "dragging"
+        self._stamp_hover = None
+        self._stamp_rect = self._stamp_drag_rect(self.mapToScene(view_pos))
+        self._update_stamp_preview()
+
+    def _stamp_release(self) -> None:
+        """스탬프 도구: 클릭이면 기본 크기로 클릭점 중심에, 드래그면 그 정사각형에 스탬프를 놓는다.
+
+        놓일 사각형이 캔버스와 전혀 겹치지 않으면(캔버스 바깥 클릭·드래그) 보이지 않는
+        아이템이 생기고 번호·되돌리기만 소비되므로 놓지 않는다. 일부만 겹치면 놓는다.
+        """
+        state, origin, rect = self._stamp_state, self._stamp_origin, QRectF(self._stamp_rect)
+        self._reset_stamp_drag()
+        if state == "pressed" and origin is not None:
+            rect = self._stamp_click_rect(origin)
+        elif state != "dragging" or rect.isEmpty():
+            self._update_stamp_preview()
+            return
+        if not rect.intersects(self._scene.sceneRect()):
+            logger.info("캔버스 바깥이라 스탬프를 놓지 않음: %s", (rect.x(), rect.y(), rect.width()))
+            self._update_stamp_preview()
+            return
+        self._commit_stamp(rect)
+        self._update_stamp_preview()
+
+    def _stamp_place_color(self, key: str) -> QColor:
+        """스탬프를 놓을 때 쓸 색: 번호 스탬프는 고른 견본 색, 일반 스탬프는 현재 팔레트 색.
+
+        팔레트 색이 유효하지 않으면 일반 스탬프도 샘플 기본 색으로 폴백한다.
+        """
+        if is_number_stamp(key) or not self.draw_color.isValid():
+            return stamp_default_color(key)
+        return QColor(self.draw_color)
+
+    def _commit_stamp(self, rect: QRectF) -> None:
+        """현재 스탬프를 rect(정사각형) 크기로 래스터화해 새 아이템으로 놓는다.
+
+        번호 스탬프면 지금의 다음 번호를 쓰고 1 늘린다(최댓값에서는 그대로).
+        되돌리기 스냅샷을 배치 전에 찍으므로 되돌리면 번호도 함께 돌아간다.
+        놓은 스탬프는 선택 상태로 두어, 팔레트 색을 고르면 바로 재채색된다.
+        """
+        key = self.stamp_key
+        if key not in STAMP_KEYS:
+            logger.warning("알 수 없는 스탬프 키라 배치하지 않음: %r", key)
+            return
+        side = max(int(round(rect.width())), 1)
+        number = self.stamp_next_number if is_number_stamp(key) else None
+        meta = {"kind": "stamp", "subtool": key, "color": self._stamp_place_color(key), "number": number,
+                "pad": 0, "geometry": QSizeF(side, side)}
+        pixmap = self._render_stamp_pixmap(meta, side)
+        self._push_undo()
+        item = self._add_pixmap(pixmap, self._snap_to_pixel(rect.topLeft()).toPoint())
+        self._shape_meta[id(item)] = meta
+        self._scene.clearSelection()
+        item.setSelected(True)
+        if number is not None:
+            self.stamp_next_number = min(number + 1, STAMP_NUMBER_MAX)
+            self.stampNumberChanged.emit(self.stamp_next_number)
+        self.viewport().update()
 
     # ---------- 그리기(브러시/지우개/형광펜) ---------- #
     def _pixel_align(self, point: QPointF) -> QPointF:
@@ -3132,7 +3403,7 @@ class CanvasView(QGraphicsView):
                 # 붙여넣은/텍스트/도형 아이템 내부: 드래그로 이동 가능함을 사방
                 # 화살표 커서로 미리 알려준다.
                 self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
-            elif self.tool == "magic":
+            elif self.tool in ("magic", "stamp"):
                 self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             else:
                 self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
@@ -3168,6 +3439,11 @@ class CanvasView(QGraphicsView):
         if self.tool == "shape":
             shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self._shape_move(pos, shift)
+            event.accept()
+            return
+
+        if self.tool == "stamp":
+            self._stamp_move(pos)
             event.accept()
             return
 
@@ -3273,6 +3549,10 @@ class CanvasView(QGraphicsView):
             self._shape_release()
             event.accept()
             return
+        if self.tool == "stamp":
+            self._stamp_release()
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         self._drop_stale_select_all()
         self._commit_pending_move()
@@ -3294,11 +3574,20 @@ class CanvasView(QGraphicsView):
             self._push_snapshot(snapshot)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """텍스트 박스를 더블클릭하면 (현재 도구와 무관하게) 편집 오버레이를 다시 연다."""
+        """텍스트 박스를 더블클릭하면 (현재 도구와 무관하게) 편집 오버레이를 다시 연다.
+
+        스탬프 도구에서는 더블클릭의 두 번째 누름도 일반 누름처럼 스탬프 배치로 처리한다.
+        """
         if event.button() == Qt.MouseButton.LeftButton:
             item = self.itemAt(event.position().toPoint())
             if isinstance(item, QGraphicsPixmapItem) and id(item) in self._text_meta:
                 self._open_text_editor(existing_item=item)
+                event.accept()
+                return
+            if self.tool == "stamp":
+                # 같은 자리를 빠르게 두 번 누르면 두 번째 누름이 더블클릭으로만 와서,
+                # 그대로 두면 번호 스탬프를 연달아 찍을 때 한 개가 빠진다.
+                self._stamp_press(event.position().toPoint())
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
@@ -3318,7 +3607,11 @@ class CanvasView(QGraphicsView):
             self.viewport().update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        """Esc로 선택 도구의 사각형 선택 또는 매직툴 선택을 취소한다."""
+        """Esc로 스탬프 드래그, 선택 도구의 사각형 선택 또는 매직툴 선택을 취소한다."""
+        if self.tool == "stamp" and event.key() == Qt.Key.Key_Escape and self._stamp_state != "idle":
+            self._reset_stamp_drag()
+            self._update_stamp_preview()
+            return
         if self.tool == "select" and event.key() == Qt.Key.Key_Escape and self.has_selection():
             self.clear_selection()
             return
@@ -3339,6 +3632,13 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         super().wheelEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        """커서가 캔버스 뷰를 벗어나면 스탬프 미리보기를 숨긴다."""
+        if self._stamp_hover is not None:
+            self._stamp_hover = None
+            self._update_stamp_preview()
+        super().leaveEvent(event)
 
     def _background_fill_color(self) -> QColor:
         """캔버스 빈 영역·잘라내거나 비운 자리의 색 (투명 배경이면 투명, 아니면 흰색)."""

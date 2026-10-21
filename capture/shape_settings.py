@@ -34,7 +34,8 @@ _CUSTOM_ICON_FILES: dict[str, str] = {
     "freehand_double_arrow": "doublehead-free-curved-arrow.png",
 }
 
-_TOGGLE_STYLE = (
+# 갤러리·설정 패널의 체크형 아이콘 버튼 공통 스타일 (텍스트·스탬프 패널도 이것을 쓴다).
+TOGGLE_STYLE = (
     "QToolButton { border: 1px solid transparent; border-radius: 4px; }"
     "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
     "QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
@@ -84,7 +85,7 @@ class ShapeSubtoolPanel(QWidget):
             btn.setIconSize(QSize(SHAPE_ICON_PX, SHAPE_ICON_PX))
             btn.setCheckable(True)
             btn.setToolTip(label)
-            btn.setStyleSheet(_TOGGLE_STYLE)
+            btn.setStyleSheet(TOGGLE_STYLE)
             btn.clicked.connect(lambda _checked=False, k=key: self.subtoolChosen.emit(k))
             self._group.addButton(btn)
             self._buttons[key] = btn

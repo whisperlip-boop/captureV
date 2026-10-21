@@ -18,12 +18,7 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFontComboBox, QHBoxLayo
 from capture.config import (DEFAULT_TEXT_FONT_SIZE, TEXT_FONT_SIZE_MAX, TEXT_FONT_SIZE_MIN, TEXT_FONT_SIZES,
                             TEXT_ICON_PX, get_resource_path)
 from capture.palette import ColorDropdownButton
-
-_TOGGLE_STYLE = (
-    "QToolButton { background: transparent; border: 1px solid transparent; border-radius: 4px; }"
-    "QToolButton:hover { background-color: #F0F0F0; border: 1px solid #D9D9D9; }"
-    "QToolButton:checked { background-color: #E1E1E1; border: 1px solid #C7C7C7; }"
-    "QToolButton:checked:hover { background-color: #E1E1E1; border: 1px solid #C7C7C7; }")
+from capture.shape_settings import TOGGLE_STYLE
 
 
 class TextSettingsPanel(QWidget):
@@ -119,7 +114,7 @@ class TextSettingsPanel(QWidget):
         btn.setIconSize(QSize(TEXT_ICON_PX, TEXT_ICON_PX))
         btn.setCheckable(True)
         btn.setToolTip(tooltip)
-        btn.setStyleSheet(_TOGGLE_STYLE)
+        btn.setStyleSheet(TOGGLE_STYLE)
         return btn
 
     # ---------- 설정 복원 ---------- #

@@ -304,3 +304,20 @@ ICO_MAX_EDGE: int = 256
 # ---------- 도형 도구 ---------- #
 DEFAULT_SHAPE_SUBTOOL: str = "rectangle"
 SHAPE_ICON_PX: int = 26    # 도형/선 갤러리 아이콘 크기
+
+# ---------- 스탬프 도구 ---------- #
+DEFAULT_STAMP_KEY: str = "number_red"   # 아직 아무 스탬프도 고르지 않았을 때 쓰는 스탬프
+STAMP_DEFAULT_PX: int = 40      # 클릭으로 놓을 때의 한 변 길이(캔버스 픽셀)
+STAMP_MIN_PX: int = 8           # 드래그·크기 조절로 줄일 수 있는 최소 한 변 길이
+STAMP_ICON_PX: int = 32         # 스탬프 패널 아이콘 크기
+STAMP_CELL_PX: int = 40         # 스탬프 패널 한 칸 크기
+STAMP_GRID_COLUMNS: int = 7
+STAMP_PREVIEW_OPACITY: float = 0.6     # 커서 위치 미리보기 불투명도
+STAMP_NUMBER_MIN: int = 1
+STAMP_NUMBER_MAX: int = 999
+
+# ---------- 시스템 트레이 ---------- #
+# 트레이 메뉴 항목을 누른 뒤 메뉴가 화면에서 완전히 사라질 때까지 기다리는 시간.
+# 바로 캡처하면 닫히는 중인 메뉴가 캡처 이미지에 찍힐 수 있다.
+TRAY_MENU_CLOSE_DELAY_MS: int = 250
+TRAY_NOTICE_TIMEOUT_MS: int = 5000

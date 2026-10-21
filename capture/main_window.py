@@ -14,12 +14,12 @@ from PySide6.QtCore import (QByteArray, QPoint, QRect, QSettings, QSize, QStanda
 from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices,
                             QDragEnterEvent, QDropEvent, QFont, QGuiApplication, QIcon, QImage,
                             QImageReader, QKeySequence, QMouseEvent, QPixmap,
-                            QShortcut)
+                            QSessionManager, QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QDialogButtonBox, QFileDialog,
                                 QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
                                 QMainWindow, QMenu, QMessageBox, QProxyStyle, QRadioButton, QSizePolicy,
-                                QSpinBox, QStyle, QStyleOption, QTabBar, QTabWidget, QToolBar,
-                                QToolButton, QVBoxLayout, QWidget, QWidgetAction)
+                                QSpinBox, QStyle, QStyleOption, QSystemTrayIcon, QTabBar, QTabWidget,
+                                QToolBar, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 from capture import screen_capture
 from capture.avif_io import is_avif_path, read_avif, write_avif
@@ -32,7 +32,7 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                             DEFAULT_CANVAS_SIZE_BG_COLOR, DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE,
                             DEFAULT_FIXED_CAPTURE_HEIGHT, DEFAULT_FIXED_CAPTURE_WIDTH, DEFAULT_MOSAIC_PERCENT,
                             DEFAULT_NEW_CANVAS_BG_COLOR, DEFAULT_NEW_CANVAS_HEIGHT, DEFAULT_NEW_CANVAS_WIDTH,
-                            DEFAULT_SAVE_FORMAT, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT,
+                            DEFAULT_SAVE_FORMAT, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT, DEFAULT_STAMP_KEY,
                             DEFAULT_SVG_IMPORT_SCALE, DEFAULT_TEXT_COLOR, DEFAULT_THICKNESS,
                             EFFECT_MENU_ICON_PX, FILL_TOLERANCE_MAX, FILL_TOLERANCE_MIN, FIXED_CAPTURE_SIZE_MAX,
                             FIXED_CAPTURE_SIZE_MIN, HUE_SATURATION_MAX,
@@ -44,8 +44,9 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                             SAVE_FILTERS, SAVE_QUALITY, SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN,
                             SVG_EXTENSIONS, SVG_IMPORT_SCALE_MAX, SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_STEP,
                             SVG_MAX_LONG_EDGE, TAB_SAVED_COLOR, TAB_UNSAVED_COLOR, THICKNESS_MAX,
-                            THICKNESS_MIN, TOOLBAR_ICON_PX, ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN,
-                            get_log_dir, get_resource_path, get_settings_path)
+                            THICKNESS_MIN, TOOLBAR_ICON_PX, TRAY_MENU_CLOSE_DELAY_MS, TRAY_NOTICE_TIMEOUT_MS,
+                            ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN, get_log_dir, get_resource_path,
+                            get_settings_path)
 from capture.desktop_shot import DesktopShot, has_mixed_screen_scales
 from capture.dialog_utils import strip_minmax_buttons
 from capture.dual_slider_dialog import DualSliderDialog
@@ -59,12 +60,22 @@ from capture.shape_settings import ShapeSubtoolPanel
 from capture.shapes import LINE_KINDS, SHAPE_KINDS
 from capture.shortcut_dialog import ShortcutSettingsDialog
 from capture.shortcuts import CAPTURE_ACTIONS, load_shortcut
+from capture.stamp_settings import StampPanel
+from capture.stamps import STAMP_KEYS, stamp_label
 from capture.text_settings import TextSettingsPanel
 
 logger = logging.getLogger(__name__)
 
 _MAGIC_ARROW_PX = 12   # 매직툴 버튼 오른쪽 ▼(허용범위 메뉴) 영역 폭
 _NO_CANVAS_MSG = "적용할 캔버스가 없습니다."
+_STAMP_TOOLTIP = "스탬프 (클릭: 기본 크기, 드래그: 크기 지정)"
+_TRAY_NOTICE = "CaptureV가 트레이에서 계속 실행 중입니다. 종료하려면 트레이 아이콘 우클릭 → 종료"
+# 트레이 메뉴에 넣는 캡처 항목. 활성 윈도우 캡처는 메뉴를 누르는 순간 활성 창이
+# 작업표시줄이 되어 의미가 없으므로 단축키 전용으로 남긴다.
+_TRAY_CAPTURE_IDS: tuple[str, ...] = ("region", "fullscreen", "repeat")
+_SETTING_CLOSE_TO_TRAY = "window/close_to_tray"
+_SETTING_TRAY_NOTICE_SHOWN = "window/tray_notice_shown"
+_SETTING_STAMP = "stamp_subtool"
 
 # 툴바·소형 버튼 공통 상태 스타일: 평상시엔 배경 없이, hover는 옅은 회색, 선택(체크)은
 # 눌린 느낌의 배경과 은은한 테두리.
@@ -144,6 +155,13 @@ class MainWindow(QMainWindow):
         self._active_view: Optional[CanvasView] = None    # 탭 전환 시 이전 탭의 텍스트 편집 반영용
         self._capture_pending: bool = False   # 창을 숨기고 화면 그랩을 기다리는 중(중복 실행 방지)
         self._mixed_scale_warned: bool = False    # 모니터별 배율 차이 경고는 실행 중 한 번만
+        # 트레이에 숨긴 상태에서 영역 캡처를 시작했는지. 그 캡처를 취소하면 창을 다시 띄우지 않는다.
+        self._capture_started_hidden: bool = False
+        self._tray: Optional[QSystemTrayIcon] = None
+        # 로그오프·종료 중 사용자가 미저장 확인을 취소했는지. 같은 세션 저장 중 Qt가 이어서
+        # 보내는 창 닫기에서 같은 질문을 또 하지 않도록 한다.
+        self._session_exit_cancelled: bool = False
+        self._close_to_tray: bool = self._read_bool(_SETTING_CLOSE_TO_TRAY, True)
 
         geometry = self.settings.value("window_geometry")
         # INI를 손으로 고치면 문자열 등이 들어와 restoreGeometry가 TypeError를 낸다.
@@ -200,6 +218,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_shortcuts()
         self._update_status()
+        self._build_tray()
         failed_hotkeys = self._register_hotkeys()
         if failed_hotkeys:
             self.statusBar().showMessage(
@@ -289,6 +308,14 @@ class MainWindow(QMainWindow):
 
         valid_shape_subtools = {k for k, _ in SHAPE_KINDS} | {k for k, _ in LINE_KINDS}
         self._shape_subtool = self._read_choice("shape_subtool", DEFAULT_SHAPE_SUBTOOL, valid_shape_subtools)
+        # 마지막으로 고른 스탬프. 고른 적이 없으면 None이고, 이때 '스탬프' 본체를 누르면 패널이 열린다.
+        self._stamp_key: Optional[str] = None
+        if self.settings.contains(_SETTING_STAMP):
+            saved_stamp = self._read_str(_SETTING_STAMP, "")
+            if saved_stamp in STAMP_KEYS:
+                self._stamp_key = saved_stamp
+            else:
+                logger.warning("스탬프 설정값이 허용 목록에 없어 무시: %r", saved_stamp)
 
         self._draw_thickness = self._read_int("draw_thickness", DEFAULT_THICKNESS, THICKNESS_MIN, THICKNESS_MAX)
 
@@ -364,6 +391,7 @@ class MainWindow(QMainWindow):
         self._build_thickness_button()
         self._build_text_button()
         self._build_shape_button()
+        self._build_stamp_button()
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -773,6 +801,68 @@ class MainWindow(QMainWindow):
         shape_arrow = self._make_split_tool_button(self._shape_action, self._shape_menu)
         self._shape_action.triggered.connect(shape_arrow.showMenu)
 
+    def _build_stamp_button(self) -> None:
+        """'스탬프' 버튼(번호/일반 스탬프 갤러리 하위 메뉴)을 구성한다.
+
+        본체를 클릭하면 마지막으로 고른 스탬프로 바로 스탬프 도구가 활성화되고,
+        아직 고른 적이 없으면 화살표와 같은 위치에 갤러리 패널이 열린다(그동안은
+        기본 스탬프로 동작). 패널에서 칸을 고르면 그 스탬프로 바뀌고 패널이 닫힌다.
+        """
+        self._stamp_action = QAction(QIcon(str(get_resource_path("img/stamp.png"))), "스탬프", self)
+        self._stamp_action.setCheckable(True)
+        self._stamp_action.triggered.connect(self._on_stamp_body_clicked)
+        self._tool_group.addAction(self._stamp_action)
+        self._update_stamp_tooltip()
+
+        self._stamp_panel = StampPanel(self._stamp_key, general_color=self._draw_color)
+        self._stamp_panel.stampChosen.connect(self._set_stamp)
+        self._stamp_panel.nextNumberChanged.connect(self._on_stamp_number_edited)
+
+        self._stamp_menu = QMenu(self)
+        action = QWidgetAction(self._stamp_menu)
+        action.setDefaultWidget(self._stamp_panel)
+        self._stamp_menu.addAction(action)
+        # 열 때마다 지금 쓰는 스탬프를 선택 표시로, 일반 스탬프 아이콘은 현재 팔레트 색으로 보여준다.
+        self._stamp_menu.aboutToShow.connect(self._on_stamp_menu_about_to_show)
+
+        self._stamp_arrow = self._make_split_tool_button(self._stamp_action, self._stamp_menu)
+
+    def _on_stamp_menu_about_to_show(self) -> None:
+        """스탬프 패널을 열기 직전에 선택 표시와 일반 스탬프 아이콘 색을 현재 상태로 맞춘다."""
+        self._stamp_panel.set_current(self._stamp_key)
+        self._stamp_panel.set_general_color(self._draw_color)
+
+    def _update_stamp_tooltip(self) -> None:
+        """'스탬프' 버튼 툴팁에 지금 쓰는 스탬프 이름을 붙인다."""
+        current = stamp_label(self._stamp_key) if self._stamp_key else "선택 안 함"
+        self._stamp_action.setToolTip(f"{_STAMP_TOOLTIP}\n현재: {current}")
+
+    def _on_stamp_body_clicked(self) -> None:
+        """'스탬프' 본체 클릭: 스탬프 도구를 켜고, 고른 스탬프가 없으면 패널을 연다."""
+        self._set_tool("stamp")
+        if self._stamp_key is None:
+            self._stamp_arrow.showMenu()
+
+    def _set_stamp(self, key: str) -> None:
+        """패널에서 고른 스탬프로 바꾸고 스탬프를 활성 도구로 만든다."""
+        self._stamp_key = key
+        self.settings.setValue(_SETTING_STAMP, key)
+        self._update_stamp_tooltip()
+        self._stamp_action.setChecked(True)
+        self._set_tool("stamp")
+        self._stamp_menu.close()
+
+    def _on_stamp_number_edited(self, number: int) -> None:
+        """패널의 '다음 번호'를 사용자가 바꾸면 활성 탭의 번호 카운터에 반영한다(되돌리기 대상 아님)."""
+        v = self.current_view()
+        if v is not None:
+            v.set_stamp_next_number(number)
+
+    def _on_view_stamp_number_changed(self, view: CanvasView, number: int) -> None:
+        """캔버스의 번호 카운터가 배치·되돌리기로 바뀌면, 그 탭이 활성일 때만 패널 표시를 맞춘다."""
+        if view is self.current_view():
+            self._stamp_panel.set_next_number(number)
+
     def _build_mini_tools_group(self) -> None:
         """색 박스 왼쪽에 '효과'/'회전'/'크기 조절'/'색상 추출' 2x2 소형 버튼 그룹을 구성한다.
 
@@ -1137,7 +1227,8 @@ class MainWindow(QMainWindow):
             v.set_text_options(self._text_settings.current_font(), self._text_settings.color(),
                                self._text_settings.align_h(), self._text_settings.align_v())
 
-    def _sync_view(self, v: Optional[CanvasView], apply_draw_style: bool = False) -> None:
+    def _sync_view(self, v: Optional[CanvasView], apply_draw_style: bool = False,
+                   restyle_stamps: bool = False) -> None:
         """현재 도구·그리기/텍스트 옵션·채우기 허용범위를 지정한 캔버스의 기본값으로 반영한다.
 
         기본값만 맞추므로, 탭 전환 등으로 호출돼도 선택된 도형·텍스트를 다시 그리지 않는다.
@@ -1146,13 +1237,15 @@ class MainWindow(QMainWindow):
             v: 대상 캔버스. None이면 아무것도 하지 않는다.
             apply_draw_style: True면 선택된 도형/선에도 현재 두께·색을 적용한다
                 (사용자가 두께·색을 직접 바꾼 경우에만).
+            restyle_stamps: True면 선택된 스탬프도 현재 색으로 재채색한다 (색을 바꾼 경우에만).
         """
         if v is None:
             return
         v.set_tool(self._current_tool)
         v.set_draw_options(self._draw_subtool, self._draw_thickness, self._draw_color,
-                           apply_to_selection=apply_draw_style)
+                           apply_to_selection=apply_draw_style, restyle_stamps=restyle_stamps)
         v.set_shape_subtool(self._shape_subtool)
+        v.set_stamp(self._stamp_key or DEFAULT_STAMP_KEY)
         v.set_fill_tolerance(self._fill_tolerance)
         v.set_magic_tolerance(self._magic_tolerance)
         v.set_text_options(self._text_settings.current_font(), self._text_settings.color(),
@@ -1160,8 +1253,12 @@ class MainWindow(QMainWindow):
                             apply_to_targets=False)
 
     def _set_tool(self, tool: str) -> None:
-        """현재 활성 도구를 전환하고, 활성 탭의 캔버스에 반영한다."""
+        """현재 활성 도구를 전환하고, 활성 탭의 캔버스에 반영한다.
+
+        스탬프는 두께와 무관하므로 스탬프 도구를 쓰는 동안 '두께' 버튼을 끈다.
+        """
         self._current_tool = tool
+        self._thickness_button.setEnabled(tool != "stamp")
         self._sync_view(self.current_view())
         logger.info("도구 전환: %s", tool)
 
@@ -1190,7 +1287,7 @@ class MainWindow(QMainWindow):
         """팔레트에서 색을 선택하면 그리기 색상을 갱신한다."""
         self._draw_color = QColor(color)
         self.settings.setValue("draw_color", self._draw_color.name())
-        self._sync_view(self.current_view(), apply_draw_style=True)
+        self._sync_view(self.current_view(), apply_draw_style=True, restyle_stamps=True)
 
     def _start_color_picking(self) -> None:
         """색상 추출 도구(그리기 색): 화면 어디서든 다음 클릭 지점의 색을 추출하는 모드로 전환한다."""
@@ -1262,6 +1359,13 @@ class MainWindow(QMainWindow):
         self._svg_scale_action = QAction("SVG 가져오기 배율...", self)
         self._svg_scale_action.triggered.connect(self._open_svg_scale_dialog)
         self._options_menu.addAction(self._svg_scale_action)
+
+        # 트레이를 쓸 수 없는 환경이면 _build_tray()가 이 항목을 끈다.
+        self._close_to_tray_action = QAction("닫기(X) 버튼으로 트레이로 최소화", self)
+        self._close_to_tray_action.setCheckable(True)
+        self._close_to_tray_action.setChecked(self._close_to_tray)
+        self._close_to_tray_action.toggled.connect(self._set_close_to_tray)
+        self._options_menu.addAction(self._close_to_tray_action)
 
         self._log_folder_action = QAction("Log", self)
         self._log_folder_action.triggered.connect(self._open_log_folder)
@@ -1357,6 +1461,7 @@ class MainWindow(QMainWindow):
         view.changed.connect(self._update_status)
         view.changed.connect(lambda: self._mark_dirty(view))
         view.viewChanged.connect(self._update_status)
+        view.stampNumberChanged.connect(lambda number: self._on_view_stamp_number_changed(view, number))
         idx = self.tabs.addTab(view, title or datetime.now().strftime("캡처 %H:%M:%S"))
         self.tabs.tabBar().setTabButton(
             idx, QTabBar.ButtonPosition.LeftSide, self._make_indicator_widget(TAB_UNSAVED_COLOR))
@@ -1526,6 +1631,8 @@ class MainWindow(QMainWindow):
             self._active_view.commit_pending_edit()
         self._active_view = self.current_view()
         self._sync_view(self._active_view)
+        if self._active_view is not None:
+            self._stamp_panel.set_next_number(self._active_view.stamp_next_number)
         self._update_status()
 
     def _update_status(self, *_args: object) -> None:
@@ -1598,6 +1705,7 @@ class MainWindow(QMainWindow):
         action이 예외를 내면 숨긴 창을 되돌리고 경고한다.
         """
         self._capture_pending = True
+        self._capture_started_hidden = not self.isVisible()
         self.hide()
         QApplication.processEvents()
         QTimer.singleShot(CAPTURE_HIDE_DELAY_MS, lambda: self._run_hidden_capture(action))
@@ -1637,8 +1745,15 @@ class MainWindow(QMainWindow):
         overlay.setFocus()
 
     def _on_region_overlay_closed(self) -> None:
-        """영역 캡처 오버레이가 닫히면(캡처/취소 모두) 참조를 지우고 메인 윈도우를 되돌린다."""
+        """영역 캡처 오버레이가 닫히면(캡처/취소 모두) 참조를 지우고 메인 윈도우를 되돌린다.
+
+        트레이에 숨겨 둔 상태에서 시작한 캡처를 취소했으면(캡처했다면 _on_captured가
+        이미 창을 띄웠다) 창을 띄우지 않고 트레이에 그대로 둔다.
+        """
         self._overlay = None
+        if self._capture_started_hidden and not self.isVisible():
+            logger.info("트레이 상태에서 시작한 영역 캡처 취소: 창을 띄우지 않음")
+            return
         self._restore_window()
 
     def start_capture(self) -> None:
@@ -2290,18 +2405,204 @@ class MainWindow(QMainWindow):
             message = "이미지로 열 수 없어 건너뛴 항목:\n" + "\n".join(failed)
             QTimer.singleShot(0, lambda: self._warn(message))
 
+    # ---------- 시스템 트레이 ---------- #
+    def _build_tray(self) -> None:
+        """시스템 트레이 아이콘과 메뉴를 만든다 (트레이를 쓸 수 없으면 아무것도 하지 않는다).
+
+        트레이를 쓰면 창을 숨겨도(마지막 창이 닫혀도) 앱이 끝나지 않도록 하고,
+        종료는 트레이 '종료' 또는 트레이 최소화를 끈 상태의 X로만 명시적으로 한다.
+        """
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("시스템 트레이를 사용할 수 없어 트레이 상주 없이 실행 (X는 항상 종료)")
+            self._close_to_tray_action.setEnabled(False)
+            return
+        tray = QSystemTrayIcon(QIcon(str(get_resource_path("img/capture.ico"))), self)
+        tray.setToolTip(APP_NAME)
+
+        menu = QMenu(self)
+        slots: dict[str, Callable[[], None]] = {
+            "region": self.start_capture,
+            "fullscreen": self._capture_fullscreen,
+            "repeat": self.repeat_capture,
+        }
+        self._tray_capture_actions: dict[str, QAction] = {}
+        for action_id in _TRAY_CAPTURE_IDS:
+            a = QAction(self)
+            a.triggered.connect(lambda _checked=False, slot=slots[action_id]: self._run_tray_capture(slot))
+            menu.addAction(a)
+            self._tray_capture_actions[action_id] = a
+        menu.addSeparator()
+        open_action = QAction("창 열기", self)
+        open_action.triggered.connect(self._restore_window)
+        menu.addAction(open_action)
+        menu.setDefaultAction(open_action)   # 굵게 표시
+        shortcut_action = QAction("캡처 단축키 설정...", self)
+        shortcut_action.triggered.connect(self._open_shortcut_settings)
+        menu.addAction(shortcut_action)
+        menu.addSeparator()
+        quit_action = QAction("종료", self)
+        quit_action.triggered.connect(self._quit_from_tray)
+        menu.addAction(quit_action)
+        # 단축키·마지막 영역은 실행 중에 바뀌므로 열 때마다 다시 맞춘다.
+        menu.aboutToShow.connect(self._sync_tray_menu)
+        self._tray_menu = menu
+        self._sync_tray_menu()
+
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._tray = tray
+        QApplication.setQuitOnLastWindowClosed(False)
+        # 숨긴 창은 로그오프·종료 때 Qt가 닫기(closeEvent)를 보내지 않아 미저장 확인 없이
+        # 끝나므로, 세션 종료 요청을 직접 받아 처리한다.
+        cast(QApplication, QApplication.instance()).commitDataRequest.connect(self._on_commit_data_request)
+        logger.info("시스템 트레이 아이콘 등록 (닫기 시 트레이로: %s)", self._close_to_tray)
+
+    def _sync_tray_menu(self) -> None:
+        """트레이 캡처 항목 오른쪽에 현재 전역 단축키를 표시하고, 반복 캡처 가능 여부를 맞춘다."""
+        for action in CAPTURE_ACTIONS:
+            menu_action = self._tray_capture_actions.get(action.action_id)
+            if menu_action is None:
+                continue
+            text = load_shortcut(self.settings, action).toString(QKeySequence.SequenceFormat.NativeText)
+            # 탭 뒤 글자는 QMenu가 단축키 열(오른쪽)에 따로 정렬한다.
+            menu_action.setText(f"{action.label}\t{text}" if text else action.label)
+        self._tray_capture_actions["repeat"].setEnabled(self.last_region is not None)
+
+    def _run_tray_capture(self, slot: Callable[[], None]) -> None:
+        """트레이 메뉴의 캡처 항목: 메뉴가 화면에서 사라진 뒤 기존 캡처 진입점을 그대로 호출한다."""
+        if self._capture_busy():
+            logger.info("캡처가 이미 진행 중이라 트레이 캡처 요청을 무시함")
+            return
+        QTimer.singleShot(TRAY_MENU_CLOSE_DELAY_MS, slot)
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        """트레이 아이콘을 더블클릭하면 창을 복원해 앞으로 가져온다."""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._restore_window()
+
+    def _set_close_to_tray(self, enabled: bool) -> None:
+        """옵션 '닫기(X) 버튼으로 트레이로 최소화'를 저장한다 (재시작 없이 바로 적용)."""
+        self._close_to_tray = enabled
+        self.settings.setValue(_SETTING_CLOSE_TO_TRAY, enabled)
+        logger.info("닫기 시 트레이로 최소화: %s", enabled)
+
+    def _should_hide_to_tray(self) -> bool:
+        """X(창 닫기)를 종료 대신 트레이 숨김으로 처리할지 여부.
+
+        Windows 로그오프·종료 중(세션 저장 중)에는 숨기면 종료를 막는 셈이 되므로
+        평소 종료 흐름을 따른다.
+        """
+        if self._tray is None or not self._close_to_tray:
+            return False
+        app = cast(QApplication, QApplication.instance())
+        return not app.isSavingSession()
+
+    def _hide_to_tray(self) -> None:
+        """창만 숨긴다 (탭·전역 단축키 유지). 처음 한 번은 트레이에서 실행 중임을 알린다."""
+        self.settings.setValue("window_geometry", self.saveGeometry())
+        self.hide()
+        logger.info("창을 트레이로 숨김")
+        if self._tray is not None and not self._read_bool(_SETTING_TRAY_NOTICE_SHOWN, False):
+            self._tray.showMessage(APP_NAME, _TRAY_NOTICE, QSystemTrayIcon.MessageIcon.Information,
+                                   TRAY_NOTICE_TIMEOUT_MS)
+            self.settings.setValue(_SETTING_TRAY_NOTICE_SHOWN, True)
+
+    def _on_commit_data_request(self, manager: QSessionManager) -> None:
+        """Windows 로그오프·종료: 트레이에 숨긴 창에 미저장 탭이 있으면 복원해 확인을 받는다.
+
+        보이는 창은 이 신호 뒤 Qt가 창 닫기(closeEvent)를 보내 기존 종료 흐름을 타므로
+        여기서는 건너뛴다. 사용자가 취소하면 세션 종료를 취소(manager.cancel())한다.
+        Qt 6에는 이 뒤에 이어지는 Qt 자체 창 닫기를 끄는 API(setFallbackSessionManagementEnabled)가
+        없어, 취소 여부를 기억해 뒤이은 closeEvent에서 같은 질문을 반복하지 않게 한다.
+
+        Args:
+            manager: 이번 세션 종료를 관리하는 세션 관리자.
+        """
+        self._session_exit_cancelled = False
+        if self.isVisible() or not self._has_unsaved_tabs():
+            return
+        if not manager.allowsInteraction():
+            logger.warning("세션 종료: 사용자 확인이 허용되지 않아 미저장 탭 확인 없이 진행")
+            return
+        logger.info("세션 종료 요청: 트레이에 숨긴 창의 미저장 탭 확인")
+        self._restore_window()
+        if self._confirm_exit():
+            manager.release()
+            return
+        logger.info("세션 종료 취소: 사용자가 미저장 탭 확인을 취소")
+        self._session_exit_cancelled = True
+        manager.cancel()
+
+    def _has_unsaved_tabs(self) -> bool:
+        """저장하지 않은 변경이 있는 탭이 있는지 (편집 중인 텍스트·곡선은 먼저 반영해 판단)."""
+        for i in range(self.tabs.count()):
+            view = self.tabs.widget(i)
+            if isinstance(view, CanvasView):
+                view.commit_pending_edit()
+                if view.is_dirty:
+                    return True
+        return False
+
+    def _quit_from_tray(self) -> None:
+        """트레이 '종료': X 종료와 같은 확인 흐름을 거쳐, 모두 정리되면 앱을 끝낸다.
+
+        미저장 탭이 있으면 무엇을 묻는지 보이도록 숨겨진(최소화된) 창을 먼저 복원한다.
+        취소하면 그대로 계속 실행한다.
+        """
+        if self._has_unsaved_tabs():
+            self._restore_window()
+        if not self._confirm_exit():
+            return
+        self._finish_exit()
+
     # ---------- 종료 ---------- #
-    def closeEvent(self, event: QCloseEvent) -> None:
-        """창을 닫기 전에 미저장 탭 처리 방법을 묻고, 다음 실행에 복원할 창 크기/위치를 저장한다.
+    def _confirm_exit(self) -> bool:
+        """다음 실행에 복원할 창 크기/위치를 저장하고, 미저장 탭 처리 방법을 물어 모든 탭을 닫는다.
 
         '모든 탭 닫기'와 같은 흐름으로 미저장 탭마다 저장 여부를 묻는다. 사용자가
         취소하거나 저장이 취소·실패해 탭이 남으면 종료하지 않는다(그 앞까지 처리된
         탭은 닫힌 채로 둔다).
+
+        Returns:
+            종료해도 되면 True.
         """
-        self.settings.setValue("window_geometry", self.saveGeometry())
+        # 숨긴 창의 위치는 숨길 때(_hide_to_tray) 이미 저장했다.
+        if self.isVisible():
+            self.settings.setValue("window_geometry", self.saveGeometry())
         self._close_all_tabs()
         if self.tabs.count() > 0:
             logger.info("종료 취소: 닫히지 않은 탭 %d개", self.tabs.count())
+            return False
+        return True
+
+    def _finish_exit(self) -> None:
+        """트레이를 쓰는 중이면 아이콘을 내리고 이벤트 루프를 끝낸다.
+
+        트레이를 쓰면 마지막 창이 닫혀도 앱이 끝나지 않게 해 두었으므로 명시적으로
+        끝내야 한다. 전역 단축키 해제 등 뒷정리는 main()의 app.exec() 이후에서 한다.
+        """
+        if self._tray is None:
+            return
+        self._tray.hide()
+        logger.info("종료 요청: 이벤트 루프 종료")
+        QApplication.quit()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """X(창 닫기): 트레이 최소화가 켜져 있으면 숨기기만 하고, 아니면 종료 확인을 거쳐 끝낸다.
+
+        로그오프·종료 중 _on_commit_data_request에서 이미 취소한 경우에는 다시 묻지 않고 거부한다.
+        """
+        app = cast(QApplication, QApplication.instance())
+        if self._session_exit_cancelled and app.isSavingSession():
+            event.ignore()
+            return
+        if self._should_hide_to_tray():
+            event.ignore()
+            self._hide_to_tray()
+            return
+        if not self._confirm_exit():
             event.ignore()
             return
         super().closeEvent(event)
+        self._finish_exit()
