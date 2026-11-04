@@ -481,19 +481,28 @@ class CanvasView(QGraphicsView):
         self._scene.addItem(item)
         return item
 
-    def _resize_draw_layer(self, new_rect: QRectF, old_rect: QRectF) -> None:
-        """씬 크기가 바뀔 때 그리기 레이어를 새 크기로 만들고 기존 내용을 그대로 옮긴다.
+    def _resize_draw_layer(self, new_rect: QRectF) -> None:
+        """씬 크기가 바뀔 때 모든 그리기 레이어를 새 크기로 만들고 기존 내용을 그대로 옮긴다.
 
+        현재 레이어만 맞추면 예전 레이어(채우기 전용 맨 아래 레이어 포함)의 캔버스 밖 내용이
+        잘리지 않고 남아, 캔버스를 다시 넓힐 때 되살아난다.
         매직툴 선택 마스크는 캔버스 픽셀 좌표 기준이라 함께 무효화한다.
         """
         self.clear_magic_selection()
-        new_pm = QPixmap(max(int(round(new_rect.width())), 1), max(int(round(new_rect.height())), 1))
+        for layer in self._scene.items():
+            if isinstance(layer, QGraphicsPixmapItem) and self._is_draw_layer(layer):
+                self._fit_layer_to_rect(layer, new_rect)
+
+    @staticmethod
+    def _fit_layer_to_rect(layer: QGraphicsPixmapItem, rect: QRectF) -> None:
+        """그리기 레이어를 rect 크기·위치로 다시 만든다 (rect 밖 내용은 버리고, 새 영역은 투명)."""
+        new_pm = QPixmap(max(int(round(rect.width())), 1), max(int(round(rect.height())), 1))
         new_pm.fill(Qt.GlobalColor.transparent)
         painter = QPainter(new_pm)
-        painter.drawPixmap(old_rect.topLeft() - new_rect.topLeft(), self.draw_item.pixmap())
+        painter.drawPixmap(layer.pos() - rect.topLeft(), layer.pixmap())
         painter.end()
-        self.draw_item.setPixmap(new_pm)
-        self.draw_item.setPos(new_rect.topLeft())
+        layer.setPixmap(new_pm)
+        layer.setPos(rect.topLeft())
 
     # ---------- 실행 취소/다시 실행 ---------- #
     def _is_blank_pixmap(self, pm: QPixmap) -> bool:
@@ -892,7 +901,7 @@ class CanvasView(QGraphicsView):
         if r.width() < MIN_CANVAS or r.height() < MIN_CANVAS:
             return
         self._push_undo()
-        self._resize_draw_layer(r, old)
+        self._resize_draw_layer(r)
         self._scene.setSceneRect(r)
         self._clip_selection_to_canvas()
         self.changed.emit()
@@ -916,9 +925,8 @@ class CanvasView(QGraphicsView):
         br = rects[0]
         for r in rects[1:]:
             br = br.united(r)
-        old = QRectF(self._scene.sceneRect())
         self._push_undo()
-        self._resize_draw_layer(br, old)
+        self._resize_draw_layer(br)
         self._scene.setSceneRect(br)
         self._clip_selection_to_canvas()
         self.changed.emit()
@@ -1823,25 +1831,29 @@ class CanvasView(QGraphicsView):
             if part.any():
                 targets.append((it, part))
                 remaining &= ~part
-        # 어떤 아이템도 덮지 않은 곳(투명 캔버스의 빈 영역)은 그리기 레이어에 칠한다.
-        if remaining.any() and self.draw_item is not None:
-            targets.append((self.draw_item, remaining))
+        # 어떤 아이템도 덮지 않은 곳(투명 캔버스의 빈 영역)은 모든 아이템 아래 그리기 레이어에 칠한다.
+        undo_pushed = False
+        if remaining.any():
+            self._push_undo()   # 레이어 생성·확장 전 상태로 되돌릴 수 있게 먼저 기록
+            undo_pushed = True
+            targets.append((self._bottom_fill_layer(), remaining))
         color = QColor(self.draw_color)
         color.setAlpha(255)
-        self._paint_mask_on_items(targets, color)
+        self._paint_mask_on_items(self._bleed_under_opaque_covers(targets, w, h, scene_rect), color,
+                                  undo_pushed=undo_pushed)
         logger.info("매직툴 선택 영역 채우기: %d픽셀, 색=%s", int(self._magic_mask.sum()), color.name())
         return True
 
     def _paint_mask_on_items(self, targets: list[tuple[QGraphicsPixmapItem, np.ndarray]],
-                             color: QColor) -> None:
+                             color: QColor, undo_pushed: bool = False) -> None:
         """각 아이템의 픽스맵에서 캔버스 크기 마스크에 해당하는 픽셀을 color로 바꾼다.
 
         먼저 해당 픽셀을 지우고(DestinationOut) 그 위에 색을 칠해, 반투명/투명
         색도 기존 픽셀과 섞이지 않고 그대로 들어가게 한다. 실행 취소는 실제로
-        바뀌는 아이템이 있을 때만 한 번 기록한다.
+        바뀌는 아이템이 있을 때만 한 번 기록한다(undo_pushed면 호출자가 이미 기록함).
         """
         scene_rect = self._scene.sceneRect()
-        pushed = False
+        pushed = undo_pushed
         for item, mask in targets:
             item_rect = self._item_pixmap_rect(item).translated(-scene_rect.topLeft())
             h, w = mask.shape
@@ -3344,7 +3356,7 @@ class CanvasView(QGraphicsView):
 
     # ---------- 채우기 ---------- #
     def _item_cover_mask(self, item: QGraphicsPixmapItem, w: int, h: int,
-                         scene_rect: QRectF) -> np.ndarray:
+                         scene_rect: QRectF, opaque_only: bool = False) -> np.ndarray:
         """아이템이 화면을 실제로 덮는 픽셀(알파>0)을 캔버스 크기 bool 마스크로 반환한다.
 
         Args:
@@ -3352,6 +3364,7 @@ class CanvasView(QGraphicsView):
             w: 캔버스(렌더 이미지) 너비.
             h: 캔버스(렌더 이미지) 높이.
             scene_rect: 현재 캔버스 영역. 마스크 좌표의 원점 기준이다.
+            opaque_only: True면 완전 불투명(알파=255) 픽셀만 포함한다.
 
         Returns:
             (h, w) 모양의 bool 배열. 아이템이 캔버스 밖에 있으면 전부 False.
@@ -3361,7 +3374,8 @@ class CanvasView(QGraphicsView):
         mask = np.zeros((h, w), dtype=bool)
         if iw == 0 or ih == 0:
             return mask
-        alpha = self._image_array(img, writable=False)[:, :, 3] > 0
+        alpha_channel = self._image_array(img, writable=False)[:, :, 3]
+        alpha = alpha_channel == 255 if opaque_only else alpha_channel > 0
         # Python round()는 .5에서 짝수 쪽으로 반올림해 Qt 렌더 위치와 1px 어긋날 수 있다.
         ox = math.floor(item.pos().x() - scene_rect.left() + 0.5)
         oy = math.floor(item.pos().y() - scene_rect.top() + 0.5)
@@ -3371,6 +3385,67 @@ class CanvasView(QGraphicsView):
             return mask
         mask[y0:y1, x0:x1] = alpha[y0 - oy:y1 - oy, x0 - ox:x1 - ox]
         return mask
+
+    def _bottom_fill_layer(self) -> QGraphicsPixmapItem:
+        """어느 아이템에도 덮이지 않은 채우기 픽셀을 담을, 모든 아이템 아래의 그리기 레이어를 반환한다.
+
+        위쪽 레이어에 칠하면 그 아래 이미지 경계와 맞닿은 투명 텍셀을 덮을 방법이 없어 확대 시
+        1px 선이 보이므로, 모든 아이템 아래에 두고 _bleed_under_opaque_covers로 경계를 메운다.
+        덮이지 않은 픽셀이라 어느 레이어에 담아도 render_image() 결과는 같다. 없으면 만들고,
+        크기·위치가 캔버스와 다르면 캔버스에 맞춘다(_resize_draw_layer와 같은 규칙).
+        """
+        pixmap_items = [it for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)]
+        floor_z = min((it.zValue() for it in pixmap_items if not self._is_draw_layer(it)), default=0.0)
+        below = [it for it in pixmap_items if self._is_draw_layer(it) and it.zValue() < floor_z]
+        if not below:
+            layer = self._add_draw_layer()
+            layer.setZValue(floor_z - 1)
+            return layer
+        layer = min(below, key=lambda it: it.zValue())
+        scene_rect = self._scene.sceneRect()
+        if self._item_pixmap_rect(layer) != scene_rect:
+            self._fit_layer_to_rect(layer, scene_rect)
+        return layer
+
+    def _bleed_under_opaque_covers(self, targets: list[tuple[QGraphicsPixmapItem, np.ndarray]], w: int, h: int,
+                                   scene_rect: QRectF) -> list[tuple[QGraphicsPixmapItem, np.ndarray]]:
+        """각 채우기 대상 마스크를, 더 위 아이템의 불투명 픽셀에 가려진 이웃 1px까지 넓힌다.
+
+        화면을 확대하면 위 아이템이 덮는 장치 픽셀과 아래 아이템이 샘플링하는 텍셀이 반 픽셀 어긋나,
+        가려져 칠하지 않은 텍셀(투명이면 흰 캔버스)이 위 아이템 가장자리에 1px 선으로 비친다.
+        가려진 쪽도 같은 색이면 어느 텍셀이 샘플링돼도 같다. 불투명하게 가려진 픽셀만 넓히므로
+        render_image() 결과는 바뀌지 않는다.
+        부작용: 채운 뒤 위 아이템을 옮기거나 지우면 그 옛 가장자리 안쪽에 채운 색 1px 선이 남는다.
+        """
+        if not targets:
+            return targets
+        min_z = min(item.zValue() for item, _ in targets)
+        covers = [(it.zValue(), self._item_cover_mask(it, w, h, scene_rect, opaque_only=True))
+                  for it in self._scene.items()
+                  if isinstance(it, QGraphicsPixmapItem) and it.zValue() > min_z]
+        out: list[tuple[QGraphicsPixmapItem, np.ndarray]] = []
+        for item, part in targets:
+            above = np.zeros((h, w), dtype=bool)
+            for z, cover in covers:
+                if z > item.zValue():
+                    above |= cover
+            rows = np.flatnonzero(above.any(axis=1))
+            if rows.size:
+                # 큰 캔버스에서 전체 팽창은 느려서, 가려진 픽셀의 경계 상자(+1px) 안에서만 3x3 팽창한다.
+                cols = np.flatnonzero(above.any(axis=0))
+                y0, y1 = max(int(rows[0]) - 1, 0), min(int(rows[-1]) + 2, h)
+                x0, x1 = max(int(cols[0]) - 1, 0), min(int(cols[-1]) + 2, w)
+                win = part[y0:y1, x0:x1]
+                grown = win.copy()
+                grown[1:] |= win[:-1]
+                grown[:-1] |= win[1:]
+                spread = grown.copy()
+                spread[:, 1:] |= grown[:, :-1]
+                spread[:, :-1] |= grown[:, 1:]
+                part = part.copy()
+                part[y0:y1, x0:x1] |= spread & above[y0:y1, x0:x1]
+            out.append((item, part))
+        return out
 
     def fill_at(self, view_pos: QPoint) -> bool:
         """클릭 지점과 연결된, 허용 범위 내의 인접 색상 영역을 draw_color로 채운다.
@@ -3414,7 +3489,7 @@ class CanvasView(QGraphicsView):
         # 그 아이템 몫만 채워지므로, 픽셀마다 '실제로 보이는(가려지지 않은)
         # 아이템'에 나눠 칠한다. 각 아이템은 자기가 보이는 부분만 칠해지므로
         # 붙여넣은 이미지가 다른 아이템에 덮여 사라지지 않는다. 아무 아이템도
-        # 없는 빈 캔버스 배경은 그리기 레이어에 칠한다.
+        # 없는 빈 캔버스 배경은 모든 아이템 아래 그리기 레이어에 칠한다.
         items = sorted((it for it in self._scene.items() if isinstance(it, QGraphicsPixmapItem)),
                        key=lambda it: it.zValue(), reverse=True)
         covered = np.zeros((h, w), dtype=bool)
@@ -3426,15 +3501,19 @@ class CanvasView(QGraphicsView):
             if part.any():
                 targets.append((it, part))
         uncovered = region & ~covered
-        if uncovered.any() and self.draw_item is not None:
-            targets.append((self.draw_item, uncovered))
-        pixel_count = sum(int(part.sum()) for _, part in targets)
+        pixel_count = sum(int(part.sum()) for _, part in targets) + int(uncovered.sum())
         if pixel_count == 0:
             return False
+        undo_pushed = False
+        if uncovered.any():
+            self._push_undo()   # 레이어 생성·확장 전 상태로 되돌릴 수 있게 먼저 기록
+            undo_pushed = True
+            targets.append((self._bottom_fill_layer(), uncovered))
 
         color = QColor(self.draw_color)
         color.setAlpha(255)
-        self._paint_mask_on_items(targets, color)
+        self._paint_mask_on_items(self._bleed_under_opaque_covers(targets, w, h, scene_rect), color,
+                                  undo_pushed=undo_pushed)
         logger.info("채우기: (%d, %d) 아이템 %d개 대상, %d픽셀, 허용범위=%d%%%s",
                     x, y, len(targets), pixel_count, self.fill_tolerance, edge_note)
         return True
@@ -3599,7 +3678,7 @@ class CanvasView(QGraphicsView):
                 # 그리기 레이어도 새 크기로 맞춰야, 손잡이로 캔버스를 넓힌 뒤 그
                 # 새로 늘어난 영역에 그리기/채우기가 실제로 반영된다 (레이어 크기가
                 # 예전 그대로면 그 영역에 그린 내용이 화면 밖처럼 잘려 사라진다).
-                self._resize_draw_layer(new_rect, old_rect)
+                self._resize_draw_layer(new_rect)
                 self._scene.setSceneRect(new_rect)
                 self._clip_selection_to_canvas()
                 self.changed.emit()
