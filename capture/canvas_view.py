@@ -156,7 +156,9 @@ class CanvasView(QGraphicsView):
         # 선택이 바뀌면 Qt의 최소 갱신(아이템 영역)만으로는 핸들 바깥쪽 절반이
         # 잔상으로 남는다. 선택 변경 시 뷰포트 전체를 다시 그린다.
         self._scene.selectionChanged.connect(self.viewport().update)
-        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        # 뷰 전체 Antialiasing은 끈다: 소수 배율(예: 231%)에서 픽스맵 아이템 가장자리가
+        # 번져 붙여넣은 캡처 사이에 밝은 1px 틈이 보인다. 곡선 오버레이는 각자 AA를 켠다.
+        self.setRenderHints(QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(QColor(CANVAS_SURROUND_COLOR))
@@ -2373,6 +2375,7 @@ class CanvasView(QGraphicsView):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             self._draw_marching_ants(painter, self._select_rect, scale)
             if self._select_state == "adjust":
+                painter.setPen(QPen(QColor(0x33, 0x33, 0x33), 1.0 / scale))
                 painter.setBrush(QBrush(Qt.GlobalColor.white))
                 for hr in self._select_handle_rects().values():
                     painter.drawRect(hr)
@@ -2394,6 +2397,7 @@ class CanvasView(QGraphicsView):
 
         if self.tool == "shape" and self._shape_state == "dragging":
             painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             pen = QPen(ACCENT)
             pen.setWidthF(1.0 / scale)
             painter.setPen(pen)
@@ -2414,6 +2418,7 @@ class CanvasView(QGraphicsView):
 
         if self.tool == "shape" and self._curve_points:
             painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setPen(self._shape_pen())
             painter.setBrush(Qt.BrushStyle.NoBrush)
             draw_bezier_kind(painter, self.shape_subtool, self._curve_points, self.draw_thickness)
