@@ -29,7 +29,8 @@ from capture.color_pick_overlay import ColorPickOverlay
 from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHTNESS_CONTRAST_MAX,
                             BRIGHTNESS_CONTRAST_MIN, CANVAS_SURROUND_COLOR, CAPTURE_HIDE_DELAY_MS,
                             DEFAULT_BLUR_PERCENT,
-                            DEFAULT_CANVAS_SIZE_BG_COLOR, DEFAULT_DRAW_COLOR, DEFAULT_FILL_TOLERANCE,
+                            DEFAULT_CANVAS_SIZE_BG_COLOR, DEFAULT_DRAW_COLOR, DEFAULT_FILL_EDGE,
+                            DEFAULT_FILL_TOLERANCE,
                             DEFAULT_FIXED_CAPTURE_HEIGHT, DEFAULT_FIXED_CAPTURE_WIDTH, DEFAULT_MOSAIC_PERCENT,
                             DEFAULT_NEW_CANVAS_BG_COLOR, DEFAULT_NEW_CANVAS_HEIGHT, DEFAULT_NEW_CANVAS_WIDTH,
                             DEFAULT_SAVE_FORMAT, DEFAULT_SHAPE_SUBTOOL, DEFAULT_SHARPEN_PERCENT, DEFAULT_STAMP_KEY,
@@ -322,6 +323,7 @@ class MainWindow(QMainWindow):
         self._draw_color = self._read_color("draw_color", DEFAULT_DRAW_COLOR)
         self._fill_tolerance = self._read_int("fill_tolerance", DEFAULT_FILL_TOLERANCE,
                                               FILL_TOLERANCE_MIN, FILL_TOLERANCE_MAX)
+        self._fill_edge = self._read_bool("fill_edge", DEFAULT_FILL_EDGE)
         self._magic_tolerance = self._read_int("magic_tolerance", DEFAULT_FILL_TOLERANCE,
                                                FILL_TOLERANCE_MIN, FILL_TOLERANCE_MAX)
         self._new_canvas_width = self._read_int("new_canvas_width", DEFAULT_NEW_CANVAS_WIDTH,
@@ -640,10 +642,10 @@ class MainWindow(QMainWindow):
         self._make_split_tool_button(self._draw_action, self._draw_menu)
 
     def _build_fill_button(self) -> None:
-        """'채우기' 버튼(허용범위 하위 메뉴)을 구성한다.
+        """'채우기' 버튼(허용범위·경계 중간색 하위 메뉴)을 구성한다.
 
         본체를 클릭하면 채우기 도구가 바로 활성화되고, 화살표를 누르면
-        허용 범위를 설정하는 팝업을 여는 메뉴가 열린다. '그리기' 화살표와
+        허용 범위 팝업과 '경계 중간색까지 채우기' 토글이 있는 메뉴가 열린다. '그리기' 화살표와
         동일한 #drawArrow 스타일을 재사용해 모양을 통일한다.
         """
         self._fill_action = QAction(QIcon(str(get_resource_path("img/fill.png"))), "채우기", self)
@@ -656,6 +658,11 @@ class MainWindow(QMainWindow):
         tolerance_action = QAction("허용범위...", self)
         tolerance_action.triggered.connect(self._open_fill_tolerance_dialog)
         self._fill_menu.addAction(tolerance_action)
+        self._fill_edge_action = QAction("경계 중간색까지 채우기", self)
+        self._fill_edge_action.setCheckable(True)
+        self._fill_edge_action.setChecked(self._fill_edge)
+        self._fill_edge_action.toggled.connect(self._set_fill_edge)
+        self._fill_menu.addAction(self._fill_edge_action)
 
         self._make_split_tool_button(self._fill_action, self._fill_menu)
 
@@ -690,6 +697,16 @@ class MainWindow(QMainWindow):
         self._sync_view(self.current_view())
         self.statusBar().showMessage(f"채우기 허용 범위: {value}%", 2500)
         logger.info("채우기 허용 범위 변경: %d%%", value)
+
+    def _set_fill_edge(self, enabled: bool) -> None:
+        """채우기 옵션 '경계 중간색까지 채우기'를 저장하고 현재 캔버스에 반영한다."""
+        self._fill_edge = enabled
+        self.settings.setValue("fill_edge", enabled)
+        v = self.current_view()
+        if v is not None:
+            v.set_fill_edge(enabled)
+        self.statusBar().showMessage(f"경계 중간색까지 채우기: {'켬' if enabled else '끔'}", 2500)
+        logger.info("채우기 경계 중간색 옵션 변경: %s", enabled)
 
     def _open_magic_tolerance_dialog(self) -> None:
         """매직툴 허용 범위(%)를 입력받아 설정에 저장한다 (채우기 허용 범위와 별도)."""
@@ -1247,6 +1264,7 @@ class MainWindow(QMainWindow):
         v.set_shape_subtool(self._shape_subtool)
         v.set_stamp(self._stamp_key or DEFAULT_STAMP_KEY)
         v.set_fill_tolerance(self._fill_tolerance)
+        v.set_fill_edge(self._fill_edge)
         v.set_magic_tolerance(self._magic_tolerance)
         v.set_text_options(self._text_settings.current_font(), self._text_settings.color(),
                             self._text_settings.align_h(), self._text_settings.align_v(),

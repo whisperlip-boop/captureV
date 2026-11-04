@@ -149,6 +149,8 @@ MAX_CUSTOM_COLORS: int = 10
 FILL_TOLERANCE_MIN: int = 0
 FILL_TOLERANCE_MAX: int = 100
 DEFAULT_FILL_TOLERANCE: int = 20    # R/G/B 각 채널 최대 허용 차이 = 이 값(%) / 100 * 255
+DEFAULT_FILL_EDGE: bool = False     # 채운 영역 바깥 1px의 경계 중간색(안티앨리어싱)까지 채울지
+EDGE_MIN_DIFF: int = 8              # 노이즈 방지: 바깥 이웃과 채널(0~255) 최대 차이가 이 값을 넘어야 중간색으로 봄
 
 # ---------- 신규(새 캔버스) ---------- #
 NEW_CANVAS_SIZE_MIN: int = 16

@@ -19,6 +19,7 @@ from scipy import ndimage
 
 from capture.config import (ACCENT, BLUR_SIGMA_SCALE, CANVAS_SURROUND_COLOR, CHECKER_DARK_COLOR,
                              CHECKER_LIGHT_COLOR, CHECKER_SQUARE_PX, CURSORS, DEFAULT_DRAW_COLOR,
+                             DEFAULT_FILL_EDGE, EDGE_MIN_DIFF,
                              DEFAULT_FILL_TOLERANCE, DEFAULT_SHAPE_SUBTOOL, DEFAULT_STAMP_KEY, DEFAULT_TEXT_COLOR,
                              DEFAULT_TEXT_FONT_SIZE, DEFAULT_THICKNESS, HANDLE_PX, HANDLES,
                              HIGHLIGHTER_ALPHA, MIN_CANVAS, MIN_SELECTION, SHARPEN_AMOUNT_SCALE,
@@ -229,6 +230,7 @@ class CanvasView(QGraphicsView):
         self._stroke_last_point: Optional[QPointF] = None
 
         self.fill_tolerance: int = DEFAULT_FILL_TOLERANCE
+        self.fill_edge: bool = DEFAULT_FILL_EDGE
 
         # shape_subtool: rectangle | rounded_rect | ellipse | circle | triangle | diamond |
         # pentagon | hexagon | line | line_arrow | line_double_arrow | freehand | freehand_arrow |
@@ -1493,6 +1495,10 @@ class CanvasView(QGraphicsView):
         """채우기 도구의 색상 허용 범위(0~100%)를 설정한다."""
         self.fill_tolerance = tolerance_pct
 
+    def set_fill_edge(self, enabled: bool) -> None:
+        """채우기 도구가 경계의 1px 중간색(안티앨리어싱) 픽셀까지 채울지 설정한다."""
+        self.fill_edge = enabled
+
     def set_magic_tolerance(self, tolerance_pct: int) -> None:
         """매직툴의 색상 허용 범위(0~100%)를 설정한다."""
         self.magic_tolerance = tolerance_pct
@@ -1862,7 +1868,8 @@ class CanvasView(QGraphicsView):
             self.changed.emit()
 
     @staticmethod
-    def _similar_region(composed: QImage, x: int, y: int, tolerance_pct: int) -> np.ndarray:
+    def _similar_region(composed: QImage, x: int, y: int, tolerance_pct: int,
+                        arr: Optional[np.ndarray] = None) -> np.ndarray:
         """(x, y)와 이어진, 허용 범위 내 비슷한 색 픽셀의 bool 마스크를 구한다 (채우기·매직툴 공용).
 
         Args:
@@ -1870,22 +1877,90 @@ class CanvasView(QGraphicsView):
             x: 기준 픽셀 x.
             y: 기준 픽셀 y.
             tolerance_pct: 채널별 최대 허용 차이 (0~100%, 255 기준).
+            arr: 이미 만든 _compare_array(composed) 결과. None이면 새로 만든다.
 
         Returns:
             (h, w) bool 배열.
         """
+        if arr is None:
+            arr = CanvasView._compare_array(composed)
+        target = arr[y, x]
+        threshold = tolerance_pct / 100 * 255
+        mask = np.all(np.abs(arr - target) <= threshold, axis=2)
+        labeled, _ = ndimage.label(mask)
+        return labeled == labeled[y, x]
+
+    @staticmethod
+    def _compare_array(composed: QImage) -> np.ndarray:
+        """색 비교용 (H, W, 4) int16 배열(B,G,R,A)을 만든다 (영역 판정 공용)."""
         arr = CanvasView._image_array(composed, writable=False).astype(np.int16)
         # 완전 투명 픽셀의 RGB는 합성 과정에서 임의값(보통 0)이 되어 의미가
         # 없으므로 0으로 정규화한 뒤, 알파를 네 번째 비교 채널로 함께 쓴다.
         # RGB만 비교하면 알파만 다른 투명 배경과 같은 색 도형(예: 검은 아이콘
         # + 투명 배경)이 한 영역으로 이어져 배경까지 함께 채워진다.
         arr[arr[:, :, 3] == 0, :3] = 0
+        return arr
 
+    @staticmethod
+    def _edge_blend_pixels(arr: np.ndarray, region: np.ndarray, x: int, y: int) -> np.ndarray:
+        """region을 감싸는 1px 테두리 중 '경계 중간색' 픽셀의 bool 마스크를 구한다 (채우기 전용).
+
+        region을 8-이웃으로 1px 팽창해 새로 닿은 픽셀 p 가운데, 8-이웃 q 중
+        팽창 영역 바깥에 있는 픽셀이 하나라도 있고, 그 q에 대해 모든 채널
+        (B,G,R,A)에서 min(t, q) <= p <= max(t, q)이면서 q와의 채널 최대 차이가
+        EDGE_MIN_DIFF를 넘는 픽셀만 고른다 (t = 클릭 지점 색). 두 캡처 사이
+        흰 틈을 어두운 색으로 채울 때, 흰색과 이웃 어두운 색 사이의 안티앨리어싱 1px 열이 허용 범위 밖이라 밝은 이음매로
+        남는 문제를 막기 위함이다. 바깥 이웃이 없는(영역에 둘러싸인) 1px 선은
+        건드리지 않는다. 채널별 범위 비교라 t·q가 흰색·검은색처럼 양 끝이면
+        그 사이의 1px 색 선(예: 빨간 선)도 채워진다 (선택 옵션이라 허용한 절충).
+        8-이웃을 쓰는 이유는 영역 모서리의 대각선 픽셀도
+        이음매로 남지 않게 하기 위해서다.
+
+        Args:
+            arr: _compare_array()로 만든 (H, W, 4) int16 배열.
+            region: 채울 영역 (H, W) bool 마스크.
+            x: 클릭 지점 x.
+            y: 클릭 지점 y.
+
+        Returns:
+            region에 더할 픽셀의 (H, W) bool 배열 (region과 겹치지 않음).
+        """
+        structure = np.ones((3, 3), dtype=bool)
+        dilated = ndimage.binary_dilation(region, structure=structure)
+        ring = dilated & ~region
+        edge = np.zeros_like(region)
+        if not ring.any():
+            return edge
+
+        # 큰 캔버스에서 메모리·시간을 줄이려고 테두리를 감싸는 사각형(+1px)만
+        # 계산한다. 테두리 픽셀의 이웃은 모두 이 사각형 안에 있다.
+        h, w = region.shape
+        rows = np.flatnonzero(ring.any(axis=1))
+        cols = np.flatnonzero(ring.any(axis=0))
+        y0, y1 = max(int(rows[0]) - 1, 0), min(int(rows[-1]) + 2, h)
+        x0, x1 = max(int(cols[0]) - 1, 0), min(int(cols[-1]) + 2, w)
+        sub = arr[y0:y1, x0:x1]
+        sh, sw = sub.shape[:2]
+        # 이미지 밖은 '바깥 이웃'으로 치지 않도록 False로 채운다 (색 패딩 값은 쓰이지 않음).
+        outside = np.pad(~dilated[y0:y1, x0:x1], 1, constant_values=False)
+        padded = np.pad(sub, ((1, 1), (1, 1), (0, 0)), mode="edge")
         target = arr[y, x]
-        threshold = tolerance_pct / 100 * 255
-        mask = np.all(np.abs(arr - target) <= threshold, axis=2)
-        labeled, _ = ndimage.label(mask)
-        return labeled == labeled[y, x]
+
+        hit = np.zeros((sh, sw), dtype=bool)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                nb = padded[1 + dy:1 + dy + sh, 1 + dx:1 + dx + sw]
+                nb_outside = outside[1 + dy:1 + dy + sh, 1 + dx:1 + dx + sw]
+                lo = np.minimum(nb, target)
+                hi = np.maximum(nb, target)
+                between = np.all((sub >= lo) & (sub <= hi), axis=2)
+                # p ≈ q면 중간색이 아니라 이웃 영역 자체(선명한 경계·단색 도형·노이즈·그라데이션)이므로 제외한다.
+                differs = np.max(np.abs(sub - nb), axis=2) > EDGE_MIN_DIFF
+                hit |= nb_outside & between & differs
+        edge[y0:y1, x0:x1] = ring[y0:y1, x0:x1] & hit
+        return edge
 
     # ---------- 핸들 공통 ---------- #
     def _handle_size_scene(self) -> float:
@@ -3321,7 +3396,13 @@ class CanvasView(QGraphicsView):
         if not (0 <= x < w and 0 <= y < h):
             return False
 
-        region = self._similar_region(composed, x, y, self.fill_tolerance)
+        arr = self._compare_array(composed)
+        region = self._similar_region(composed, x, y, self.fill_tolerance, arr)
+        edge_note = ""
+        if self.fill_edge:
+            edge = self._edge_blend_pixels(arr, region, x, y)
+            region |= edge
+            edge_note = f", 경계 중간색 {int(edge.sum())}픽셀 추가"
 
         # 잘라내기/붙여넣기를 반복하면 눈에 보이는 한 영역이 배경·붙여넣은
         # 조각 여러 아이템에 걸쳐 있다. 클릭 지점의 최상단 아이템 하나만 칠하면
@@ -3349,8 +3430,8 @@ class CanvasView(QGraphicsView):
         color = QColor(self.draw_color)
         color.setAlpha(255)
         self._paint_mask_on_items(targets, color)
-        logger.info("채우기: (%d, %d) 아이템 %d개 대상, %d픽셀, 허용범위=%d%%",
-                    x, y, len(targets), pixel_count, self.fill_tolerance)
+        logger.info("채우기: (%d, %d) 아이템 %d개 대상, %d픽셀, 허용범위=%d%%%s",
+                    x, y, len(targets), pixel_count, self.fill_tolerance, edge_note)
         return True
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
