@@ -3326,9 +3326,24 @@ class CanvasView(QGraphicsView):
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(self._stroke_path)
+        if self._stroke_path.elementCount() == 1:
+            # moveTo만 있는 경로(제자리 클릭)는 Qt가 아무것도 그리지 않으므로 점을 직접 찍는다.
+            self._paint_dot(painter, self._stroke_path.currentPosition(), color)
+        else:
+            painter.drawPath(self._stroke_path)
         painter.end()
         self.draw_item.setPixmap(pm)
+
+    def _paint_dot(self, painter: QPainter, center: QPointF, color: QColor) -> None:
+        """한 점 클릭: 둥근 끝(RoundCap)과 같은 지름=두께의 점을 그린다(1px은 해당 픽셀 하나만)."""
+        width = max(self.draw_thickness, 1)
+        if width == 1:
+            # 1px 원은 안티앨리어싱으로 픽셀을 다 채우지 못하므로 정수 경계 사각형으로 정확히 한 픽셀을 채운다.
+            painter.fillRect(QRectF(center.x() - 0.5, center.y() - 0.5, 1, 1), color)
+            return
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(center, width / 2, width / 2)
 
     def _erase_segment(self, p1: QPointF, p2: QPointF) -> None:
         """지우개: 모든 그리기 레이어에서 p1-p2 구간을 투명하게 지운다.
@@ -3350,7 +3365,11 @@ class CanvasView(QGraphicsView):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
             painter.setPen(pen)
-            painter.drawLine(p1 + offset, p2 + offset)
+            if p1 == p2:
+                # 길이 0인 선은 두께가 2 이상이면 Qt가 그리지 않으므로 점으로 지운다.
+                self._paint_dot(painter, p1 + offset, QColor(Qt.GlobalColor.black))
+            else:
+                painter.drawLine(p1 + offset, p2 + offset)
             painter.end()
             layer.setPixmap(pm)
 
