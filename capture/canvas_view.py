@@ -1693,13 +1693,13 @@ class CanvasView(QGraphicsView):
         self._magic_ants_image = None
         self.viewport().update()
 
-    def magic_select_at(self, view_pos: QPoint, mode: str = "replace") -> bool:
+    def magic_select_at(self, view_pos: QPointF, mode: str = "replace") -> bool:
         """클릭 지점과 이어진, 허용 범위 내 비슷한 색의 픽셀을 선택한다.
 
         색 판정은 채우기와 동일하게 화면에 보이는 합성 결과를 기준으로 한다.
 
         Args:
-            view_pos: 뷰(위젯) 좌표의 클릭 지점.
+            view_pos: 뷰(위젯) 좌표의 클릭 지점(HiDPI 소수 좌표 그대로).
             mode: 'replace'(새로 선택), 'add'(Shift, 기존 선택에 추가),
                 'subtract'(Alt, 기존 선택에서 빼기).
 
@@ -1707,7 +1707,7 @@ class CanvasView(QGraphicsView):
             선택이 바뀌었는지 여부 (클릭 지점이 캔버스 밖이면 False).
         """
         scene_rect = self._scene.sceneRect()
-        sp = self.mapToScene(view_pos)
+        sp = self._map_to_scene_f(view_pos)
         if not scene_rect.contains(sp):
             return False
         composed = self.render_image().convertToFormat(QImage.Format.Format_ARGB32)
@@ -1803,7 +1803,7 @@ class CanvasView(QGraphicsView):
         logger.info("매직툴 영역 지우기: %d픽셀", int(self._magic_mask.sum()))
         self.clear_magic_selection()
 
-    def _fill_magic_selection_at(self, view_pos: QPoint) -> bool:
+    def _fill_magic_selection_at(self, view_pos: QPointF) -> bool:
         """채우기 도구로 매직툴 선택 영역 안을 클릭하면 선택 영역 전체를 draw_color로 채운다.
 
         채우기와 같이 각 픽셀은 그 위치에서 보이는 최상단 아이템에 칠한다
@@ -1815,7 +1815,7 @@ class CanvasView(QGraphicsView):
         if not self.has_magic_selection():
             return False
         scene_rect = self._scene.sceneRect()
-        sp = self.mapToScene(view_pos)
+        sp = self._map_to_scene_f(view_pos)
         x = int(sp.x() - scene_rect.left())
         y = int(sp.y() - scene_rect.top())
         h, w = self._magic_mask.shape
@@ -2505,19 +2505,19 @@ class CanvasView(QGraphicsView):
                 event.accept()
                 return
             if self.tool == "draw":
-                self._draw_press(event.position().toPoint())
+                self._draw_press(event.position())
                 event.accept()
                 return
             if self.tool == "magic":
                 mods = event.modifiers()
                 mode = ("add" if mods & Qt.KeyboardModifier.ShiftModifier
                         else "subtract" if mods & Qt.KeyboardModifier.AltModifier else "replace")
-                self.magic_select_at(event.position().toPoint(), mode)
+                self.magic_select_at(event.position(), mode)
                 event.accept()
                 return
             if self.tool == "fill":
-                if not self._fill_magic_selection_at(event.position().toPoint()):
-                    self.fill_at(event.position().toPoint())
+                if not self._fill_magic_selection_at(event.position()):
+                    self.fill_at(event.position())
                 event.accept()
                 return
             if self.tool == "text":
@@ -3273,12 +3273,30 @@ class CanvasView(QGraphicsView):
             return
         self.draw_item = self._add_draw_layer()
 
-    def _draw_press(self, view_pos: QPoint) -> None:
+    def _map_to_scene_f(self, view_pos: QPointF) -> QPointF:
+        """뷰 좌표(소수 포함)를 정수로 반올림하지 않고 씬 좌표로 옮긴다.
+
+        HiDPI(125%/150%)에서는 마우스 위치가 소수로 오는데, toPoint()로 반올림한 뒤
+        옮기면 줌 100%에서 일부 씬 픽셀(150%면 세 번째마다)에 점을 찍을 수 없다.
+        정수 부분은 mapToScene() 그대로 옮겨, 정수 위치(화면 배율 100%)의 결과가 기존과
+        비트 단위로 같게 유지한다. 뷰 변환은 균일 확대/축소뿐이라 m11()로 나눈다.
+        """
+        p = view_pos.toPoint()
+        frac = view_pos - QPointF(p)
+        if frac.isNull():
+            return self.mapToScene(p)
+        scale = self.transform().m11() or 1.0
+        s = self.mapToScene(p) + frac / scale
+        # 1/1.5 같은 배율은 부동소수 오차로 정확한 픽셀 경계(10.0)가 9.999...로 내려가
+        # floor 시 왼쪽/위 이웃 픽셀이 되므로, 경계 근처 오차를 1e-6 단위로 없앤다.
+        return QPointF(round(s.x(), 6), round(s.y(), 6))
+
+    def _draw_press(self, view_pos: QPointF) -> None:
         """그리기 도구: 새 스트로크를 시작한다."""
         self._push_undo()
         if self.draw_subtool != "eraser":
             self._ensure_top_draw_layer()
-        sp = self._pixel_align(self.mapToScene(view_pos) - self.draw_item.pos())
+        sp = self._pixel_align(self._map_to_scene_f(view_pos) - self.draw_item.pos())
         self._stroke_path = QPainterPath()
         self._stroke_path.moveTo(sp)
         self._stroke_last_point = sp
@@ -3293,11 +3311,11 @@ class CanvasView(QGraphicsView):
         else:
             self._paint_stroke()
 
-    def _draw_move(self, view_pos: QPoint) -> None:
+    def _draw_move(self, view_pos: QPointF) -> None:
         """그리기 도구: 스트로크를 이어 그린다."""
         if self._stroke_path is None:
             return
-        sp = self._pixel_align(self.mapToScene(view_pos) - self.draw_item.pos())
+        sp = self._pixel_align(self._map_to_scene_f(view_pos) - self.draw_item.pos())
         if self.draw_subtool == "eraser":
             self._erase_segment(self._stroke_last_point, sp)
             self._stroke_last_point = sp
@@ -3466,7 +3484,7 @@ class CanvasView(QGraphicsView):
             out.append((item, part))
         return out
 
-    def fill_at(self, view_pos: QPoint) -> bool:
+    def fill_at(self, view_pos: QPointF) -> bool:
         """클릭 지점과 연결된, 허용 범위 내의 인접 색상 영역을 draw_color로 채운다.
 
         영역 판정은 화면에 실제로 보이는 색(원본 이미지 + 그리기 레이어 +
@@ -3478,13 +3496,13 @@ class CanvasView(QGraphicsView):
         스크린샷은 대개 그렇다) 붙여넣은 다른 이미지들까지 통째로 덮여 사라졌다.
 
         Args:
-            view_pos: 뷰(위젯) 좌표의 클릭 지점.
+            view_pos: 뷰(위젯) 좌표의 클릭 지점(HiDPI 소수 좌표 그대로).
 
         Returns:
             실제로 채웠는지 여부 (클릭 지점이 캔버스 밖이면 False).
         """
         scene_rect = self._scene.sceneRect()
-        sp = self.mapToScene(view_pos)
+        sp = self._map_to_scene_f(view_pos)
         if not scene_rect.contains(sp):
             return False
 
@@ -3607,7 +3625,7 @@ class CanvasView(QGraphicsView):
             return
 
         if self.tool == "draw" and self._stroke_path is not None:
-            self._draw_move(pos)
+            self._draw_move(event.position())
             event.accept()
             return
 
