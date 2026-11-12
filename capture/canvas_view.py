@@ -55,7 +55,17 @@ class _CanvasPixmapItem(QGraphicsPixmapItem):
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem,
               widget: Optional[QWidget] = None) -> None:
-        """선택 상태 플래그만 뺀 옵션으로 기본 paint를 호출한다."""
+        """선택 상태 플래그만 뺀 옵션으로 기본 paint를 호출한다.
+
+        화면 표시(widget 있음)에서 물리 픽셀 기준 100% 초과 확대면 보간 없이(최근접) 그려
+        픽셀 경계를 또렷하게 한다. 저장·복사(scene.render, widget 없음)는 기존 그대로다.
+        """
+        t = painter.worldTransform()
+        if widget is not None and math.hypot(t.m11(), t.m12()) * painter.device().devicePixelRatioF() > 1.0 + 1e-6:
+            # 기본 paint는 아이템 transformationMode로 힌트를 덮어쓰므로 직접 그린다(선택 표시는 원래 안 그림).
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            painter.drawPixmap(self.offset(), self.pixmap())
+            return
         opt = QStyleOptionGraphicsItem(option)
         opt.state &= ~QStyle.StateFlag.State_Selected
         super().paint(painter, opt, widget)
