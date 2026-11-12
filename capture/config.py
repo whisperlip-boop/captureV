@@ -322,4 +322,3 @@ STAMP_NUMBER_MAX: int = 999
 # 트레이 메뉴 항목을 누른 뒤 메뉴가 화면에서 완전히 사라질 때까지 기다리는 시간.
 # 바로 캡처하면 닫히는 중인 메뉴가 캡처 이미지에 찍힐 수 있다.
 TRAY_MENU_CLOSE_DELAY_MS: int = 250
-TRAY_NOTICE_TIMEOUT_MS: int = 5000

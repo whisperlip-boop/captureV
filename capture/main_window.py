@@ -45,7 +45,7 @@ from capture.config import (APP_NAME, BLUR_PERCENT_MAX, BLUR_PERCENT_MIN, BRIGHT
                             SAVE_FILTERS, SAVE_QUALITY, SHARPEN_PERCENT_MAX, SHARPEN_PERCENT_MIN,
                             SVG_EXTENSIONS, SVG_IMPORT_SCALE_MAX, SVG_IMPORT_SCALE_MIN, SVG_IMPORT_SCALE_STEP,
                             SVG_MAX_LONG_EDGE, TAB_SAVED_COLOR, TAB_UNSAVED_COLOR, THICKNESS_MAX,
-                            THICKNESS_MIN, TOOLBAR_ICON_PX, TRAY_MENU_CLOSE_DELAY_MS, TRAY_NOTICE_TIMEOUT_MS,
+                            THICKNESS_MIN, TOOLBAR_ICON_PX, TRAY_MENU_CLOSE_DELAY_MS,
                             ZOOM_PERCENT_MAX, ZOOM_PERCENT_MIN, get_log_dir, get_resource_path,
                             get_settings_path)
 from capture.desktop_shot import DesktopShot, has_mixed_screen_scales
@@ -70,12 +70,9 @@ logger = logging.getLogger(__name__)
 _MAGIC_ARROW_PX = 12   # 매직툴 버튼 오른쪽 ▼(허용범위 메뉴) 영역 폭
 _NO_CANVAS_MSG = "적용할 캔버스가 없습니다."
 _STAMP_TOOLTIP = "스탬프 (클릭: 기본 크기, 드래그: 크기 지정)"
-_TRAY_NOTICE = "CaptureV가 트레이에서 계속 실행 중입니다. 종료하려면 트레이 아이콘 우클릭 → 종료"
 # 트레이 메뉴에 넣는 캡처 항목. 활성 윈도우 캡처는 메뉴를 누르는 순간 활성 창이
 # 작업표시줄이 되어 의미가 없으므로 단축키 전용으로 남긴다.
 _TRAY_CAPTURE_IDS: tuple[str, ...] = ("region", "fullscreen", "repeat")
-_SETTING_CLOSE_TO_TRAY = "window/close_to_tray"
-_SETTING_TRAY_NOTICE_SHOWN = "window/tray_notice_shown"
 _SETTING_STAMP = "stamp_subtool"
 
 # 툴바·소형 버튼 공통 상태 스타일: 평상시엔 배경 없이, hover는 옅은 회색, 선택(체크)은
@@ -156,13 +153,10 @@ class MainWindow(QMainWindow):
         self._active_view: Optional[CanvasView] = None    # 탭 전환 시 이전 탭의 텍스트 편집 반영용
         self._capture_pending: bool = False   # 창을 숨기고 화면 그랩을 기다리는 중(중복 실행 방지)
         self._mixed_scale_warned: bool = False    # 모니터별 배율 차이 경고는 실행 중 한 번만
-        # 트레이에 숨긴 상태에서 영역 캡처를 시작했는지. 그 캡처를 취소하면 창을 다시 띄우지 않는다.
-        self._capture_started_hidden: bool = False
         self._tray: Optional[QSystemTrayIcon] = None
         # 로그오프·종료 중 사용자가 미저장 확인을 취소했는지. 같은 세션 저장 중 Qt가 이어서
         # 보내는 창 닫기에서 같은 질문을 또 하지 않도록 한다.
         self._session_exit_cancelled: bool = False
-        self._close_to_tray: bool = self._read_bool(_SETTING_CLOSE_TO_TRAY, True)
 
         geometry = self.settings.value("window_geometry")
         # INI를 손으로 고치면 문자열 등이 들어와 restoreGeometry가 TypeError를 낸다.
@@ -1378,13 +1372,6 @@ class MainWindow(QMainWindow):
         self._svg_scale_action.triggered.connect(self._open_svg_scale_dialog)
         self._options_menu.addAction(self._svg_scale_action)
 
-        # 트레이를 쓸 수 없는 환경이면 _build_tray()가 이 항목을 끈다.
-        self._close_to_tray_action = QAction("닫기(X) 버튼으로 트레이로 최소화", self)
-        self._close_to_tray_action.setCheckable(True)
-        self._close_to_tray_action.setChecked(self._close_to_tray)
-        self._close_to_tray_action.toggled.connect(self._set_close_to_tray)
-        self._options_menu.addAction(self._close_to_tray_action)
-
         self._log_folder_action = QAction("Log", self)
         self._log_folder_action.triggered.connect(self._open_log_folder)
         self._options_menu.addAction(self._log_folder_action)
@@ -1723,7 +1710,6 @@ class MainWindow(QMainWindow):
         action이 예외를 내면 숨긴 창을 되돌리고 경고한다.
         """
         self._capture_pending = True
-        self._capture_started_hidden = not self.isVisible()
         self.hide()
         QApplication.processEvents()
         QTimer.singleShot(CAPTURE_HIDE_DELAY_MS, lambda: self._run_hidden_capture(action))
@@ -1763,15 +1749,8 @@ class MainWindow(QMainWindow):
         overlay.setFocus()
 
     def _on_region_overlay_closed(self) -> None:
-        """영역 캡처 오버레이가 닫히면(캡처/취소 모두) 참조를 지우고 메인 윈도우를 되돌린다.
-
-        트레이에 숨겨 둔 상태에서 시작한 캡처를 취소했으면(캡처했다면 _on_captured가
-        이미 창을 띄웠다) 창을 띄우지 않고 트레이에 그대로 둔다.
-        """
+        """영역 캡처 오버레이가 닫히면(캡처/취소 모두) 참조를 지우고 메인 윈도우를 되돌린다."""
         self._overlay = None
-        if self._capture_started_hidden and not self.isVisible():
-            logger.info("트레이 상태에서 시작한 영역 캡처 취소: 창을 띄우지 않음")
-            return
         self._restore_window()
 
     def start_capture(self) -> None:
@@ -2427,12 +2406,11 @@ class MainWindow(QMainWindow):
     def _build_tray(self) -> None:
         """시스템 트레이 아이콘과 메뉴를 만든다 (트레이를 쓸 수 없으면 아무것도 하지 않는다).
 
-        트레이를 쓰면 창을 숨겨도(마지막 창이 닫혀도) 앱이 끝나지 않도록 하고,
-        종료는 트레이 '종료' 또는 트레이 최소화를 끈 상태의 X로만 명시적으로 한다.
+        트레이를 쓰면 캡처 중 창을 숨겨도(마지막 창이 닫혀도) 앱이 끝나지 않도록 하고,
+        종료는 X 또는 트레이 '종료'로 명시적으로 한다.
         """
         if not QSystemTrayIcon.isSystemTrayAvailable():
-            logger.warning("시스템 트레이를 사용할 수 없어 트레이 상주 없이 실행 (X는 항상 종료)")
-            self._close_to_tray_action.setEnabled(False)
+            logger.warning("시스템 트레이를 사용할 수 없어 트레이 아이콘 없이 실행")
             return
         tray = QSystemTrayIcon(QIcon(str(get_resource_path("img/capture.ico"))), self)
         tray.setToolTip(APP_NAME)
@@ -2474,7 +2452,7 @@ class MainWindow(QMainWindow):
         # 숨긴 창은 로그오프·종료 때 Qt가 닫기(closeEvent)를 보내지 않아 미저장 확인 없이
         # 끝나므로, 세션 종료 요청을 직접 받아 처리한다.
         cast(QApplication, QApplication.instance()).commitDataRequest.connect(self._on_commit_data_request)
-        logger.info("시스템 트레이 아이콘 등록 (닫기 시 트레이로: %s)", self._close_to_tray)
+        logger.info("시스템 트레이 아이콘 등록")
 
     def _sync_tray_menu(self) -> None:
         """트레이 캡처 항목 오른쪽에 현재 전역 단축키를 표시하고, 반복 캡처 가능 여부를 맞춘다."""
@@ -2499,35 +2477,8 @@ class MainWindow(QMainWindow):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._restore_window()
 
-    def _set_close_to_tray(self, enabled: bool) -> None:
-        """옵션 '닫기(X) 버튼으로 트레이로 최소화'를 저장한다 (재시작 없이 바로 적용)."""
-        self._close_to_tray = enabled
-        self.settings.setValue(_SETTING_CLOSE_TO_TRAY, enabled)
-        logger.info("닫기 시 트레이로 최소화: %s", enabled)
-
-    def _should_hide_to_tray(self) -> bool:
-        """X(창 닫기)를 종료 대신 트레이 숨김으로 처리할지 여부.
-
-        Windows 로그오프·종료 중(세션 저장 중)에는 숨기면 종료를 막는 셈이 되므로
-        평소 종료 흐름을 따른다.
-        """
-        if self._tray is None or not self._close_to_tray:
-            return False
-        app = cast(QApplication, QApplication.instance())
-        return not app.isSavingSession()
-
-    def _hide_to_tray(self) -> None:
-        """창만 숨긴다 (탭·전역 단축키 유지). 처음 한 번은 트레이에서 실행 중임을 알린다."""
-        self.settings.setValue("window_geometry", self.saveGeometry())
-        self.hide()
-        logger.info("창을 트레이로 숨김")
-        if self._tray is not None and not self._read_bool(_SETTING_TRAY_NOTICE_SHOWN, False):
-            self._tray.showMessage(APP_NAME, _TRAY_NOTICE, QSystemTrayIcon.MessageIcon.Information,
-                                   TRAY_NOTICE_TIMEOUT_MS)
-            self.settings.setValue(_SETTING_TRAY_NOTICE_SHOWN, True)
-
     def _on_commit_data_request(self, manager: QSessionManager) -> None:
-        """Windows 로그오프·종료: 트레이에 숨긴 창에 미저장 탭이 있으면 복원해 확인을 받는다.
+        """Windows 로그오프·종료: 캡처 중 숨긴 창에 미저장 탭이 있으면 복원해 확인을 받는다.
 
         보이는 창은 이 신호 뒤 Qt가 창 닫기(closeEvent)를 보내 기존 종료 흐름을 타므로
         여기서는 건너뛴다. 사용자가 취소하면 세션 종료를 취소(manager.cancel())한다.
@@ -2543,7 +2494,7 @@ class MainWindow(QMainWindow):
         if not manager.allowsInteraction():
             logger.warning("세션 종료: 사용자 확인이 허용되지 않아 미저장 탭 확인 없이 진행")
             return
-        logger.info("세션 종료 요청: 트레이에 숨긴 창의 미저장 탭 확인")
+        logger.info("세션 종료 요청: 캡처 중 숨긴 창의 미저장 탭 확인")
         self._restore_window()
         if self._confirm_exit():
             manager.release()
@@ -2563,16 +2514,15 @@ class MainWindow(QMainWindow):
         return False
 
     def _quit_from_tray(self) -> None:
-        """트레이 '종료': X 종료와 같은 확인 흐름을 거쳐, 모두 정리되면 앱을 끝낸다.
+        """트레이 '종료': X와 같은 closeEvent 흐름으로 종료 확인·정리를 한 번만 거쳐 앱을 끝낸다.
 
         미저장 탭이 있으면 무엇을 묻는지 보이도록 숨겨진(최소화된) 창을 먼저 복원한다.
         취소하면 그대로 계속 실행한다.
         """
         if self._has_unsaved_tabs():
             self._restore_window()
-        if not self._confirm_exit():
-            return
-        self._finish_exit()
+        # QApplication.quit()이 창마다 closeEvent를 다시 보내므로, 직접 정리하면 두 번 돈다.
+        self.close()
 
     # ---------- 종료 ---------- #
     def _confirm_exit(self) -> bool:
@@ -2585,7 +2535,7 @@ class MainWindow(QMainWindow):
         Returns:
             종료해도 되면 True.
         """
-        # 숨긴 창의 위치는 숨길 때(_hide_to_tray) 이미 저장했다.
+        # 캡처 중 숨긴 창은 숨기기 전 위치를 그대로 둔다.
         if self.isVisible():
             self.settings.setValue("window_geometry", self.saveGeometry())
         self._close_all_tabs()
@@ -2607,17 +2557,13 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """X(창 닫기): 트레이 최소화가 켜져 있으면 숨기기만 하고, 아니면 종료 확인을 거쳐 끝낸다.
+        """X(창 닫기)·Alt+F4: 트레이 '종료'와 같은 종료 확인을 거쳐 앱을 끝낸다.
 
         로그오프·종료 중 _on_commit_data_request에서 이미 취소한 경우에는 다시 묻지 않고 거부한다.
         """
         app = cast(QApplication, QApplication.instance())
         if self._session_exit_cancelled and app.isSavingSession():
             event.ignore()
-            return
-        if self._should_hide_to_tray():
-            event.ignore()
-            self._hide_to_tray()
             return
         if not self._confirm_exit():
             event.ignore()
