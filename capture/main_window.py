@@ -914,13 +914,22 @@ class MainWindow(QMainWindow):
         self._magic_action.setCheckable(True)
         self._magic_action.setToolTip(
             "매직툴 (클릭한 지점과 비슷한 색 영역 선택, Shift+클릭 추가 / Alt+클릭 빼기 / Esc 해제)\n"
-            "Ctrl+C 복사, Ctrl+X 잘라내기, Delete 지우기, 채우기 도구로 영역 안 클릭 시 전체 채우기")
+            "Ctrl+C 복사, Ctrl+X 잘라내기, Delete 지우기, Ctrl+Shift+I 선택 반전, "
+            "채우기 도구로 영역 안 클릭 시 전체 채우기")
         self._magic_action.triggered.connect(lambda: self._set_tool("magic"))
         self._tool_group.addAction(self._magic_action)
         magic_menu = QMenu(self)
         magic_tolerance_action = QAction("허용범위...", self)
         magic_tolerance_action.triggered.connect(self._open_magic_tolerance_dialog)
         magic_menu.addAction(magic_tolerance_action)
+        magic_invert_action = QAction("선택 반전", self)
+        magic_invert_action.setShortcut(QKeySequence("Ctrl+Shift+I"))
+        # 길게 누르면 반복 반전돼 최종 상태가 반복 횟수에 좌우되므로 끈다.
+        magic_invert_action.setAutoRepeat(False)
+        magic_invert_action.triggered.connect(self.invert_magic_selection_current)
+        magic_menu.addAction(magic_invert_action)
+        # 툴버튼 메뉴는 평소 숨겨져 있어 창에도 등록해야 단축키가 동작한다.
+        self.addAction(magic_invert_action)
         self._magic_btn = QToolButton()
         self._magic_btn.setDefaultAction(self._magic_action)
         self._magic_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
@@ -1998,6 +2007,18 @@ class MainWindow(QMainWindow):
             return
         QGuiApplication.clipboard().setImage(img)
         self.statusBar().showMessage("선택 영역을 잘라내 클립보드에 복사했습니다.", 2500)
+
+    def invert_magic_selection_current(self) -> None:
+        """현재 탭의 매직툴 선택을 캔버스 전체 기준으로 반전한다."""
+        v = self.current_view()
+        if v is None:
+            return
+        if not v.invert_magic_selection():
+            self.statusBar().showMessage("매직툴 선택 영역이 없습니다.", 2000)
+        elif v.has_magic_selection():
+            self.statusBar().showMessage("매직툴 선택 영역을 반전했습니다.", 2000)
+        else:
+            self.statusBar().showMessage("캔버스 전체가 선택돼 있어 반전 후 선택을 해제했습니다.", 2500)
 
     def undo_current(self) -> None:
         """현재 탭에서 직전 작업을 한 단계 되돌린다."""

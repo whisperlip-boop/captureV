@@ -1758,6 +1758,23 @@ class CanvasView(QGraphicsView):
         self._magic_ants_key = ()
         self.viewport().update()
 
+    def invert_magic_selection(self) -> bool:
+        """매직툴 선택을 캔버스 전체 기준으로 반전한다 (전체가 선택돼 있었으면 선택 해제).
+
+        마스크는 선택 당시 캔버스 크기이며, 캔버스 크기가 바뀌는 연산은 선택을
+        지우므로 현재 캔버스 전체와 일치한다.
+
+        Returns:
+            반전했는지 여부 (선택이 없으면 False).
+        """
+        if not self.has_magic_selection():
+            return False
+        before = int(self._magic_mask.sum())
+        self._set_magic_mask(~self._magic_mask, self._magic_scene_rect)
+        logger.info("매직툴 선택 반전: %d픽셀 -> %d픽셀", before,
+                    int(self._magic_mask.sum()) if self.has_magic_selection() else 0)
+        return True
+
     def _magic_bounds(self) -> tuple[int, int, int, int]:
         """매직툴 선택 마스크를 감싸는 최소 사각형 (x0, y0, x1, y1), 캔버스 픽셀 좌표."""
         ys, xs = np.nonzero(self._magic_mask)
